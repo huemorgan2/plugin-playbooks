@@ -1,0 +1,97 @@
+name = "plugin-playbooks"
+version = "0.2.1"
+description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
+entry = "plugin_playbooks"
+sdk_version = "0"
+license = "MIT"
+category = "system"
+db_tables = ["playbooks", "playbook_versions", "playbook_runs", "playbook_step_runs", "playbook_drafts"]
+tags = ["playbooks", "workflows", "automation", "triggers"]
+readme = """
+# plugin-playbooks
+
+The **Playbooks engine** for Luna: durable, multi-step agent workflows.
+Playbooks are reusable YAML templates of steps (tool calls, LLM steps, agent
+decisions, loops, branches, waits) that Luna authors through conversation and
+executes on triggers or on demand.
+
+Adds a **Playbooks** sidebar section with a full visual canvas (react-flow):
+list → canvas/YAML editor → run replay with per-step state visualization.
+Served as a full-pane iframe from the plugin's own prebuilt `ui/` dist; live
+agent edits stream in over the E12 `ui.plugin.event` bridge (`playbook.open`,
+`playbook.patch`, `navigate`), and run/step activity rides the `activity.*`
+SSE feed.
+
+Owns its **five DB tables via the SDK** (E4 isolated metadata) and binds
+external trigger sources (cron, webhooks, connector events) through the SDK
+`TriggerSourceRegistry`. Chat messages sent from playbook runs are tagged
+`source=playbook` (E11) for generic badging in core. Imports only `luna_sdk`
++ stdlib + SQLAlchemy — zero `luna.*` imports.
+
+Extracted from Luna core in 009.001 (Luna ≥ 0.29). History lives in the main
+luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
+"""
+
+[requires]
+tools = 10
+tables = 5
+
+[[tools]]
+name = "playbook_propose"
+description = "Create a new playbook from a full YAML definition."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_edit"
+description = "Rewrite an existing playbook's full YAML definition."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_list"
+description = "List available playbooks."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_get_definition"
+description = "Get the full YAML of a playbook."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_validate"
+description = "Statically check a playbook without running it."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_dry_run"
+description = "Simulate a playbook run with tool/LLM steps stubbed — no side effects."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_run"
+description = "Execute a playbook for real (runs tools and agent steps)."
+policy = "auto_approve"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_status"
+description = "Get the full step trace of a playbook run."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_cancel"
+description = "Cancel a running playbook."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_set_autonomy"
+description = "Change who can trigger a playbook (agent/owner/confirm)."
+policy = "ask"
+risk_level = "medium"
