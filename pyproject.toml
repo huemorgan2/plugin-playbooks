@@ -1,6 +1,6 @@
 [project]
 name = "plugin-playbooks"
-version = "0.2.2"
+version = "0.3.0"
 description = "Durable multi-step playbooks for Luna — Luna builds them, triggers fire them. Built on luna_sdk v0."
 readme = "README.md"
 license = { text = "MIT" }

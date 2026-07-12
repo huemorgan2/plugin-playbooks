@@ -13,7 +13,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.2.2",
+        version="0.3.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -33,7 +33,8 @@ class PlaybooksPlugin(LunaPlugin):
                 name="playbook-authoring",
                 description=(
                     "how to build, edit, and debug playbooks — load before creating or "
-                    "modifying any playbook"
+                    "modifying any playbook; the authoring tools (propose, edit, "
+                    "validate, dry_run, …) unlock on your next turn"
                 ),
                 body=(
                     "## Playbook Authoring\n\n"
@@ -356,6 +357,15 @@ class PlaybooksPlugin(LunaPlugin):
                     "- NEVER invent other tool names. A `tool_call` step must reference a tool "
                     "from your actual tool list — unknown tools are rejected at authoring time."
                 ),
+                tools=[
+                    "playbook_propose",
+                    "playbook_edit",
+                    "playbook_get_definition",
+                    "playbook_validate",
+                    "playbook_dry_run",
+                    "playbook_set_autonomy",
+                    "playbook_list_available_triggers",
+                ],
             ),
         ],
     )
@@ -397,7 +407,7 @@ class PlaybooksPlugin(LunaPlugin):
         for tool_def, handler in build_tools(
             ctx.db_session_factory, ctx.events, self._runner,
         ):
-            ctx.tool_registry.register(self.manifest.name, tool_def, handler)
+            self._register_tool(ctx, tool_def, handler)
 
         self._register_trigger_tools(ctx)
 
@@ -433,6 +443,35 @@ class PlaybooksPlugin(LunaPlugin):
         if self._binding_service is not None:
             await self._binding_service.sync()
 
+    # 0.3.0: authoring tools ride behind the playbook-authoring skill (the
+    # manifest SkillDef lists them) — building/editing playbooks is rare and
+    # the skill body is required reading anyway. Run/inspect tools
+    # (playbook_run/list/status/cancel) stay visible every turn. Cores
+    # without the skill_gated kwarg get everything ungated.
+    AUTHORING_TOOLS = (
+        "playbook_propose",
+        "playbook_edit",
+        "playbook_get_definition",
+        "playbook_validate",
+        "playbook_dry_run",
+        "playbook_set_autonomy",
+        "playbook_list_available_triggers",
+    )
+
+    def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:
+        if (
+            tool_def.name in self.AUTHORING_TOOLS
+            and getattr(ctx, "skill_registry", None) is not None
+        ):
+            try:
+                ctx.tool_registry.register(
+                    self.manifest.name, tool_def, handler, skill_gated=True
+                )
+                return
+            except TypeError:  # older core: no skill_gated kwarg
+                pass
+        ctx.tool_registry.register(self.manifest.name, tool_def, handler)
+
     def _register_trigger_tools(self, ctx: PluginContext) -> None:
         """Agent-facing trigger discovery — reads the neutral registry."""
         from luna_sdk import ToolDef
@@ -465,14 +504,15 @@ class PlaybooksPlugin(LunaPlugin):
                 ),
             }
 
-        ctx.tool_registry.register(
-            self.manifest.name,
+        self._register_tool(
+            ctx,
             ToolDef(
                 name="playbook_list_available_triggers",
                 description=(
                     "List external event triggers a playbook can bind to (from "
                     "connected apps that expose triggers — gmail, slack, github...). "
-                    "Returns the exact event name to use in playbook_add_trigger."
+                    "Returns the exact event name to put in the playbook's "
+                    "`triggers:` block via playbook_propose / playbook_edit."
                 ),
                 parameters={
                     "type": "object",
