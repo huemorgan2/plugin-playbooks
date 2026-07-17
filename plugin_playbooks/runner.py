@@ -45,6 +45,25 @@ _active_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def _playbook_origin_scope(playbook: Any):
+    """Bind the billing origin for a playbook run and everything it derives
+    (luna-service 048): root_action_type=playbook_run + a stable playbook id.
+    A scheduler-initiated run already carries channel=scheduler + the trigger
+    id on the outer scope; that job id wins (the trigger is the cost driver),
+    while this run keeps a plain (non-scheduler) channel so user-initiated
+    playbooks land in the Playbooks usage section. No-op on older luna core."""
+    from contextlib import nullcontext
+    try:
+        from luna_sdk import billing_origin_scope
+    except Exception:  # noqa: BLE001 — older core: degrade to no attribution
+        return nullcontext()
+    return billing_origin_scope(
+        root_action_type="playbook_run",
+        job_id=getattr(playbook, "name", None),
+        prefer_outer_job_id=True,  # a scheduler trigger id (if any) wins
+    )
+
+
 
 
 class PlaybookRunner:
@@ -140,7 +159,8 @@ class PlaybookRunner:
                     f"Playbook '{playbook.name}' has no steps — nothing to execute. "
                     "Add steps before running."
                 )
-            await self._execute_steps(definition.steps, context)
+            with _playbook_origin_scope(playbook):
+                await self._execute_steps(definition.steps, context)
             await self._complete_run(run.id, "done")
             run.status = "done"
         except _PlaybookHalt as h:

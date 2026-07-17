@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.3.0"
+version = "0.3.1"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
