@@ -13,7 +13,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../ui',
+    outDir: '../plugin_playbooks/ui',  // the dir routes.py serves from
     emptyOutDir: true,
     sourcemap: false,
   },

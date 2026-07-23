@@ -5,7 +5,11 @@ templates of steps that Luna builds through conversation and executes
 on triggers or on demand.
 """
 
+import logging
+
 from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, SkillDef
+
+logger = logging.getLogger(__name__)
 
 
 class PlaybooksPlugin(LunaPlugin):
@@ -13,7 +17,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.3.1",
+        version="0.4.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -395,6 +399,20 @@ class PlaybooksPlugin(LunaPlugin):
         async with ctx.engine.begin() as conn:
             for table in Base.metadata.sorted_tables:
                 await conn.run_sync(table.create, checkfirst=True)
+
+        # plans/001: `table.create(checkfirst=True)` skips the whole table when
+        # it already exists, indexes included — so installs that predate an
+        # index never get it. Create each one on its own, and never let a
+        # legacy/locked database block the plugin from loading.
+        for table in Base.metadata.sorted_tables:
+            for index in table.indexes:
+                try:
+                    async with ctx.engine.begin() as conn:
+                        await conn.run_sync(index.create, checkfirst=True)
+                except Exception as e:  # pragma: no cover - depends on the DB
+                    logger.warning(
+                        "playbooks: could not create index %s: %s", index.name, e
+                    )
 
         self._runner = PlaybookRunner(
             session_factory=ctx.db_session_factory,

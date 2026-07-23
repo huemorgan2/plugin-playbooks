@@ -93,6 +93,10 @@ export interface PlaybookSummary {
   status: string
   agent_autonomy: string
   version: number
+  // plans/001: run history, computed server-side over the last 30 days.
+  last_run_at?: string | null
+  runs_per_day?: number
+  runs_window?: number
 }
 
 export interface PlaybookRunSummary {

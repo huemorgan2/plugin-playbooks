@@ -5,14 +5,17 @@ Note: no `from __future__ import annotations` — same Pydantic body fix.
 """
 
 import json
+import logging
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from luna_sdk import get_current_user
@@ -145,6 +148,106 @@ def _sf() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+# ---- Run stats for the list (plans/001) ----
+# The list shows when each playbook last ran and how often it runs. Both come
+# from one grouped, windowed query over playbook_runs — never one query per
+# row, never a scan of the whole run history.
+
+logger = logging.getLogger(__name__)
+
+_STATS_WINDOW_DAYS = 30
+_STATS_TTL_SECONDS = 20.0
+_stats_cache: dict[str, Any] | None = None
+
+
+def _reset_stats_cache() -> None:
+    """Drop the memoised aggregate — used by tests and after a run finishes."""
+    global _stats_cache
+    _stats_cache = None
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    """SQLite hands back naive datetimes; treat those as UTC."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _runs_per_day(runs: int, created_at: datetime | None, now: datetime) -> float:
+    """Runs per day over the days the playbook actually existed in the window.
+
+    A playbook created yesterday that ran four times reads 4.0/day, not 0.1/day.
+    """
+    window_start = now - timedelta(days=_STATS_WINDOW_DAYS)
+    created = _aware(created_at) or window_start
+    days = (now - max(created, window_start)).total_seconds() / 86400.0
+    days = min(max(days, 1.0), float(_STATS_WINDOW_DAYS))
+    return round(runs / days, 1)
+
+
+async def _run_stats(session: AsyncSession, playbooks: list) -> dict[str, dict[str, Any]]:
+    """`{playbook_id: {last_run_at, runs_per_day, runs_window}}` for a list page.
+
+    Two queries at most, both grouped and both index-range scans:
+      1. every playbook that ran inside the window (one round trip, all rows);
+      2. the last run of the playbooks missing from (1), restricted to those
+         ids — skipped when every playbook ran recently.
+    Results are memoised for `_STATS_TTL_SECONDS`, so repeated mounts of the
+    pane cost nothing. Stats trail reality by design; 20s is invisible.
+    """
+    global _stats_cache
+    now = datetime.now(timezone.utc)
+    cache = _stats_cache
+    if cache is None or (time.monotonic() - cache["at"]) > _STATS_TTL_SECONDS:
+        rows = (await session.execute(
+            select(
+                PlaybookRun.playbook_id,
+                func.count(PlaybookRun.id),
+                func.max(PlaybookRun.started_at),
+            )
+            .where(PlaybookRun.started_at >= now - timedelta(days=_STATS_WINDOW_DAYS))
+            .group_by(PlaybookRun.playbook_id)
+        )).all()
+        cache = {
+            "at": time.monotonic(),
+            "recent": {str(pid): (count, last) for pid, count, last in rows},
+            # Playbooks with nothing in the window; resolved lazily, and
+            # remembered as None when they have never run at all.
+            "idle": {},
+        }
+        _stats_cache = cache
+
+    recent, idle = cache["recent"], cache["idle"]
+    unknown = [
+        p.id for p in playbooks
+        if str(p.id) not in recent and str(p.id) not in idle
+    ]
+    if unknown:
+        rows = (await session.execute(
+            select(PlaybookRun.playbook_id, func.max(PlaybookRun.started_at))
+            .where(PlaybookRun.playbook_id.in_(unknown))
+            .group_by(PlaybookRun.playbook_id)
+        )).all()
+        found = {str(pid): last for pid, last in rows}
+        for pid in unknown:
+            idle[str(pid)] = found.get(str(pid))
+
+    out: dict[str, dict[str, Any]] = {}
+    for p in playbooks:
+        key = str(p.id)
+        if key in recent:
+            count, last = recent[key]
+        else:
+            count, last = 0, idle.get(key)
+        last = _aware(last)
+        out[key] = {
+            "last_run_at": last.isoformat() if last else None,
+            "runs_window": count,
+            "runs_per_day": _runs_per_day(count, getattr(p, "created_at", None), now),
+        }
+    return out
+
+
 class PlaybookCreate(BaseModel):
     name: str
     display_name: str = ""
@@ -177,6 +280,13 @@ async def list_playbooks(status: str = "active"):
         elif status != "all":
             stmt = stmt.where(Playbook.status == status)
         rows = (await session.execute(stmt)).scalars().all()
+        try:
+            stats = await _run_stats(session, list(rows))
+        except Exception as e:  # pragma: no cover - depends on the DB
+            # Run history is a nice-to-have on this screen; never let it stop
+            # the list from rendering.
+            logger.warning("playbooks: run stats unavailable: %s", e)
+            stats = {}
         return [{
             "id": str(p.id),
             "name": p.name,
@@ -188,6 +298,9 @@ async def list_playbooks(status: str = "active"):
             "version": p.version,
             "cost_estimate_cents": p.cost_estimate_cents,
             "duration_estimate_ms": p.duration_estimate_ms,
+            **stats.get(str(p.id), {
+                "last_run_at": None, "runs_window": 0, "runs_per_day": 0.0,
+            }),
         } for p in rows]
 
 
@@ -386,6 +499,7 @@ async def start_run(name: str, body: RunCreate):
             raise HTTPException(404, f"Playbook '{name}' not found")
 
     run = await _runner.start_run(p, inputs=body.inputs, trigger=body.trigger)
+    _reset_stats_cache()  # a run the owner just started should show as "now"
     return {"run_id": str(run.id), "status": run.status}
 
 

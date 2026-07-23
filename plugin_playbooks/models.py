@@ -11,7 +11,7 @@ pre-split schema (existing rows must keep loading); creation happens in
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from luna_sdk import JSONB, UUID, declarative_base
@@ -74,6 +74,13 @@ class PlaybookVersion(Base):
 
 class PlaybookRun(Base):
     __tablename__ = "playbook_runs"
+
+    # plans/001: the playbook list reads "last run" and "runs per day" from
+    # this table on every load. Both are index-range scans over
+    # (playbook_id, started_at) — never a scan of the run history.
+    __table_args__ = (
+        Index("ix_playbook_runs_playbook_started", "playbook_id", "started_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
     playbook_id: Mapped[uuid.UUID] = mapped_column(

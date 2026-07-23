@@ -16,6 +16,7 @@ import type { PlaybookSummary } from './types'
 import { PlaybookEditor } from './PlaybookEditor'
 import { setPlaybookConsumerReady } from './liveBus'
 import { applyActivity, runningNames as computeRunning } from './activityPresence'
+import { lastRunLabel, rateLabel } from './runStats'
 
 type SelectedItem = { kind: 'playbook'; name: string } | { kind: 'draft'; id: string }
 type Tab = 'active' | 'archived'
@@ -220,6 +221,17 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
                 <div className="flex items-center gap-3 mt-1 text-[11px] text-ink-600">
                   <span>v{pb.version}</span>
                   <span className="capitalize">{pb.agent_autonomy.replace(/_/g, ' ')}</span>
+                  <span
+                    data-testid="playbook-last-run"
+                    title={pb.last_run_at ? new Date(pb.last_run_at).toLocaleString() : 'No runs yet'}
+                  >
+                    {lastRunLabel(pb.last_run_at)}
+                  </span>
+                  {rateLabel(pb) && (
+                    <span data-testid="playbook-rate" title="Average runs per day over the last 30 days">
+                      {rateLabel(pb)}
+                    </span>
+                  )}
                 </div>
               </div>
 
