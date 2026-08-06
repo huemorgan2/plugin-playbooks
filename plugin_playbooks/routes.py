@@ -498,7 +498,9 @@ async def start_run(name: str, body: RunCreate):
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
 
-    run = await _runner.start_run(p, inputs=body.inputs, trigger=body.trigger)
+    # plans/009: background start — the Run button responds instantly instead
+    # of hanging for the whole run; liveness comes from activity.* heartbeats.
+    run = await _runner.start_run_background(p, inputs=body.inputs, trigger=body.trigger)
     _reset_stats_cache()  # a run the owner just started should show as "now"
     return {"run_id": str(run.id), "status": run.status}
 

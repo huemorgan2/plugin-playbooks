@@ -85,6 +85,10 @@ class PlaybookRunner:
         # 009.001/phase03 (E6): conversation pinning reads/writes go through
         # the SDK context instead of luna.agent.runtime internals.
         self._ctx = context
+        # plans/009: background run tasks by run id. Holding a strong ref
+        # keeps the task alive (create_task alone can be GC'd); entries pop
+        # via done-callback. wait_for_run/cancel_run look tasks up here.
+        self._tasks: dict[Any, asyncio.Task] = {}
 
     async def start_run(
         self,
@@ -93,7 +97,61 @@ class PlaybookRunner:
         trigger: str | None = None,
         parent_run_id: Any = None,
     ) -> PlaybookRun:
-        """Create a new run and begin executing it."""
+        """Create a run and execute it to completion (blocking).
+
+        Subtask composition depends on these semantics — a parent playbook
+        must wait for its child. Chat/HTTP/trigger entry points use
+        `start_run_background` instead (plans/009).
+        """
+        run = await self._create_run(
+            playbook, inputs=inputs, trigger=trigger, parent_run_id=parent_run_id,
+        )
+        await self._drive_run(run, playbook, inputs or {})
+        return run
+
+    async def start_run_background(
+        self,
+        playbook: Playbook,
+        inputs: dict[str, Any] | None = None,
+        trigger: str | None = None,
+        parent_run_id: Any = None,
+    ) -> PlaybookRun:
+        """Create a run and execute it in a background task.
+
+        Returns immediately with the run in status 'running'. Callers get a
+        real run_id up front — a slow playbook can never orphan a run behind
+        a tool/HTTP timeout again. Pair with `wait_for_run` for a bounded
+        wait, `playbook_status` for polling, `cancel_run` to stop it.
+        """
+        run = await self._create_run(
+            playbook, inputs=inputs, trigger=trigger, parent_run_id=parent_run_id,
+        )
+        task = asyncio.create_task(
+            self._drive_run(run, playbook, inputs or {}),
+            name=f"playbook-run-{run.id}",
+        )
+        self._tasks[run.id] = task
+        task.add_done_callback(lambda _t, _id=run.id: self._tasks.pop(_id, None))
+        return run
+
+    async def wait_for_run(self, run_id: Any, timeout: float) -> PlaybookRun | None:
+        """Wait up to `timeout` seconds for a background run, then return the
+        run's current DB state (whatever its status is by then). Never cancels
+        the run — a timeout here just means 'still going'."""
+        task = self._tasks.get(run_id)
+        if task is not None and timeout > 0:
+            await asyncio.wait([task], timeout=timeout)
+        async with self._sf() as session:
+            return await session.get(PlaybookRun, run_id)
+
+    async def _create_run(
+        self,
+        playbook: Playbook,
+        inputs: dict[str, Any] | None = None,
+        trigger: str | None = None,
+        parent_run_id: Any = None,
+    ) -> PlaybookRun:
+        """Persist the run row and announce it — shared by both entry points."""
         # 006.712: capture the originating conversation so agent_steps can
         # send_chat_message back to the right chat. playbook_run is called
         # inside a chat turn, where the contextvar is pinned; trigger/cron
@@ -120,7 +178,15 @@ class PlaybookRunner:
             "inputs": inputs,
             "trigger": trigger,
         })
+        return run
 
+    async def _drive_run(
+        self,
+        run: PlaybookRun,
+        playbook: Playbook,
+        inputs: dict[str, Any],
+    ) -> None:
+        """Execute a created run to its terminal status (mutates run.status)."""
         # 008.006: generic presence channel. The list/brain react to
         # `activity.*` (not `playbook.*`), so any long task can light the same
         # indicators. A heartbeat task beats while the run is alive; its
@@ -143,9 +209,9 @@ class PlaybookRunner:
         definition = PlaybookDef.model_validate(playbook.definition)
         context = _RunContext(
             run_id=run.id,
-            inputs=inputs or {},
+            inputs=inputs,
             step_outputs={},
-            conversation_id=conversation_id,
+            conversation_id=run.conversation_id,
         )
 
         token = _active_run_id.set(str(run.id))
@@ -174,6 +240,13 @@ class PlaybookRunner:
         except _PlaybookCancel:
             await self._complete_run(run.id, "cancelled")
             run.status = "cancelled"
+        except asyncio.CancelledError:
+            # plans/009: cancel_run() cancelled the background task — mark the
+            # run and end cleanly (swallowing is correct in a task context; the
+            # step loop's `except Exception` never eats CancelledError).
+            log.info("playbook.run.cancelled run_id=%s", run.id)
+            await self._complete_run(run.id, "cancelled")
+            run.status = "cancelled"
         except Exception as e:
             log.exception("playbook.run.error run_id=%s", run.id)
             await self._complete_run(run.id, "failed", error=str(e))
@@ -200,14 +273,12 @@ class PlaybookRunner:
             message_source.reset(source_token)
             _active_run_id.reset(token)
 
-        return run
-
     async def _activity_heartbeat(
         self, activity_id: str, label: str, meta: dict[str, Any]
     ) -> None:
         """008.006: emit a steady `activity.heartbeat` while a run is alive.
 
-        Started in `start_run` and cancelled in its `finally`. Emit-then-sleep
+        Started in `_drive_run` and cancelled in its `finally`. Emit-then-sleep
         so the first beat fires immediately after `activity.started`. Clients
         treat `running = (now - lastBeat) < TTL`; if this loop stops without an
         `activity.completed` (crash), the indicator clears on its own. `meta`
@@ -278,7 +349,17 @@ class PlaybookRunner:
         }
 
     async def cancel_run(self, run_id: Any) -> None:
-        """Cancel a running playbook."""
+        """Cancel a running playbook.
+
+        plans/009: background runs are ACTUALLY stopped — the task is
+        cancelled and `_drive_run`'s CancelledError handler marks the run
+        (previously this only flipped the DB flag while every remaining step
+        kept executing). The DB fallback below covers runs with no live task.
+        """
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            task.cancel()
+            return
         async with self._sf() as session:
             run = await session.get(PlaybookRun, run_id)
             if run and run.status == "running":

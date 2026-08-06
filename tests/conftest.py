@@ -64,10 +64,9 @@ def _install_luna_sdk_stub() -> None:
 
         return Base
 
-    _message_source: ContextVar[str | None] = ContextVar("message_source", default=None)
-
-    def message_source() -> str | None:
-        return _message_source.get()
+    # The real SDK exposes a ContextVar (runner.py does message_source.set/
+    # reset around a run) — the stub must be one too, not a function.
+    message_source: ContextVar[str | None] = ContextVar("message_source", default=None)
 
     def get_current_user() -> Any:  # pragma: no cover - FastAPI dependency stand-in
         raise RuntimeError("stub: no auth outside the Luna runtime")

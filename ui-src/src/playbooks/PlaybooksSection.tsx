@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Plus, Loader2,
-  Workflow,
+  Workflow, Info,
   Archive, ArchiveRestore,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
@@ -14,6 +14,7 @@ import { subscribeActivityEvents } from '../lib/events'
 import { playbooksApi } from './api'
 import type { PlaybookSummary } from './types'
 import { PlaybookEditor } from './PlaybookEditor'
+import { ToolsGuide } from './ToolsGuide'
 import { setPlaybookConsumerReady } from './liveBus'
 import { applyActivity, runningNames as computeRunning } from './activityPresence'
 import { lastRunLabel, rateLabel } from './runStats'
@@ -27,6 +28,7 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
   const [selected, setSelected] = useState<SelectedItem | null>(null)
   const [creating, setCreating] = useState(false)
   const [tab, setTab] = useState<Tab>('active')
+  const [showGuide, setShowGuide] = useState(false)
   // 008.006: playbook name → last heartbeat ms. Derived `runningNames` drives
   // the badge; a 2s sweep drops stale beats so it self-clears within the TTL.
   const lastBeat = useRef<Map<string, number>>(new Map())
@@ -140,11 +142,26 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 shrink-0">
-        <div>
-          <h2 className="text-lg font-semibold text-ink-50">Playbooks</h2>
-          <p className="text-xs text-ink-500 mt-0.5">
-            Multi-step workflows Luna builds and runs for you
-          </p>
+        <div className="flex items-center gap-2">
+          <div>
+            <h2 className="text-lg font-semibold text-ink-50">Playbooks</h2>
+            <p className="text-xs text-ink-500 mt-0.5">
+              Multi-step workflows Luna builds and runs for you
+            </p>
+          </div>
+          <button
+            onClick={() => setShowGuide((s) => !s)}
+            className={cn(
+              'p-1.5 rounded-md transition self-start mt-0.5',
+              showGuide
+                ? 'text-luna-400 bg-luna-600/20'
+                : 'text-ink-500 hover:text-ink-300 hover:bg-white/5',
+            )}
+            title="What playbooks can do — the tools guide"
+            data-testid="tools-guide-toggle"
+          >
+            <Info className="w-4 h-4" />
+          </button>
         </div>
         {tab === 'active' && (
           <button
@@ -157,6 +174,8 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
           </button>
         )}
       </div>
+
+      {showGuide && <ToolsGuide />}
 
       {/* Tabs */}
       <div className="flex gap-1 px-6 pt-3 pb-1 shrink-0">

@@ -192,11 +192,24 @@ def build_tools(
     ))
 
     # --- playbook_run ---
-    async def _run(*, name: str, inputs: str = "{}") -> str:
+    # plans/009: hybrid-async. The old tool awaited the whole run and hit its
+    # 120s timeout on any slow playbook — the agent got a bare timeout, no
+    # run_id, and the orphaned run kept executing invisibly. Now the run
+    # starts in the background, we wait a bounded window, and either return
+    # the finished results (fast playbooks: unchanged one-call UX) or the
+    # run_id to poll with playbook_status.
+    _RUN_WAIT_DEFAULT = 55.0
+    _RUN_WAIT_MAX = 90.0
+
+    async def _run(*, name: str, inputs: str = "{}", wait_seconds: float | None = None) -> str:
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
         except json.JSONDecodeError:
             return json.dumps({"error": "Invalid JSON inputs"})
+
+        if wait_seconds is None:
+            wait_seconds = _RUN_WAIT_DEFAULT
+        wait_seconds = max(0.0, min(float(wait_seconds), _RUN_WAIT_MAX))
 
         async with session_factory() as session:
             playbook = (await session.execute(
@@ -225,23 +238,32 @@ def build_tools(
                 ),
             })
 
-        run = await runner.start_run(playbook, inputs=input_data, trigger="agent")
+        run = await runner.start_run_background(
+            playbook, inputs=input_data, trigger="agent",
+        )
+        waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
+        status = waited.status if waited else run.status
 
         result: dict = {
             "run_id": str(run.id),
             "playbook": name,
-            "status": run.status,
+            "status": status,
         }
 
-        if run.status == "failed":
-            async with session_factory() as session:
-                run_obj = await session.get(PlaybookRun, run.id)
-                if run_obj and run_obj.completed_at:
-                    result["error"] = (
-                        "Playbook execution FAILED. Do NOT fabricate results. "
-                        "Check the error details with playbook_status."
-                    )
-        elif run.status == "done":
+        if status == "running":
+            result["message"] = (
+                "The playbook is still executing in the background (this is "
+                f"normal for runs longer than {int(wait_seconds)}s). Poll "
+                "playbook_status(run_id) to see step-by-step progress and "
+                "final outputs. Do NOT re-run the playbook, and do NOT report "
+                "results until playbook_status shows status 'done'."
+            )
+        elif status == "failed":
+            result["error"] = (
+                "Playbook execution FAILED. Do NOT fabricate results. "
+                "Check the error details with playbook_status."
+            )
+        elif status == "done":
             async with session_factory() as session:
                 steps = (await session.execute(
                     select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
@@ -267,12 +289,28 @@ def build_tools(
             # runs). Use a `subtask` step for playbook composition.
             chat_only=True,
             timeout_seconds=120,
-            description="Trigger a playbook run with the given inputs.",
+            description=(
+                "Trigger a playbook run. The run executes in the BACKGROUND: "
+                "this returns the run_id immediately and waits up to "
+                "wait_seconds (default 55) for completion. Fast playbooks "
+                "return their results directly (status 'done' + step_results). "
+                "If the result says status 'running', the playbook is still "
+                "going — poll playbook_status(run_id) until it reaches "
+                "'done'/'failed'; never re-run it and never invent results."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
                     "inputs": {"type": "string", "description": "JSON string of inputs"},
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": (
+                            "How long to wait for completion before returning "
+                            "(0–90, default 55). Use 0 to fire-and-forget and "
+                            "poll playbook_status yourself."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
@@ -291,9 +329,16 @@ def build_tools(
                 select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
             )).scalars().all()
 
-            return json.dumps({
+            # plans/009: the polling target for background runs — surface
+            # run-level timing and the failing step's error at top level so a
+            # polling agent doesn't have to dig for them.
+            step_errors = [s.error for s in steps if s.error]
+            payload: dict = {
                 "run_id": run_id,
                 "status": run.status,
+                "trigger": run.trigger,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
                 "steps": [{
                     "step_id": s.step_id,
                     "kind": s.step_kind,
@@ -302,12 +347,25 @@ def build_tools(
                     "outputs": s.outputs,
                     "error": s.error,
                 } for s in steps],
-            })
+            }
+            if step_errors:
+                payload["error"] = step_errors[-1]
+            if run.status == "running":
+                payload["hint"] = (
+                    "Still running — poll playbook_status again in a bit. "
+                    "Completed steps above already show their outputs."
+                )
+            return json.dumps(payload)
 
     tools.append((
         ToolDef(
             name="playbook_status",
-            description="Get the full step trace of a playbook run.",
+            description=(
+                "Get the live state of a playbook run: overall status "
+                "(running/done/failed/cancelled), timing, and the full "
+                "step-by-step trace with each step's outputs and errors. "
+                "Poll this after playbook_run returns status 'running'."
+            ),
             parameters={
                 "type": "object",
                 "properties": {

@@ -17,7 +17,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.4.0",
+        version="0.5.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -71,7 +71,11 @@ class PlaybooksPlugin(LunaPlugin):
                     "does not exist in the namespace). A loop result is "
                     "`{iterations, results, collected}`, so gather with "
                     "`steps.<loop_id>.collected`.\n"
-                    "4. RUN: `playbook_run(name, inputs)` for real.\n"
+                    "4. RUN: `playbook_run(name, inputs)` for real. The run executes "
+                    "in the background: fast playbooks return results directly; if the "
+                    "result says status 'running', the run is still going — poll "
+                    "`playbook_status(run_id)` until 'done'/'failed'. Never re-run a "
+                    "'running' playbook and never invent its results.\n"
                     "5. INSPECT: `playbook_status(run_id)` — shows each step's resolved "
                     "inputs + outputs (your stack trace). Fix and repeat.\n\n"
                     "### THE POINT: turn a prompt into a process (read first)\n"

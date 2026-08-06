@@ -72,7 +72,11 @@ class PlaybookTriggerService:
                             pb.name, trigger.event,
                         )
                         try:
-                            await self._runner.start_run(
+                            # plans/009: background start — a slow playbook
+                            # must not block the event bus handler for its
+                            # whole duration. Execution errors are handled and
+                            # logged inside the runner's drive loop.
+                            await self._runner.start_run_background(
                                 pb, inputs=mapped, trigger=trigger.event,
                             )
                         except Exception:
