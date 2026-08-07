@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Loader2, Play, CircleDot, Clock, AlertTriangle, CheckCircle2, XCircle, X } from 'lucide-react'
 import { cn } from '../lib/cn'
+import { subscribePlaybookEvents } from '../lib/events'
 import { playbooksApi } from './api'
 import type { PlaybookRunSummary, RunStatus } from './types'
 
@@ -101,6 +102,15 @@ export function PlaybookRuns({
       .then(setRuns)
       .catch(() => {})
       .finally(() => setLoading(false))
+  }, [name])
+
+  // live: a run started or finished anywhere (chat, trigger, cron) — refetch
+  // so the panel isn't frozen at its mount-time snapshot
+  useEffect(() => {
+    return subscribePlaybookEvents((evt) => {
+      if (evt.event !== 'playbook.run.started' && evt.event !== 'playbook.run.completed') return
+      playbooksApi.listRuns(name).then(setRuns).catch(() => {})
+    })
   }, [name])
 
   return (

@@ -25,6 +25,7 @@ import { TriggerNode } from './nodes/TriggerNode'
 import { buildGraph } from './layout'
 import { applyPlaybookPatch, patchMatchesEditor, type PlaybookPatchEvt } from './livePatch'
 import { setPlaybookConsumerReady } from './liveBus'
+import { subscribePlaybookEvents } from '../lib/events'
 import { playbooksApi } from './api'
 import type {
   PlaybookDef, StepDef, StepKind, StepRunDetail,
@@ -312,25 +313,54 @@ export function PlaybookEditor(props: Props) {
     if (frame) fireNode(`step-${frame.stepId}`)
   }, [cursor, runDetail, fireNode])
 
-  // Near-live: poll a running run and refresh statuses without a layout rebuild
-  // (so the shimmer keeps moving on the same node objects).
+  // Refresh a loaded run's statuses without a layout rebuild (so the shimmer
+  // keeps moving on the same node objects). Shared by the fallback poll and
+  // the live playbook.step.* nudges.
+  const refreshRunStatuses = useCallback(async (runId: string) => {
+    try {
+      const fresh = await playbooksApi.getRun(runId)
+      setRunDetail(fresh)
+      setTimeline(buildTimeline(fresh))
+      const byStep = new Map(fresh.steps.map((s) => [s.step_id, s.status]))
+      setNodes((prev) => prev.map((n) => {
+        const sid = (n.data as any).stepId as string | undefined
+        const st = sid ? byStep.get(sid) : undefined
+        return st ? { ...n, data: { ...n.data, runStatus: st } } : n
+      }))
+    } catch { /* ignore */ }
+  }, [setNodes])
+
+  // Live attach: a run of THIS playbook started elsewhere (chat tool, trigger,
+  // cron) — load it onto the canvas so the run is visible without the owner
+  // digging through the Runs panel. Step/completion events nudge an immediate
+  // refresh so movement is instant; the poll below covers anything missed.
+  const runDetailRef = useRef<PlaybookRunDetail | null>(null)
+  useEffect(() => { runDetailRef.current = runDetail }, [runDetail])
+  useEffect(() => {
+    return subscribePlaybookEvents((evt) => {
+      const current = runDetailRef.current
+      if (evt.event === 'playbook.run.started') {
+        // attach only when idle — never yank the canvas off a run the owner
+        // is already watching
+        if (props.name && evt.playbook_name === props.name
+            && (!current || current.status !== 'running')) {
+          setViewMode('canvas')
+          loadCanvasRun(evt.run_id)
+        }
+        return
+      }
+      if (current && evt.run_id === current.id) {
+        void refreshRunStatuses(evt.run_id)
+      }
+    })
+  }, [props.name, loadCanvasRun, refreshRunStatuses])
+
+  // Near-live: poll a running run as a fallback for missed events.
   useEffect(() => {
     if (!runDetail || runDetail.status !== 'running') return
-    const t = setTimeout(async () => {
-      try {
-        const fresh = await playbooksApi.getRun(runDetail.id)
-        setRunDetail(fresh)
-        setTimeline(buildTimeline(fresh))
-        const byStep = new Map(fresh.steps.map((s) => [s.step_id, s.status]))
-        setNodes((prev) => prev.map((n) => {
-          const sid = (n.data as any).stepId as string | undefined
-          const st = sid ? byStep.get(sid) : undefined
-          return st ? { ...n, data: { ...n.data, runStatus: st } } : n
-        }))
-      } catch { /* ignore */ }
-    }, 1400)
+    const t = setTimeout(() => { void refreshRunStatuses(runDetail.id) }, 1400)
     return () => clearTimeout(t)
-  }, [runDetail, setNodes])
+  }, [runDetail, refreshRunStatuses])
 
   // Apply ONE patch: mutate the definition, rebuild the graph, mark the
   // affected node so it pops in with a glow in its kind color.
