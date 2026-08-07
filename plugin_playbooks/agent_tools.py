@@ -539,7 +539,19 @@ def build_tools(
         )
         errors = [i.to_dict() for i in issues if i.severity == "error"]
         warnings = [i.to_dict() for i in issues if i.severity == "warning"]
-        return json.dumps({"ok": not errors, "errors": errors, "warnings": warnings})
+        # 0.6.0 (luna 074/phase4): validate returns a success-shaped payload
+        # ("ok": true) that headless agents repeatedly mistook for a completed
+        # save — validate and edit have near-identical schemas, and edit used
+        # to be invisible headless. Say explicitly that nothing was persisted.
+        return json.dumps({
+            "ok": not errors, "errors": errors, "warnings": warnings,
+            "saved": False,
+            "note": (
+                "Validation only — NOTHING was saved. To persist a change, "
+                "call playbook_edit (existing playbook) or playbook_propose "
+                "(new playbook)."
+            ),
+        })
 
     tools.append((
         ToolDef(
@@ -668,7 +680,13 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit",
-            chat_only=True,
+            # 0.6.0 (luna 074/phase4): no longer chat_only. Headless turns
+            # (scheduled fires, playbook agent_steps) could only reach
+            # playbook_validate — the no-op twin with a near-identical schema
+            # — so scheduled "update the playbook" tasks silently saved
+            # nothing. Headless tool calls go through the same dispatch/
+            # approval gate as chat since luna 0.40.003, and the edit
+            # validates + snapshots a version before replacing.
             description=(
                 "Change an existing playbook by rewriting its FULL YAML (edit the "
                 "whole 'file' at once). This is the ONLY way to edit a playbook — get "
