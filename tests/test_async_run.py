@@ -197,3 +197,44 @@ async def test_cancel_run_without_task_falls_back_to_db_flag(env):
 async def test_wait_for_run_unknown_id_returns_none(env):
     sf, runner, _calls, _gate = env
     assert await runner.wait_for_run(uuid.uuid4(), timeout=0.01) is None
+
+
+async def test_sweep_marks_orphaned_runs_failed_but_spares_live_ones(env):
+    sf, runner, calls, gate = env
+    pb = await _save(sf, _playbook("swept-pb", [
+        {"id": "s1", "kind": "tool_call", "tool": "slow", "args": {}},
+    ]))
+
+    # orphan: a "running" row (with a "running" step) no task is driving —
+    # what a restart/upgrade or a pre-0.5.0 cancelled coroutine leaves behind
+    async with sf() as s:
+        orphan = PlaybookRun(playbook_id=pb.id, playbook_version=1, status="running")
+        s.add(orphan)
+        await s.flush()
+        s.add(PlaybookStepRun(
+            run_id=orphan.id, step_id="s1", step_kind="tool_call", status="running",
+        ))
+        await s.commit()
+        await s.refresh(orphan)
+
+    # live: a real background run parked on the gate — must NOT be swept
+    live = await runner.start_run_background(pb, inputs={})
+    while "slow-started" not in calls:
+        await asyncio.sleep(0.01)
+
+    assert await runner.sweep_orphaned_runs() == 1
+
+    swept = await _run_row(sf, orphan.id)
+    assert swept.status == "failed"
+    assert swept.completed_at is not None
+    async with sf() as s:
+        step = (await s.execute(
+            select(PlaybookStepRun).where(PlaybookStepRun.run_id == orphan.id)
+        )).scalars().one()
+    assert step.status == "failed"
+    assert "interrupted" in step.error
+
+    assert (await _run_row(sf, live.id)).status == "running"
+    gate.set()
+    done = await runner.wait_for_run(live.id, timeout=5)
+    assert done.status == "done"

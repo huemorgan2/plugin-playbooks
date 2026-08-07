@@ -17,7 +17,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.5.0",
+        version="0.5.1",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -425,6 +425,14 @@ class PlaybooksPlugin(LunaPlugin):
             agent=ctx.agent,
             context=ctx,
         )
+
+        # 0.5.1: rows still "running" from before this process existed
+        # (restart/upgrade, or pre-0.5.0 cancelled-mid-run coroutines) would
+        # otherwise sit at "running" forever. Never block the load on it.
+        try:
+            await self._runner.sweep_orphaned_runs()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: orphan-run sweep failed: %s", e)
 
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,

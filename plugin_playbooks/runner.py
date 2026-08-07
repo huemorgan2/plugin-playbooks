@@ -144,6 +144,49 @@ class PlaybookRunner:
         async with self._sf() as session:
             return await session.get(PlaybookRun, run_id)
 
+    async def sweep_orphaned_runs(self) -> int:
+        """0.5.1: mark "running" rows with no live task as failed.
+
+        A run row can claim "running" with nothing driving it: the process
+        restarted or the plugin was upgraded (background tasks die with the
+        process), or — pre-0.5.0 — the blocking tool call was cancelled at
+        the harness timeout and the CancelledError skipped every completion
+        handler. Called at plugin load, where `self._tasks` only contains
+        tasks started by THIS runner, so anything else is an orphan. Quiet by
+        design: no bus events for deaths that predate this process.
+        """
+        note = (
+            "interrupted — the server restarted or the plugin was upgraded "
+            "while this run was in flight"
+        )
+        now = datetime.now(timezone.utc)
+        swept = 0
+        async with self._sf() as session:
+            runs = (await session.execute(
+                select(PlaybookRun).where(PlaybookRun.status == "running")
+            )).scalars().all()
+            for run in runs:
+                if run.id in self._tasks:
+                    continue
+                run.status = "failed"
+                run.completed_at = now
+                steps = (await session.execute(
+                    select(PlaybookStepRun).where(
+                        PlaybookStepRun.run_id == run.id,
+                        PlaybookStepRun.status == "running",
+                    )
+                )).scalars().all()
+                for step in steps:
+                    step.status = "failed"
+                    step.error = step.error or note
+                    step.completed_at = step.completed_at or now
+                swept += 1
+            if swept:
+                await session.commit()
+        if swept:
+            log.info("playbook.runs.swept_orphans count=%d", swept)
+        return swept
+
     async def _create_run(
         self,
         playbook: Playbook,
