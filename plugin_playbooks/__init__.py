@@ -400,13 +400,32 @@ replaces the pointer, history keeps every version).
 2. `playbook_dry_run(name, inputs)` — tests the candidate by default.
 3. Real proof, if the owner wants it: `playbook_run_candidate(name, inputs)` —
 a REAL supervised run of the candidate (side effects included; asks the owner).
-4. `playbook_promote(name)` — runs the promotion gate (static validation;
-manifest drift was enforced at save time) and makes the candidate live. A
-refusal names the failing gate — fix the candidate, never bypass the gate.
+4. `playbook_promote(name)` — runs the promotion gate (static validation, the
+playbook's SPECS, manifest drift enforced at save time) and makes the
+candidate live. A refusal names the failing gate — fix the candidate, never
+bypass the gate.
 5. If a promoted change misbehaves: `playbook_rollback(name)` restores the
 previous live version.
 NEVER report an edit as done after `candidate_saved` — the owner's playbook
 still runs the old version until promote succeeds.
+
+### SPECS (playbook tests)
+A spec is a stored test: fixture `inputs`, scripted `stubs` (step-id or
+tool-name → the output that step should pretend to produce), and `expect`
+assertions over the dry-run trace (status, step order, per-tool call counts +
+`args_contain`, `output_contains`, `error_contains`). Specs run automatically
+on every candidate save (the save result reports pass/fail) and are a
+PROMOTE GATE — a failing spec blocks `playbook_promote` until the code is
+fixed or the spec is updated.
+- After a good real run, prefer `playbook_spec_from_run(name)` — it turns the
+recorded run into a spec proposal (stubs from real outputs); trim it and save
+with `playbook_spec_add(name, spec_name, spec_yaml)`.
+- `playbook_spec_run(name)` runs all specs on demand (candidate by default);
+`playbook_spec_list(name)` shows each spec's last result.
+- A playbook with no specs has no safety net: when you finish meaningful
+changes to a playbook that has none, propose pinning one from a good run.
+- Keep specs SMALL — assert the few things that matter (right tools called,
+right values in args). Over-tight specs fail on harmless changes.
 
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
 A new requirement (e.g. 'for EACH job role, first search LinkedIn for
@@ -420,8 +439,8 @@ a new top-level step.
 `playbook_edit(ticket=..., code=...)` with the full new source.
 4. RE-POINT downstream refs — steps after the seam must now read the NEW
 step's output. This rewiring is the real work of a change.
-5. `playbook_validate` -> `playbook_dry_run` (candidate) -> `playbook_promote`
--> `playbook_run`.
+5. `playbook_validate` -> `playbook_dry_run` (candidate) -> specs auto-ran on
+save (fix or update any that failed) -> `playbook_promote` -> `playbook_run`.
 Never create a '-v2' copy — edit IN PLACE by name; every version is kept in
 history and `playbook_rollback` restores the previous live one.
 
@@ -443,7 +462,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.10.0",
+        version="0.11.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -480,6 +499,11 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_dry_run",
                     "playbook_set_autonomy",
                     "playbook_list_available_triggers",
+                    "playbook_spec_add",
+                    "playbook_spec_list",
+                    "playbook_spec_delete",
+                    "playbook_spec_run",
+                    "playbook_spec_from_run",
                 ],
             ),
         ],
@@ -620,6 +644,12 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_dry_run",
         "playbook_set_autonomy",
         "playbook_list_available_triggers",
+        # 0.11.0: specs — every SkillDef tool must be here too (phase-3 rule).
+        "playbook_spec_add",
+        "playbook_spec_list",
+        "playbook_spec_delete",
+        "playbook_spec_run",
+        "playbook_spec_from_run",
     )
 
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:

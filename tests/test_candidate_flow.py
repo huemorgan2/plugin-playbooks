@@ -225,7 +225,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
     assert out["status"] == "promoted"
     assert out["live_version"] == 2
     assert out["previous_live_version"] == 1
-    assert [g["gate"] for g in out["gates"]] == ["static_validation", "manifest_drift"]
+    assert [g["gate"] for g in out["gates"]] == ["static_validation", "specs", "manifest_drift"]
     assert all(g["ok"] for g in out["gates"])
     pb = await _get(sf)
     assert pb.code == NEW_CODE                  # candidate content is live now

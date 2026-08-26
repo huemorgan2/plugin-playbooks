@@ -17,6 +17,8 @@ import json
 import uuid
 from typing import Any
 
+import yaml
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -27,10 +29,12 @@ from .models import (
     Playbook,
     PlaybookEditTicket,
     PlaybookRun,
+    PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
+from .specs import parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 
 
@@ -1204,7 +1208,7 @@ def build_tools(
             data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
             data["name"] = name  # never rename via edit
             playbook.version += 1
-            session.add(PlaybookVersion(
+            cand_row = PlaybookVersion(
                 playbook_id=playbook.id,
                 version=playbook.version,
                 definition=data,
@@ -1215,11 +1219,20 @@ def build_tools(
                     "candidate (drift gate skipped — forced edit)"
                     if forced else "candidate"
                 ),
-            ))
+            )
+            session.add(cand_row)
             playbook.candidate_version = playbook.version
             await session.commit()
             new_version = playbook.version
             live_version = _live_version_of(playbook)
+            # 0.11.0: auto-run the playbook's specs against the fresh
+            # candidate (dry-run — cheap, no side effects). A failing spec
+            # does NOT block the save; it blocks PROMOTE.
+            spec_summary = await run_all_specs(
+                session, runner, playbook.id,
+                _shim_playbook(playbook, cand_row), new_version,
+            )
+            await session.commit()  # persist last_result caches
 
         await events.emit("playbook.candidate.saved", {
             "name": name, "candidate_version": new_version,
@@ -1240,6 +1253,22 @@ def build_tools(
                 "restores the previous live version after a promote."
             ),
         }
+        if spec_summary["total"]:
+            result["specs"] = {
+                "passed": spec_summary["passed"],
+                "failed": spec_summary["failed"],
+            }
+            if spec_summary["failed"]:
+                result["specs"]["failures"] = [
+                    r for r in spec_summary["results"] if not r["passed"]
+                ]
+                result["next"] = (
+                    f"{spec_summary['failed']} spec(s) FAILED against this "
+                    "candidate — playbook_promote will refuse until they "
+                    "pass. Fix the code (playbook_edit) or update the spec "
+                    "(playbook_spec_add upserts by name) if the expectation "
+                    "itself changed."
+                )
         if forced:
             result["note"] = "manifest drift gate skipped (forced edit)"
         if drift_warning:
@@ -1451,7 +1480,36 @@ def build_tools(
                     "issues": errors,
                     "hint": "Fix the candidate via playbook_edit and retry.",
                 })
-            # gate 2: manifest drift — candidates only exist because the save
+            # gate 2 (0.11.0): specs — every stored spec must pass against
+            # the candidate. Failing results are cached on the spec rows
+            # (committed even on refusal, so playbook_spec_list shows them).
+            spec_summary = await run_all_specs(
+                session, runner, playbook.id,
+                _shim_playbook(playbook, row), row.version,
+            )
+            gates.append({
+                "gate": "specs",
+                "ok": spec_summary["failed"] == 0,
+                "note": (
+                    "no specs defined" if spec_summary["total"] == 0
+                    else f"{spec_summary['passed']}/{spec_summary['total']} passed"
+                ),
+            })
+            if spec_summary["failed"]:
+                await session.commit()  # persist last_result on the spec rows
+                return json.dumps({
+                    "error": "Promote refused — gate 'specs' failed.",
+                    "gate": "specs",
+                    "failing_specs": [
+                        r for r in spec_summary["results"] if not r["passed"]
+                    ],
+                    "hint": (
+                        "Fix the candidate via playbook_edit, or update the "
+                        "spec if the expectation itself changed "
+                        "(playbook_spec_add upserts by name)."
+                    ),
+                })
+            # gate 3: manifest drift — candidates only exist because the save
             # passed the drift check or the owner approved a forced edit
             # (recorded on the version row). Reported, never re-run here.
             forced = "forced" in (row.message or "")
@@ -1462,7 +1520,7 @@ def build_tools(
                     else "checked at save time"
                 ),
             })
-            # (specs and probes gates plug in here — phases 4 and 5.)
+            # (the probes gate plugs in here — phase 5.)
 
             old_live = _live_version_of(playbook)
             await _ensure_live_row(session, playbook)
@@ -1696,6 +1754,332 @@ def build_tools(
             risk_level="medium",
         ),
         _run_candidate,
+    ))
+
+    # --- specs: playbook tests (0.11.0, plans/002 phase 4) ---
+
+    async def _spec_target(
+        session: AsyncSession, playbook: Playbook, version: str,
+    ) -> tuple[Any, int] | str:
+        """Resolve which content specs run against: 'auto' = candidate when
+        one exists else live; or 'candidate' / 'live' / a version number.
+        Returns (target, version_n) or an error string."""
+        v = (version or "auto").strip().lower()
+        if v == "auto":
+            v = "candidate" if playbook.candidate_version else "live"
+        if v == "live":
+            return playbook, _live_version_of(playbook)
+        if v == "candidate":
+            if not playbook.candidate_version:
+                return f"'{playbook.name}' has no candidate version."
+            row = await _get_version_row(
+                session, playbook, playbook.candidate_version,
+            )
+            if row is None:
+                return "Candidate version row is missing — save the edit again."
+            return _shim_playbook(playbook, row), row.version
+        try:
+            n = int(v)
+        except ValueError:
+            return f"version must be 'auto', 'candidate', 'live', or a number — got '{version}'."
+        if n == _live_version_of(playbook):
+            return playbook, n
+        row = await _get_version_row(session, playbook, n)
+        if row is None:
+            return f"No stored content for version {n}."
+        return _shim_playbook(playbook, row), n
+
+    async def _spec_add(*, name: str, spec_name: str, spec_yaml: str) -> str:
+        try:
+            spec = parse_spec_yaml(spec_yaml)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            row = (await session.execute(
+                select(PlaybookSpec).where(
+                    PlaybookSpec.playbook_id == playbook.id,
+                    PlaybookSpec.name == spec_name,
+                )
+            )).scalar_one_or_none()
+            action = "updated" if row else "created"
+            if row is None:
+                row = PlaybookSpec(
+                    playbook_id=playbook.id, name=spec_name, created_by="agent",
+                    spec=spec.model_dump(mode="json", exclude_none=True),
+                )
+                session.add(row)
+            else:
+                row.spec = spec.model_dump(mode="json", exclude_none=True)
+            resolved = await _spec_target(session, playbook, "auto")
+            if isinstance(resolved, str):
+                return json.dumps({"error": resolved})
+            target, version_n = resolved
+            summary = await run_all_specs(
+                session, runner, playbook.id, target, version_n,
+                only_name=spec_name,
+            )
+            await session.commit()
+        res = summary["results"][0] if summary["results"] else None
+        out: dict[str, Any] = {
+            "playbook": name, "spec": spec_name, "status": action,
+            "ran_against_version": version_n, "result": res,
+        }
+        if res and not res["passed"]:
+            out["warning"] = (
+                "The spec FAILS against the current content — it was stored "
+                "anyway. playbook_promote will refuse while it fails."
+            )
+        return json.dumps(out)
+
+    tools.append((
+        ToolDef(
+            name="playbook_spec_add",
+            description=(
+                "Add or update (upsert by spec_name) a SPEC — a stored test "
+                "for a playbook: fixture inputs, scripted stubs for "
+                "tool/agent/llm steps, and assertions over the dry-run "
+                "trace. YAML keys: description, inputs {..}, stubs "
+                "{step_id_or_tool_name: scripted_output}, expect {status: "
+                "done|failed, steps_ran: [ids in order], steps_not_ran: "
+                "[ids], tool_calls: {tool: {count, args_contain: {..}}}, "
+                "output_contains: {step_id: substring}, error_contains}. "
+                "The spec runs immediately against the candidate (or live "
+                "when none) and on every future candidate save; a failing "
+                "spec blocks playbook_promote."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "spec_name": {"type": "string", "description": "Spec name (unique per playbook)"},
+                    "spec_yaml": {"type": "string", "description": "The spec document (YAML)"},
+                },
+                "required": ["name", "spec_name", "spec_yaml"],
+            },
+        ),
+        _spec_add,
+    ))
+
+    async def _spec_list(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            rows = (await session.execute(
+                select(PlaybookSpec)
+                .where(PlaybookSpec.playbook_id == playbook.id)
+                .order_by(PlaybookSpec.name)
+            )).scalars().all()
+        return json.dumps({
+            "playbook": name,
+            "count": len(rows),
+            "specs": [
+                {
+                    "name": r.name,
+                    "description": (r.spec or {}).get("description", ""),
+                    "created_by": r.created_by,
+                    "last_result": r.last_result,
+                    "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+                    "last_version": r.last_version,
+                }
+                for r in rows
+            ],
+            **({"note": (
+                "No specs — the playbook has no tests. "
+                "playbook_spec_from_run pins a good real run as a spec; "
+                "playbook_spec_add writes one from scratch."
+            )} if not rows else {}),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_spec_list",
+            description=(
+                "List a playbook's specs (its tests) with each spec's last "
+                "result, when it last ran, and against which version."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+        ),
+        _spec_list,
+    ))
+
+    async def _spec_delete(*, name: str, spec_name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            row = (await session.execute(
+                select(PlaybookSpec).where(
+                    PlaybookSpec.playbook_id == playbook.id,
+                    PlaybookSpec.name == spec_name,
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                return json.dumps({
+                    "error": f"'{name}' has no spec named '{spec_name}'.",
+                })
+            await session.delete(row)
+            await session.commit()
+        return json.dumps({"playbook": name, "spec": spec_name, "status": "deleted"})
+
+    tools.append((
+        ToolDef(
+            name="playbook_spec_delete",
+            description="Delete one of a playbook's specs by name.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "spec_name": {"type": "string", "description": "Spec to delete"},
+                },
+                "required": ["name", "spec_name"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _spec_delete,
+    ))
+
+    async def _spec_run(
+        *, name: str, spec_name: str = "", version: str = "auto",
+    ) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            resolved = await _spec_target(session, playbook, version)
+            if isinstance(resolved, str):
+                return json.dumps({"error": resolved})
+            target, version_n = resolved
+            summary = await run_all_specs(
+                session, runner, playbook.id, target, version_n,
+                only_name=spec_name or None,
+            )
+            await session.commit()
+        if spec_name and summary["total"] == 0:
+            return json.dumps({
+                "error": f"'{name}' has no spec named '{spec_name}'.",
+            })
+        is_cand = bool(playbook.candidate_version) and version_n == playbook.candidate_version
+        return json.dumps({
+            "playbook": name,
+            "ran_against_version": version_n,
+            "is_candidate": is_cand,
+            **summary,
+            **({"note": (
+                "No specs defined — nothing was tested. This playbook has "
+                "no safety net for promote."
+            )} if summary["total"] == 0 else {}),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_spec_run",
+            description=(
+                "Run a playbook's specs (all, or one via spec_name=) as "
+                "dry-runs with the spec's fixture inputs and stubs — no side "
+                "effects. version= targets 'auto' (candidate when one "
+                "exists, else live), 'candidate', 'live', or a number. "
+                "Returns per-spec pass/fail with readable failure lines."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "spec_name": {"type": "string", "description": "Run just this spec"},
+                    "version": {
+                        "type": "string",
+                        "description": "'auto' (default) | 'candidate' | 'live' | version number",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        _spec_run,
+    ))
+
+    async def _spec_from_run(*, name: str, run_id: str = "") -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            q = select(PlaybookRun).where(PlaybookRun.playbook_id == playbook.id)
+            if run_id:
+                try:
+                    q = q.where(PlaybookRun.id == uuid.UUID(run_id))
+                except ValueError:
+                    return json.dumps({"error": f"'{run_id}' is not a run id"})
+            else:
+                q = q.where(PlaybookRun.status == "done").order_by(
+                    PlaybookRun.started_at.desc()
+                ).limit(1)
+            run = (await session.execute(q)).scalars().first()
+            if run is None:
+                return json.dumps({
+                    "error": f"No completed run of '{name}' to pin"
+                             + (f" (run {run_id} not found)" if run_id else "")
+                             + ".",
+                })
+            steps = (await session.execute(
+                select(PlaybookStepRun)
+                .where(PlaybookStepRun.run_id == run.id)
+                .order_by(PlaybookStepRun.started_at)
+            )).scalars().all()
+        doc = spec_from_run(run, steps, playbook.definition)
+        return json.dumps({
+            "playbook": name,
+            "run_id": str(run.id),
+            "run_version": run.playbook_version,
+            "spec_yaml": yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+            "next": (
+                "This is a PROPOSAL built from the recorded run: trim stubs "
+                "and expectations you don't care about (over-tight specs "
+                "fail on harmless changes), give it a name, then save it "
+                "with playbook_spec_add."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_spec_from_run",
+            description=(
+                "Record & replay: build a spec PROPOSAL from a real "
+                "completed run — recorded tool outputs become stubs, the "
+                "run's inputs become fixture inputs, expectations are "
+                "seeded from what the run actually did (status, step order, "
+                "tool call counts). Defaults to the latest completed run; "
+                "pass run_id= to pin a specific one. Returns YAML to trim "
+                "and save via playbook_spec_add — nothing is stored yet."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "run_id": {"type": "string", "description": "Specific run to pin (default: latest done)"},
+                },
+                "required": ["name"],
+            },
+        ),
+        _spec_from_run,
     ))
 
     return tools

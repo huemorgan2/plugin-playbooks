@@ -347,6 +347,7 @@ class PlaybookRunner:
         self,
         playbook: Playbook,
         inputs: dict[str, Any] | None = None,
+        stubs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Simulate a run WITHOUT side effects: real control flow (loops,
         conditions, parallel, subtask, templates, expressions) but every
@@ -361,6 +362,7 @@ class PlaybookRunner:
             step_outputs={},
         )
         ctx.dry = True
+        ctx.stubs = stubs or {}
         status = "done"
         error: str | None = None
         try:
@@ -552,6 +554,12 @@ class PlaybookRunner:
         if ctx.dry:
             # No execution. Stub the result from the tool's output hints if any,
             # but always surface the RESOLVED args (proves templates rendered).
+            # Phase 4: a spec stub (step-id wins over tool-name) scripts the
+            # result so downstream templates see fixture-shaped data.
+            if step.id in ctx.stubs or step.tool in ctx.stubs:
+                scripted = ctx.stubs.get(step.id, ctx.stubs.get(step.tool))
+                return {"tool": step.tool, "resolved_args": args, "result": scripted,
+                        "stubbed": True, "_dry": True}
             return {"tool": step.tool, "resolved_args": args, "result": {"_dry": True}, "_dry": True}
         try:
             rt = self._tools.get(step.tool)
@@ -572,6 +580,8 @@ class PlaybookRunner:
             # Render the prompt (exercises templates) but never call the model.
             rendered = _render_template(step.prompt, ctx, step_id=step.id)
             ctx.step_inputs[step.id] = {"prompt": rendered[:2000]}
+            if step.id in ctx.stubs:
+                return ctx.stubs[step.id]
             return _stub_from_schema(step.output_schema)
         # 008.993 (E10): the agent is injected as ctx.agent (the sub-agent/turn
         # facade) at on_load — no more building one here from luna.agent.*.
@@ -618,6 +628,8 @@ class PlaybookRunner:
             if step.system:
                 _render_template(step.system, ctx, step_id=step.id)
             ctx.step_inputs[step.id] = {"prompt": rendered[:2000]}
+            if step.id in ctx.stubs:
+                return ctx.stubs[step.id]
             return _stub_from_schema(step.output_schema)
         agent = self._agent
         if not agent:
@@ -721,6 +733,7 @@ class PlaybookRunner:
             sub_def = PlaybookDef.model_validate(target.definition)
             sub_ctx = _RunContext(run_id=uuid.uuid4(), inputs=mapped_inputs, step_outputs={})
             sub_ctx.dry = True
+            sub_ctx.stubs = ctx.stubs
             try:
                 await self._execute_steps(sub_def.steps, sub_ctx)
             except _PlaybookHalt:
@@ -898,6 +911,7 @@ class PlaybookRunner:
                     conversation_id=ctx.conversation_id,
                 )
                 child.dry = ctx.dry
+                child.stubs = ctx.stubs
                 child.vars = dict(ctx.vars)
                 child.step_outputs[f"{step.id}._item"] = item
                 child.step_outputs[f"{step.id}._index"] = index
@@ -1093,6 +1107,9 @@ class _RunContext:
         # an in-memory trace instead of step rows.
         self.dry: bool = False
         self.trace: list[dict[str, Any]] = []
+        # plans/002 phase 4: dry-run stubs — step-id or tool-name → scripted
+        # output. Step-id keys win. Only consulted when self.dry is True.
+        self.stubs: dict[str, Any] = {}
         # 007.009.01: run-scoped mutable state — survives across loop
         # iterations. A `state` step reads/writes these; templates see `vars.*`.
         self.vars: dict[str, Any] = {}

@@ -171,6 +171,41 @@ class PlaybookStepRun(Base):
     )
 
 
+class PlaybookSpec(Base):
+    """0.11.0 (plans/002 phase 4): playbook tests.
+
+    A spec is fixture inputs + scripted stubs + assertions over the dry-run
+    trace (see specs.SpecDef). Specs auto-run on every candidate save and
+    gate playbook_promote. `last_*` cache the most recent evaluation for the
+    list tool, the promote gate report, and UI badges.
+    """
+    __tablename__ = "playbook_specs"
+
+    __table_args__ = (
+        Index("ix_playbook_specs_playbook_name", "playbook_id", "name", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    spec: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(64), default="agent", nullable=False)
+    last_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # the playbook version number the last evaluation ran against
+    last_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
 class PlaybookDraft(Base):
     """In-progress canvas drafts — persisted so page reloads don't lose work."""
     __tablename__ = "playbook_drafts"

@@ -21,7 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from luna_sdk import get_current_user
 
 from .definition import PlaybookDef, parse_yaml
-from .models import Playbook, PlaybookDraft, PlaybookRun, PlaybookStepRun, PlaybookVersion
+from .models import (
+    Playbook,
+    PlaybookDraft,
+    PlaybookRun,
+    PlaybookSpec,
+    PlaybookStepRun,
+    PlaybookVersion,
+)
+from .specs import run_all_specs
 from .validation import validate_definition
 
 # 009.001/phase03: every endpoint requires an authenticated user (router-level
@@ -209,6 +217,29 @@ async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersio
         )
         session.add(row)
     return row
+
+
+def _shim_for(p: Playbook, row: PlaybookVersion) -> Playbook:
+    """Transient Playbook carrying a version row's content — lets the runner
+    dry-run non-live content untouched. NEVER add it to a session."""
+    defn = dict(row.definition)
+    defn["name"] = p.name
+    return Playbook(
+        id=p.id,
+        name=p.name,
+        display_name=p.display_name,
+        description=defn.get("description") or p.description,
+        when_to_use=defn.get("when_to_use") or p.when_to_use,
+        inputs_schema=defn.get("inputs"),
+        definition=defn,
+        code=row.code,
+        manifest=row.manifest,
+        version=row.version,
+        live_version=row.version,
+        status=p.status,
+        agent_autonomy=p.agent_autonomy,
+        created_by=p.created_by,
+    )
 
 
 def _runs_per_day(runs: int, created_at: datetime | None, now: datetime) -> float:
@@ -747,7 +778,7 @@ async def promote_version(name: str, body: PromoteBody):
             raise HTTPException(404, f"Version {target_n} not found")
 
         if candidate:
-            # THE GATE (extensible — specs/probes gates plug in here).
+            # THE GATE (extensible — the probes gate plugs in here, phase 5).
             issues = validate_definition(
                 row.definition,
                 tool_registry=getattr(_runner, "_tools", None),
@@ -759,6 +790,20 @@ async def promote_version(name: str, body: PromoteBody):
                     "message": "Promote refused — gate 'static_validation' failed",
                     "gate": "static_validation",
                     "issues": errors,
+                })
+            # 0.11.0: specs gate — every stored spec must pass against the
+            # candidate (same gate as the playbook_promote tool).
+            spec_summary = await run_all_specs(
+                session, _runner, p.id, _shim_for(p, row), row.version,
+            )
+            if spec_summary["failed"]:
+                await session.commit()  # persist last_result on spec rows
+                raise HTTPException(422, {
+                    "message": "Promote refused — gate 'specs' failed",
+                    "gate": "specs",
+                    "failing_specs": [
+                        r for r in spec_summary["results"] if not r["passed"]
+                    ],
                 })
 
         old_live = _live_version_of(p)
@@ -820,6 +865,63 @@ async def rollback_playbook(name: str):
         }
     await _notify_changed(name)
     return result
+
+
+# --- Specs (0.11.0, plans/002 phase 4) ---
+
+@router.get("/playbooks/{name}/specs")
+async def list_specs(name: str):
+    """The playbook's tests + last results — feeds the phase-6 Tests tab."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        rows = (await session.execute(
+            select(PlaybookSpec)
+            .where(PlaybookSpec.playbook_id == p.id)
+            .order_by(PlaybookSpec.name)
+        )).scalars().all()
+        return {
+            "name": name,
+            "specs": [
+                {
+                    "name": r.name,
+                    "spec": r.spec,
+                    "created_by": r.created_by,
+                    "last_result": r.last_result,
+                    "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+                    "last_version": r.last_version,
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                }
+                for r in rows
+            ],
+        }
+
+
+@router.post("/playbooks/{name}/specs/run")
+async def run_specs_route(name: str):
+    """Run all specs against the candidate (or live when none) — the Tests
+    tab's run-all button."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        if p.candidate_version:
+            row = await _get_version_row(session, p, p.candidate_version)
+            if not row:
+                raise HTTPException(409, "Candidate version row is missing")
+            target, version_n = _shim_for(p, row), row.version
+        else:
+            target, version_n = p, _live_version_of(p)
+        summary = await run_all_specs(
+            session, _runner, p.id, target, version_n,
+        )
+        await session.commit()
+        return {"name": name, "ran_against_version": version_n, **summary}
 
 
 # --- Manifest (0.9.0, plans/002 phase 2) ---
