@@ -1,0 +1,57 @@
+event: delta
+data: {"text": "\n\nLet"}
+
+event: delta
+data: {"text": " me load"}
+
+event: delta
+data: {"text": " the play"}
+
+event: delta
+data: {"text": "book auth"}
+
+event: delta
+data: {"text": "oring skill"}
+
+event: delta
+data: {"text": " first"}
+
+event: delta
+data: {"text": " so"}
+
+event: delta
+data: {"text": " I can make the edit."}
+
+event: tool_call
+data: {"names": ["load_skill"]}
+
+event: tool_result
+data: {"name": "load_skill", "result": "{\"skill\": \"playbook-authoring\", \"instructions\": \"## Playbook Authoring\\n\\nA playbook is written in playbook CODE \\u2014 a restricted Python dialect. You WRITE\\ncode; Luna PARSES and COMPILES it into a step graph. It is NEVER executed as\\nPython: no imports, no def/class, no for/while/if statements, no function calls\\nexcept the combinators below and range(). Each statement is one step.\\n\\n### THE LOOP \\u2014 build a playbook like you write code (read first)\\nAuthoring a playbook IS coding. Never"}
+
+event: new_message
+data: {"id": "continuation-1-0a38f097-98a4ecf9-bf89-4708-bff3-d80b678f8b6e"}
+
+event: delta
+data: {"text": "Skill"}
+
+event: delta
+data: {"text": " loaded \u2014"}
+
+event: delta
+data: {"text": " proceeding to"}
+
+event: delta
+data: {"text": " edit"}
+
+event: delta
+data: {"text": " the"}
+
+event: delta
+data: {"text": " playbook now"}
+
+event: delta
+data: {"text": "."}
+
+event: done
+data: {"text": "Skill loaded \u2014 proceeding to edit the playbook now.", "needs_continuation": true, "context": {"used_tokens": 113901, "limit": 200000, "fraction": 0.5695, "sections": [{"key": "system_prompt", "label": "System prompt", "tokens": 17395}, {"key": "tools", "label": "Tool definitions", "tokens": 10347, "count": 146}, {"key": "skills", "label": "Skills", "tokens": 997}, {"key": "plugins", "label": "Plugin sections", "tokens": 7008}, {"key": "memories", "label": "Memories", "tokens": 89}, {"key": "conversation", "label": "Conversation", "tokens": 34}, {"key": "other", "label": "Other / overhead", "tokens": 78031}], "estimated": false}, "history_messages": 1}
+

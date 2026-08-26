@@ -1,0 +1,36 @@
+event: delta
+data: {"text": "\n\nI"}
+
+event: delta
+data: {"text": " can"}
+
+event: delta
+data: {"text": "'t do"}
+
+event: delta
+data: {"text": " that \u2014"}
+
+event: delta
+data: {"text": " it"}
+
+event: delta
+data: {"text": " would"}
+
+event: delta
+data: {"text": " viol"}
+
+event: delta
+data: {"text": "ate the playbook's manifest"}
+
+event: delta
+data: {"text": ", which explicitly states:\n\n> **Never:** Never greet in any language other than English.\n\nIf you want"}
+
+event: delta
+data: {"text": " to change this behavior, we'd need to update the manifest first (via `playbook_manifest_set`), which would require your"}
+
+event: delta
+data: {"text": " approval. Want me to go that route?"}
+
+event: done
+data: {"text": "\n\nI can't do that \u2014 it would violate the playbook's manifest, which explicitly states:\n\n> **Never:** Never greet in any language other than English.\n\nIf you want to change this behavior, we'd need to update the manifest first (via `playbook_manifest_set`), which would require your approval. Want me to go that route?", "context": {"used_tokens": 47902, "limit": 200000, "fraction": 0.2395, "sections": [{"key": "system_prompt", "label": "System prompt", "tokens": 18875}, {"key": "tools", "label": "Tool definitions", "tokens": 11175, "count": 160}, {"key": "skills", "label": "Skills", "tokens": 997}, {"key": "plugins", "label": "Plugin sections", "tokens": 7008}, {"key": "memories", "label": "Memories", "tokens": 89}, {"key": "conversation", "label": "Conversation", "tokens": 12207}], "estimated": false}, "history_messages": 86}
+

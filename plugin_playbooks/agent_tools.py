@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from luna_sdk import EventBus, ToolDef
 
-from .definition import AgentAutonomy, PlaybookDef, parse_yaml
+from .definition import AgentAutonomy, PlaybookDef
 from .models import (
     Playbook,
     PlaybookEditTicket,
@@ -173,24 +173,20 @@ def build_tools(
         manifest: str = "",
         agent_autonomy: str = "agent_must_confirm",
     ) -> str:
-        # 0.8.0 (plans/002 phase 1): code is the preferred authoring format;
-        # definition_yaml stays accepted until the migration phase removes it.
-        if bool(code) == bool(definition_yaml):
+        # 0.14.0 (plans/002 phase 7): code is the ONLY authoring format.
+        # definition_yaml is still a declared-nowhere kwarg so stale callers
+        # get a steering hint instead of a TypeError.
+        if definition_yaml:
             return json.dumps({
-                "error": "Provide exactly one of 'code' (preferred) or "
-                         "'definition_yaml'.",
+                "error": "YAML authoring was removed — write the playbook as "
+                         "`code` (see the playbook-authoring skill).",
             })
-        if code:
-            pb_def, err = _compile_code(code, name=name)
-            if err:
-                return err
-            stored_code: str | None = code
-        else:
-            try:
-                pb_def = parse_yaml(definition_yaml)
-            except Exception as e:
-                return json.dumps({"error": f"Invalid YAML: {e}"})
-            stored_code = _codegen_or_none(pb_def)
+        if not code:
+            return json.dumps({"error": "Provide 'code' — the full playbook source."})
+        pb_def, err = _compile_code(code, name=name)
+        if err:
+            return err
+        stored_code: str | None = code
 
         defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
         defn["name"] = name
@@ -203,20 +199,13 @@ def build_tools(
                 return json.dumps({"error": f"Playbook '{name}' already exists"})
             all_pb = await _load_all_playbook_steps(session, exclude=name)
 
-            # YAML path: validate the raw mapping so unknown keys (typos) are
-            # caught — the pydantic dump silently drops them. Code path: the
-            # compiler already rejects unknown kwargs, and the dump carries
-            # cross-kind defaults (fan_in/concurrency/...) the key checker
-            # would falsely flag — so skip the unknown-key check there.
-            if definition_yaml:
-                import yaml as _yaml
-                check_target = _yaml.safe_load(definition_yaml)
-            else:
-                check_target = defn
+            # The compiler already rejects unknown kwargs, and the dump
+            # carries cross-kind defaults (fan_in/concurrency/...) the key
+            # checker would falsely flag — so skip the unknown-key check.
             issues = validate_definition(
-                check_target,
+                defn,
                 tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
-                check_unknown_keys=bool(definition_yaml),
+                check_unknown_keys=False,
             )
             errors = [i.to_dict() for i in issues if i.severity == "error"]
             if errors:
@@ -272,12 +261,11 @@ def build_tools(
             chat_only=True,
             description=(
                 "Create a new playbook from its FULL source, written all at "
-                "once. PREFERRED: pass `code` — the playbook language "
+                "once. Pass `code` — the playbook language "
                 "(restricted Python: playbook(...) header, then "
                 "x = tool(...)/llm(...)/loop(...)/if_(...) steps; see the "
                 "playbook-authoring skill). The code is parsed and compiled, "
-                "never executed. Legacy: `definition_yaml` (full YAML IR). "
-                "Pass exactly one of the two."
+                "never executed."
             ),
             parameters={
                 "type": "object",
@@ -288,11 +276,7 @@ def build_tools(
                     "when_to_use": {"type": "string"},
                     "code": {
                         "type": "string",
-                        "description": "Full playbook code (preferred format)",
-                    },
-                    "definition_yaml": {
-                        "type": "string",
-                        "description": "Full YAML definition (legacy format)",
+                        "description": "Full playbook code",
                     },
                     "manifest": {
                         "type": "string",
@@ -1033,8 +1017,15 @@ def build_tools(
         skip_drift: bool = False,
         forced: bool = False,
     ) -> str:
+        # 0.14.0 (plans/002 phase 7): YAML input removed — steering hint for
+        # stale callers instead of a TypeError.
+        if definition_yaml:
+            return json.dumps({
+                "error": "YAML editing was removed — pass code= (full source) "
+                         "or old=/new= (targeted snippet) instead.",
+            })
         snippet_mode = bool(old) or bool(new)
-        modes = sum([bool(code), snippet_mode, bool(definition_yaml)])
+        modes = sum([bool(code), snippet_mode])
 
         # READ stage: no payload at all → manifest + code + fresh ticket.
         if modes == 0:
@@ -1073,8 +1064,8 @@ def build_tools(
                         "Read the manifest and the current code above — your "
                         "edit must stay within what the manifest states. Then "
                         "call playbook_edit again with this ticket and exactly "
-                        "one of: code= (full source), old=/new= (targeted "
-                        "snippet), or definition_yaml= (legacy). The ticket "
+                        "one of: code= (full source) or old=/new= (targeted "
+                        "snippet). The ticket "
                         "is single-use and expires. Saving creates a CANDIDATE "
                         "— the live playbook keeps running unchanged until "
                         "playbook_promote."
@@ -1090,8 +1081,7 @@ def build_tools(
 
         if modes != 1:
             return json.dumps({
-                "error": "Provide exactly one of: 'code', 'old'+'new', or "
-                         "'definition_yaml'.",
+                "error": "Provide exactly one of: 'code' or 'old'+'new'.",
             })
         if snippet_mode and not (old and new is not None):
             return json.dumps({"error": "Snippet edits need both 'old' and 'new'."})
@@ -1146,22 +1136,13 @@ def build_tools(
                     })
                 code = old_code.replace(old, new)
 
-            if code:
-                pb_def, err = _compile_code(code, name=name)
-                if err:
-                    return err
-                stored_code = code
-                check_target: Any = pb_def.model_dump(
-                    mode="json", exclude_none=True, by_alias=True,
-                )
-            else:
-                try:
-                    pb_def = parse_yaml(definition_yaml)
-                except Exception as e:
-                    return json.dumps({"error": f"Invalid YAML: {e}"})
-                stored_code = _codegen_or_none(pb_def)
-                import yaml as _yaml
-                check_target = _yaml.safe_load(definition_yaml)
+            pb_def, err = _compile_code(code, name=name)
+            if err:
+                return err
+            stored_code = code
+            check_target: Any = pb_def.model_dump(
+                mode="json", exclude_none=True, by_alias=True,
+            )
 
             all_pb = await _load_all_playbook_steps(session, exclude=name)
             issues = validate_definition(
@@ -1169,7 +1150,7 @@ def build_tools(
                 tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
                 # compiled dumps carry cross-kind defaults the key checker
                 # would falsely flag; the compiler already rejects typos.
-                check_unknown_keys=bool(definition_yaml),
+                check_unknown_keys=False,
             )
             errors = [i.to_dict() for i in issues if i.severity == "error"]
             if errors:
@@ -1183,7 +1164,7 @@ def build_tools(
         drift_warning: str | None = None
         if manifest.strip() and not skip_drift:
             verdict, drift_warning = await _drift_check(
-                manifest, old_code, stored_code or definition_yaml,
+                manifest, old_code, stored_code or "",
             )
             if verdict and verdict["conflict"]:
                 return json.dumps({
@@ -1319,10 +1300,6 @@ def build_tools(
             "description": "Exact snippet of the current code to replace (must be unique)",
         },
         "new": {"type": "string", "description": "Replacement text for 'old'"},
-        "definition_yaml": {
-            "type": "string",
-            "description": "Full new YAML definition (legacy format)",
-        },
     }
 
     tools.append((
@@ -1340,9 +1317,9 @@ def build_tools(
                 "call with ONLY the name; you get the playbook's manifest (its "
                 "owner-stated intent), the current code, and a single-use edit "
                 "ticket. STEP 2 (write): call again with that ticket plus "
-                "exactly one of code= (full new source), old=/new= (targeted "
-                "snippet; 'old' must match exactly one place), or "
-                "definition_yaml= (legacy). The write compiles, validates, "
+                "exactly one of code= (full new source) or old=/new= (targeted "
+                "snippet; 'old' must match exactly one place). "
+                "The write compiles, validates, "
                 "checks the edit against the manifest, snapshots a version, "
                 "then replaces the definition. Edits that conflict with the "
                 "manifest are refused."

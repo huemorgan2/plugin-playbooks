@@ -377,9 +377,9 @@ flow enforced by the tools:
 1. READ: `playbook_edit(name)` with nothing else → returns `{manifest, code,
 version, ticket, expires_in_seconds}`. Read the manifest — your edit must stay
 within it.
-2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`,
-`old=`/`new=`, or `definition_yaml=`. The ticket is single-use and expires in
-15 minutes; a save without a valid ticket is refused.
+2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`
+(full source) or `old=`/`new=` (targeted snippet). The ticket is single-use
+and expires in 15 minutes; a save without a valid ticket is refused.
 Every write is checked against the manifest. If it conflicts you get the
 reason and three legal moves: fix the code and retry with the SAME ticket
 (a refusal does not burn it); or update the manifest via
@@ -462,9 +462,10 @@ Messages land in the conversation the run was started from, live.
 should SEE something, a later `tool('send_chat_message', ...)` must pass it on.
 - NEVER invent tool names. A `tool()` step must reference a tool from your
 actual tool list — unknown tools are rejected at authoring time.
-- Legacy: `definition_yaml=` (the raw YAML IR) is still accepted by
-propose/edit/validate, and `playbook_get_definition(name, format='yaml')`
-returns it. Prefer code.
+- CODE is the only authoring format: propose/edit take `code=` (or `old=`/
+`new=`) and nothing else. `playbook_validate` still checks a legacy
+`definition_yaml=`, and `playbook_get_definition(name, format='yaml')` can
+show the compiled IR — both are read/check surfaces, not authoring inputs.
 '''
 
 
@@ -473,7 +474,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.13.0",
+        version="0.14.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -706,9 +707,10 @@ class PlaybooksPlugin(LunaPlugin):
                     for i in infos
                 ],
                 "note": (
-                    "Put the 'event' value in the playbook's `triggers:` block in the "
-                    "YAML you pass to playbook_propose / playbook_edit. The trigger "
-                    "goes live automatically when the playbook is saved."
+                    "Put the 'event' value in a trigger(...) entry of the playbook's "
+                    "triggers=[...] list in the code you pass to playbook_propose / "
+                    "playbook_edit. The trigger goes live automatically when the "
+                    "playbook is saved."
                 ),
             }
 
@@ -720,7 +722,8 @@ class PlaybooksPlugin(LunaPlugin):
                     "List external event triggers a playbook can bind to (from "
                     "connected apps that expose triggers — gmail, slack, github...). "
                     "Returns the exact event name to put in the playbook's "
-                    "`triggers:` block via playbook_propose / playbook_edit."
+                    "triggers=[trigger(...)] list via playbook_propose / "
+                    "playbook_edit."
                 ),
                 parameters={
                     "type": "object",

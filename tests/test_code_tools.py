@@ -77,14 +77,16 @@ async def test_propose_with_code_stores_code_and_definition(env):
 
 
 @pytest.mark.asyncio
-async def test_propose_requires_exactly_one_format(env):
+async def test_propose_requires_code_and_refuses_yaml(env):
+    # 0.14.0 (plans/002 phase 7): code is the only authoring format; a stale
+    # definition_yaml call gets a steering hint, not a save.
     _, tools = env
     out = json.loads(await tools["playbook_propose"](name="x"))
-    assert "exactly one" in out["error"]
+    assert "Provide 'code'" in out["error"]
     out = json.loads(await tools["playbook_propose"](
-        name="x", code=CODE, definition_yaml="name: x\nsteps: []",
+        name="x", definition_yaml="name: x\nsteps: []",
     ))
-    assert "exactly one" in out["error"]
+    assert "removed" in out["error"] and "code" in out["error"]
 
 
 @pytest.mark.asyncio
@@ -214,27 +216,15 @@ async def test_edit_requires_exactly_one_mode(env):
 
 
 @pytest.mark.asyncio
-async def test_yaml_edit_regenerates_code(env):
-    sf, tools = env
+async def test_yaml_edit_is_refused_with_steering_hint(env):
+    # 0.14.0 (plans/002 phase 7): the legacy YAML edit path is gone.
+    _, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    yaml_src = (
-        "name: greeter\n"
-        "steps:\n"
-        "  - id: say\n"
-        "    kind: tool_call\n"
-        "    tool: send_chat_message\n"
-        "    args: {message: 'hello'}\n"
-    )
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=await _ticket(tools, "greeter"),
-        definition_yaml=yaml_src,
+        definition_yaml="name: greeter\nsteps: []\n",
     ))
-    assert out["status"] == "candidate_saved"
-    async with sf() as s:
-        cand = (await s.execute(
-            select(PlaybookVersion).where(PlaybookVersion.version == out["candidate_version"])
-        )).scalar_one()
-    assert "message='hello'" in cand.code  # regenerated, not the stale source
+    assert "removed" in out["error"] and "old=/new=" in out["error"]
 
 
 @pytest.mark.asyncio

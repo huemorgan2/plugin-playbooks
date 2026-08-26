@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import logging
 import time
 import uuid
@@ -43,6 +44,24 @@ HEARTBEAT_INTERVAL = 2.5
 _active_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_active_run_id", default=None
 )
+
+
+def _normalize_tool_result(result: Any) -> Any:
+    """Parse JSON-string tool results into structured data.
+
+    Most Luna tool handlers return json.dumps(...) strings. Stored raw, they
+    leak quoted JSON into step outputs, spec_from_run stubs, and the run
+    view (plans/002 phase 7). Only strings that parse to a dict or list are
+    converted — plain text passes through untouched.
+    """
+    if isinstance(result, str) and result.lstrip()[:1] in ("{", "["):
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            return result
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return result
 
 
 def _playbook_origin_scope(playbook: Any):
@@ -570,7 +589,7 @@ class PlaybookRunner:
                 "that does not exist."
             ) from None
         result = await rt.handler(**args)
-        return {"tool": step.tool, "result": result}
+        return {"tool": step.tool, "result": _normalize_tool_result(result)}
 
     async def _run_agent_step(self, step: StepDef, ctx: _RunContext) -> Any:
         """Execute an agent_step — full LLM turn via run_turn()."""

@@ -238,3 +238,36 @@ async def test_sweep_marks_orphaned_runs_failed_but_spares_live_ones(env):
     gate.set()
     done = await runner.wait_for_run(live.id, timeout=5)
     assert done.status == "done"
+
+
+async def test_tool_results_normalized_json_strings_become_structured(env):
+    # plans/002 phase 7: handlers that return json.dumps(...) strings must not
+    # leak quoted JSON into step outputs; plain text stays a string.
+    sf, _, _, _ = env
+
+    async def json_tool(**_kw):
+        return '{"sent": true, "count": 2}'
+
+    async def text_tool(**_kw):
+        return "plain words, not JSON"
+
+    runner = PlaybookRunner(
+        session_factory=sf,
+        tool_registry=_Tools(jsonish=_Tool(json_tool), texty=_Tool(text_tool)),
+        events=_Bus(),
+    )
+    pb = await _save(sf, _playbook("norm-pb", [
+        {"id": "a", "kind": "tool_call", "tool": "jsonish", "args": {}},
+        {"id": "b", "kind": "tool_call", "tool": "texty", "args": {}},
+    ]))
+    run = await runner.start_run_background(pb, inputs={})
+    done = await runner.wait_for_run(run.id, timeout=5)
+    assert done.status == "done"
+
+    async with sf() as s:
+        steps = (await s.execute(
+            select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
+        )).scalars().all()
+    outs = {st.step_id: st.outputs for st in steps}
+    assert outs["a"]["result"] == {"sent": True, "count": 2}
+    assert outs["b"]["result"] == "plain words, not JSON"
