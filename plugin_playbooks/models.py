@@ -37,6 +37,11 @@ class Playbook(Base):
     when_to_use: Mapped[str] = mapped_column(Text, default="", nullable=False)
     inputs_schema: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     definition: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # 0.8.0 (plans/002 phase 1): the pblang Python source this definition was
+    # compiled from. NULL means "derive via codegen on read" — any write path
+    # that changes `definition` without code MUST null this out (stale code is
+    # worse than no code).
+    code: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="enabled", nullable=False)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
@@ -61,6 +66,8 @@ class PlaybookVersion(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     definition: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # 0.8.0: pblang source at snapshot time (NULL = derive via codegen).
+    code: Mapped[str | None] = mapped_column(Text, nullable=True)
     author: Mapped[str] = mapped_column(String(64), default="owner", nullable=False)
     message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     promoted_from: Mapped[int | None] = mapped_column(Integer, nullable=True)

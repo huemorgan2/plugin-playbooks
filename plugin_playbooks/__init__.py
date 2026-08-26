@@ -12,12 +12,356 @@ from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, 
 logger = logging.getLogger(__name__)
 
 
+async def _ensure_code_columns(engine) -> None:
+    """Add the nullable `code` TEXT column to pre-0.8.0 installs."""
+    from sqlalchemy import inspect, text
+
+    def _missing(sync_conn):
+        insp = inspect(sync_conn)
+        out = []
+        for table in ("playbooks", "playbook_versions"):
+            cols = {c["name"] for c in insp.get_columns(table)}
+            if "code" not in cols:
+                out.append(table)
+        return out
+
+    async with engine.begin() as conn:
+        for table in await conn.run_sync(_missing):
+            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN code TEXT"))
+            logger.info("playbooks: added code column to %s", table)
+
+
+async def backfill_code(session_factory) -> int:
+    """Store pblang code for every playbook that has none.
+
+    Each backfill is verified — the generated code must compile back to the
+    exact same definition, else the row is skipped (code stays NULL and is
+    derived on read). Returns the number of rows backfilled.
+    """
+    from sqlalchemy import select
+
+    from .definition import PlaybookDef
+    from .models import Playbook
+    from .pblang import compile_playbook, defs_equal, generate_code
+
+    filled = 0
+    async with session_factory() as session:
+        rows = (await session.execute(
+            select(Playbook).where(Playbook.code.is_(None))
+        )).scalars().all()
+        for pb in rows:
+            try:
+                d = PlaybookDef.model_validate(pb.definition)
+                code = generate_code(d)
+                if defs_equal(d, compile_playbook(code)):
+                    pb.code = code
+                    filled += 1
+                else:
+                    logger.warning(
+                        "playbooks: codegen round-trip drift for '%s' — "
+                        "leaving code NULL", pb.name,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "playbooks: could not backfill code for '%s': %s",
+                    pb.name, e,
+                )
+        if filled:
+            await session.commit()
+    if filled:
+        logger.info("playbooks: backfilled pblang code for %d playbook(s)", filled)
+    return filled
+
+
+# 0.8.0 (plans/002 phase 1): the authoring skill teaches playbook CODE —
+# the restricted-Python language compiled by pblang. Both examples are
+# compile-verified in tests/test_pblang.py (test_skill_examples_compile).
+_AUTHORING_SKILL_BODY = '''\
+## Playbook Authoring
+
+A playbook is written in playbook CODE — a restricted Python dialect. You WRITE
+code; Luna PARSES and COMPILES it into a step graph. It is NEVER executed as
+Python: no imports, no def/class, no for/while/if statements, no function calls
+except the combinators below and range(). Each statement is one step.
+
+### THE LOOP — build a playbook like you write code (read first)
+Authoring a playbook IS coding. Never run blind. Always:
+0. OUTLINE FIRST — before any code, write the decomposition as one line per
+step: `id -> kind -> the SINGLE operation`. Then self-check three rules:
+(a) any line with a quantifier (each/all/every) MUST be a `loop`; (b) no
+single step may carry the whole task — if one step would, you have one line,
+so keep decomposing until each line is atomic; (c) each `agent()`/`llm()` is
+ONE judgment on ONE thing. Only when the outline passes do you write code.
+1. WRITE: `playbook_propose(name, code=...)` to create. EDIT: get the current
+code with `playbook_get_definition(name)`, then `playbook_edit(name, code=...)`
+with the full new source, or `playbook_edit(name, old=..., new=...)` for a
+targeted change (the `old` snippet must match exactly one place).
+2. COMPILE: `playbook_validate(code=...)` or `playbook_validate(name=...)` —
+returns ALL errors at once (compile errors with line numbers, undefined
+steps/inputs references, unknown tools, bad loops, cycles). Fix every error.
+3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with tool/LLM
+steps STUBBED. It proves loops iterate, branches pick the right path, and
+templates resolve — no side effects, no token cost. Outputs are SIMULATED:
+NEVER report a dry-run value to the user as a real result.
+   Reading the result: `references` shows the exact template namespace — i.e.
+precisely what every `steps.<id>.<field>` resolves to. Copy your paths from
+there. The `trace` list is execution order; its per-step `output` key is JUST
+a trace label — do NOT write `steps.<id>.output.<field>` (that key does not
+exist). A loop result is `{iterations, results, collected}`, so gather with
+`steps.<loop_id>.collected`.
+4. RUN: `playbook_run(name, inputs)` for real. Runs execute in the background:
+fast playbooks return results directly; if the result says status 'running',
+poll `playbook_status(run_id)` until 'done'/'failed'. Never re-run a 'running'
+playbook and never invent its results.
+5. INSPECT: `playbook_status(run_id)` — each step's resolved inputs + outputs
+(your stack trace). Fix and repeat.
+
+### THE POINT: turn a prompt into a process (read first)
+A playbook's value is DECOMPOSITION — breaking a task into small, visible,
+reusable steps with structured data flowing between them. If you put the whole
+task into ONE agent() prompt ('search emails, find subscriptions, format a
+table, total it'), you've built a prompt wearing a playbook costume: one opaque
+LLM call, no per-step visibility, no reuse, no typed data. Don't.
+
+### AGENT DECIDES, THE WORKFLOW WORKS (the core principle)
+An `agent()` step is a DECISION node — a judgment that needs tools or memory
+mid-reasoning. It is NOT where you do the work. Fetching, searching, looping,
+transforming, storing, traversing are WORK — they go in `tool()`, `loop()`,
+`state()` steps where each is visible, typed, and reusable. If you catch
+yourself writing a paragraph that tells an agent to go DO a multi-step job,
+stop: that paragraph is your step list. Call an agent only for the DECISIONS
+the graph cannot express deterministically (judge / classify / rank / choose).
+The validator enforces this and will report:
+- `monolithic-playbook` (ERROR — blocks): the whole playbook is one delegated
+step that hides a process. You must decompose it.
+- `compound-leaf` (warning): one leaf step's prompt hides a loop or several
+operations. Make a loop / split the step.
+- `agent-does-work` (warning): an `agent()` doing mechanical work with no
+judgment — use a `tool()`. Treat warnings as redesign signals, not noise.
+
+Rules of thumb:
+- If a step's prompt contains 'and then', a numbered list, or the word 'each',
+it is probably SEVERAL steps.
+- One LLM step = ONE judgment or extraction on ONE thing (classify THIS email).
+Iterate with `loop()`, branch with `if_()`, do deterministic work with `tool()`.
+- DEFAULT to `llm()` for pure transforms (classify, extract, summarize,
+format). It's a single raw model call — no tools, no memory — cheaper, faster
+(Haiku by default), deterministic. Use `agent()` ONLY when the step must call
+tools or use memory mid-reasoning.
+- Prefer `output=` on llm/agent steps so they emit STRUCTURED DATA the next
+step can filter/branch on — not prose a later step has to re-parse.
+- To gather results across a loop, use `collect=`; read them at
+`steps.<loop_id>.collected`.
+
+### Worked example — 'scan my emails for subscriptions':
+WRONG (one mega-step): a single agent() whose prompt loops over emails,
+classifies, formats a table, and totals it.
+RIGHT (a process):
+```python
+playbook(
+    name='subscription-scan',
+    description='Scan emails for paid subscriptions',
+    when_to_use='When the owner asks what subscriptions they pay for',
+)
+
+fetch = tool('gmail__gmail__fetch_emails', query='after:2024/12/15 (receipt OR invoice)')
+scan = loop(
+    over='{{ steps.fetch.result.messages }}',
+    item_name='email',
+    concurrency=4,
+    body=[
+        llm(
+            'Is THIS ONE email a paid subscription? {{ email }}',
+            output={'is_subscription': 'bool', 'service': 'str', 'amount': 'number'},
+            id='classify',
+        ),
+    ],
+    collect='{{ steps.classify }}',
+)
+report = llm(
+    """Build a markdown report of subscriptions from:
+{{ steps.scan.collected | selectattr('is_subscription') | list }}""",
+    output={'report': 'str'},
+)
+notify = tool('send_chat_message', message='{{ steps.report.report }}')
+```
+Each step is inspectable on the canvas, `classify` is reusable, and the data
+between steps is typed. THAT is a playbook.
+
+### THE LANGUAGE — exact rules (the compiler enforces all of this)
+- The FIRST statement must be the `playbook(...)` header: `name=` (required),
+`display_name=`, `description=`, `when_to_use=`, `agent_autonomy=`,
+`inputs=` (JSON-schema dict), `triggers=[trigger(event=..., filter={...},
+map={...})]`.
+- Every step is `<id> = combinator(...)`. The VARIABLE NAME is the step id —
+later steps reference it as `steps.<id>....`. Inside nested lists (loop body,
+then/else, parallel branches) use walrus `(x := llm(...))` or pass `id='x'`.
+A bare call with no name gets a generated id.
+- Combinators (the ONLY callables, plus range()):
+  - `tool('tool_name', **args)` — call a registered Luna tool; loose kwargs
+    are the tool args.
+  - `llm(prompt, output={...}, purpose=..., model=..., system=...)` — raw
+    model call, no tools. `purpose='reasoning'` routes to the big model.
+  - `agent(prompt, output={...}, tools=[...])` — full agent turn.
+  - `if_(cond, then=[...], else_=[...])` — branch.
+  - `loop(over=... | while_=... | until=..., item_name=..., body=[...],
+    collect=..., break_when=..., max_iterations=..., concurrency=...)`.
+  - `parallel([[...], [...]], fan_in='all')` — list of branch step-lists.
+  - `approve(show=[...])` — pause for owner approval.
+  - `wait_event('event.name', filter={...}, timeout_seconds=...)`.
+  - `subtask('other-playbook', inputs={...}, returns={...})`.
+  - `state(op, op, ...)` — mutate run vars; ops below.
+  - `halt(when=..., value=...)` — end the run early as SUCCESS.
+- Common kwargs on ANY step: `id=`, `explanation=`, `retry=` (int, or
+`{'max': 2, 'backoff_seconds': 5.0}`), `on_error=` ('abort'|'continue'),
+`timeout=` seconds.
+- EXPRESSIONS: plain strings pass through verbatim — write Jinja `{{ ... }}`
+inside them for templating. Bare Python expressions over `inputs`, `vars`,
+`steps`, `event` also work (`inputs.n + 1`, `steps.fetch.result`), and
+f-strings work in prompts/args. Jinja FILTERS (`| length`, `| selectattr`)
+only exist inside strings: write `'{{ vars.frontier | length > 0 }}'`.
+- BANNED (compile errors with a hint): any other function call, comprehensions,
+lambdas, imports, def/class, Python for/while/if statements (use loop()/if_()),
+`is`/`is not`. Duplicate step ids are rejected.
+- The `name` in the header cannot rename an existing playbook — the tool's
+`name` argument always wins.
+
+### CONTEXT ECONOMY — iterate, never dump (critical)
+Keep the AGENTIC CONTEXT small. The #1 way a playbook fails is dumping a big
+collection into ONE model call. To process N items: LOOP over them, judge ONE
+per iteration with `llm()`, emit a SMALL structured result, `collect=` it, then
+operate on the reduced set. NEVER write a single step whose prompt interpolates
+a whole collection like `{{ steps.fetch.result.messages }}` for 1000 emails.
+The validator warns on this; treat it as a redesign signal.
+
+### REFERENCE SHAPES — get the path right or the run fails LOUD
+Templates fail loudly on an undefined reference. Memorize these:
+- `tool()` output is wrapped: read the tool's data under `.result`. A tool
+returning {messages: [...]} is `steps.<id>.result.messages`.
+- A schemaless `llm()`/`agent()` returns `{_raw: <text>}` — read
+`steps.<id>._raw`. There is NO `.output`. To get typed fields declare
+`output=`. This is the #1 cause of a loop that collected nulls.
+- `loop()` output is {iterations, results, collected, stopped} — gather with
+`steps.<loop_id>.collected`. `stopped` is null (drained), 'break'
+(break_when), or 'max_iterations' (hit the cap).
+If validate errors on a `.field`, you have the wrong path; copy the right one
+from `dry_run`'s `references`.
+
+### RUN-SCOPED STATE — stacks, queues, sets, counters (the big one)
+A `state()` step mutates run-scoped variables that PERSIST across loop
+iterations. Read them anywhere as `vars.<name>`. This is how you build a REAL
+recursive crawl / BFS / DFS / dedup / accumulator — instead of HARDCODING a
+list you guessed. Ops (one state() may carry several, applied in order):
+- `set_('var', value)` | `append`/`extend` (list grow) | `merge` (dict)
+- `push_back` + `pop_back` = STACK (LIFO)
+- `push_back` + `pop_front` = QUEUE (FIFO)
+- `pop_back('var', into='x')` / `pop_front('var', into='x')` — `into=`
+captures what you popped (else it's discarded — the validator warns)
+- `add_unique` = SET (dedup) | `incr('n')`/`decr('n')` = COUNTER | `delete`
+Values are expressions: `set_('frontier', '[ inputs.start_url ]')`,
+`push_back('frontier', '{{ link }}')`, `set_('n', '0')`.
+
+### NEVER HARDCODE A DISCOVERABLE LIST (hard rule)
+If a task is 'scan/crawl/traverse a site / a tree / paginated results /
+a graph', you MUST discover items at RUN TIME with a frontier — do NOT write N
+sibling tool() calls to URLs/items you guessed. The pattern:
+```python
+playbook(
+    name='site-crawl',
+    description='BFS crawl',
+    inputs={'type': 'object', 'properties': {'start_url': {'type': 'string'}}},
+)
+
+seed = state(set_('frontier', '[ inputs.start_url ]'), set_('visited', '[]'))
+crawl = loop(
+    while_='{{ vars.frontier | length > 0 }}',   # frontier grows + shrinks
+    max_iterations=200,                          # safety cap
+    body=[
+        state(
+            pop_front('frontier', into='cur'),   # FIFO = BFS
+            add_unique('visited', '{{ vars.cur }}'),
+            id='take',
+        ),
+        tool('web_fetch', url='{{ vars.cur }}', id='fetch'),
+        llm(
+            """List internal link URLs on this page:
+{{ steps.fetch.result }}""",
+            output={'links': 'array'},
+            id='links',
+        ),
+        loop(
+            over='{{ steps.links.links }}',
+            item_name='link',
+            body=[
+                if_(
+                    '{{ link not in vars.visited and link not in vars.frontier }}',
+                    then=[
+                        state(push_back('frontier', '{{ link }}'), id='push'),
+                    ],
+                    id='gate',
+                ),
+            ],
+            id='enqueue',
+        ),
+    ],
+)
+```
+Swap pop_front→pop_back for DFS. The `visited` set makes it cycle-safe;
+`max_iterations` bounds it. THAT is a crawl.
+
+### Loop config (exact kwargs — no other fields work):
+- `over=`: a literal list or an expression producing one
+(`over='{{ range(1, inputs.n + 1) }}'` or `over=[1, 2, 3]`)
+- `until=`: loops UNTIL the condition is true
+- `while_=`: loops WHILE true (the frontier pattern; mutate a `vars.*` each
+iteration with a state() step or it runs to the cap — ALWAYS set
+`max_iterations` on a while loop)
+- `break_when=`: checked AFTER each iteration; stops early (stopped: 'break')
+- `concurrency=N`: run up to N item bodies in parallel (default 1). Bodies are
+isolated — do NOT mutate shared state inside a concurrent loop; only
+`collect` merges back (in item order). PREFER `concurrency=4` whenever the
+body is side-effect-free; sequential `over` loops waste wall-clock.
+- `item_name='email'` makes `{{ email }}` and `{{ email_index }}` available
+inside the body
+- `collect=`: an expression evaluated AFTER each iteration (item vars still in
+scope); results append to `steps.<loop_id>.collected`. THIS is how you gather
+per-iteration outputs — without it only the last iteration survives.
+- A loop with an empty body does NOTHING — nest at least one step in `body=[]`.
+
+### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
+A new requirement (e.g. 'for EACH job role, first search LinkedIn for
+comparables') is almost always an INSERTION mid-graph, NOT a step bolted on the
+end, and NEVER a second monolith. Recipe:
+1. `playbook_get_definition(name)` — read the current code.
+2. Find the SEAM — 'for each role' means inside the per-role loop() body, not
+a new top-level step.
+3. Splice the new steps there, decomposed. Use `playbook_edit(old=..., new=...)`
+for a surgical splice, or `playbook_edit(code=...)` with the full new source.
+4. RE-POINT downstream refs — steps after the seam must now read the NEW
+step's output. This rewiring is the real work of a change.
+5. `playbook_validate` -> `playbook_dry_run` -> `playbook_run`.
+Never create a '-v2' copy — edit IN PLACE by name; every edit snapshots a
+version first, so history is kept.
+
+### Posting to the chat from a playbook:
+- Steps CAN post into the chat: `tool('send_chat_message', message='...')`.
+Messages land in the conversation the run was started from, live.
+- An `llm()`/`agent()` output is only stored on the run record — if the owner
+should SEE something, a later `tool('send_chat_message', ...)` must pass it on.
+- NEVER invent tool names. A `tool()` step must reference a tool from your
+actual tool list — unknown tools are rejected at authoring time.
+- Legacy: `definition_yaml=` (the raw YAML IR) is still accepted by
+propose/edit/validate, and `playbook_get_definition(name, format='yaml')`
+returns it. Prefer code.
+'''
+
+
 class PlaybooksPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.7.0",
+        version="0.8.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -40,336 +384,7 @@ class PlaybooksPlugin(LunaPlugin):
                     "modifying any playbook; the authoring tools (propose, edit, "
                     "validate, dry_run, …) unlock on your next turn"
                 ),
-                body=(
-                    "## Playbook Authoring\n\n"
-                    "A playbook is a YAML definition with steps that execute sequentially.\n\n"
-                    "### THE LOOP — build a playbook like you write code (read first)\n"
-                    "Authoring a playbook IS coding. Never run blind. Always:\n"
-                    "0. OUTLINE FIRST — before any YAML, write the decomposition as one "
-                    "line per step: `id -> kind -> the SINGLE operation`. Then self-check "
-                    "three rules: (a) any line with a quantifier (each/all/every) MUST be "
-                    "a `loop`; (b) no single step may carry the whole task — if one step "
-                    "would, you have one line, so keep decomposing until each line is "
-                    "atomic; (c) each `agent_step`/`llm_step` is ONE judgment on ONE "
-                    "thing. Only when the outline passes do you write YAML.\n"
-                    "1. WRITE/EDIT the YAML (`playbook_propose` to create, "
-                    "`playbook_edit` to rewrite a whole existing one).\n"
-                    "2. COMPILE: `playbook_validate(name=...)` or "
-                    "`playbook_validate(definition_yaml=...)` — a static check that "
-                    "returns ALL errors at once (undefined {{steps}}/{{inputs}} refs, "
-                    "unknown tools, bad loops, cycles). Fix every error before running.\n"
-                    "3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with "
-                    "tool/LLM steps STUBBED. It proves loops iterate, branches pick the "
-                    "right path, and templates resolve — with no side effects and no "
-                    "token cost. The outputs are SIMULATED: NEVER report a dry-run value "
-                    "to the user as a real result.\n"
-                    "   Reading the result: `references` shows the exact template "
-                    "namespace — i.e. precisely what every `steps.<id>.<field>` "
-                    "resolves to. Copy your paths from there. The `trace` list is "
-                    "execution order; its per-step `output` key is JUST a trace label "
-                    "— do NOT write `steps.<id>.output.<field>` in templates (that key "
-                    "does not exist in the namespace). A loop result is "
-                    "`{iterations, results, collected}`, so gather with "
-                    "`steps.<loop_id>.collected`.\n"
-                    "4. RUN: `playbook_run(name, inputs)` for real. The run executes "
-                    "in the background: fast playbooks return results directly; if the "
-                    "result says status 'running', the run is still going — poll "
-                    "`playbook_status(run_id)` until 'done'/'failed'. Never re-run a "
-                    "'running' playbook and never invent its results.\n"
-                    "5. INSPECT: `playbook_status(run_id)` — shows each step's resolved "
-                    "inputs + outputs (your stack trace). Fix and repeat.\n\n"
-                    "### THE POINT: turn a prompt into a process (read first)\n"
-                    "A playbook's value is DECOMPOSITION — breaking a task into small, "
-                    "visible, reusable steps with structured data flowing between them. "
-                    "If you put the whole task into ONE agent_step's prompt ('search "
-                    "emails, find subscriptions, format a table, total it'), you've "
-                    "built a prompt wearing a playbook costume: one opaque LLM call, no "
-                    "per-step visibility, no reuse, no typed data. Don't.\n\n"
-                    "### AGENT DECIDES, THE WORKFLOW WORKS (the core principle)\n"
-                    "An `agent_step` is a DECISION node — a judgment that needs tools or "
-                    "memory mid-reasoning. It is NOT where you do the work. Fetching, "
-                    "searching, looping, transforming, storing, traversing are WORK — "
-                    "they go in `tool_call`, `loop`, `state` nodes where each is visible, "
-                    "typed, and reusable. If you catch yourself writing a paragraph that "
-                    "tells an agent to go DO a multi-step job, stop: that paragraph is "
-                    "your step list. Call an agent only for the DECISIONS the graph "
-                    "cannot express deterministically (judge / classify / rank / choose), "
-                    "and put everything around the decision into explicit steps.\n"
-                    "The validator enforces this and will report:\n"
-                    "- `monolithic-playbook` (ERROR — blocks): the whole playbook is one "
-                    "delegated step that hides a process. You must decompose it.\n"
-                    "- `compound-leaf` (warning): one leaf step's prompt hides a loop or "
-                    "several operations (a quantifier like 'each/all', an 'and then', or "
-                    "multiple verbs). Make a loop / split the step.\n"
-                    "- `agent-does-work` (warning): an `agent_step` is doing mechanical "
-                    "work with no judgment — use a `tool_call`. Treat warnings as "
-                    "redesign signals, not noise.\n\n"
-                    "Rules of thumb:\n"
-                    "- If a step's prompt contains 'and then', a numbered list, or the "
-                    "word 'each', it is probably SEVERAL steps.\n"
-                    "- One LLM step = ONE judgment or extraction on ONE thing "
-                    "(classify THIS email; summarize THIS doc). Iterate with a `loop`, "
-                    "branch with a `condition`, do deterministic work with `tool_call`.\n"
-                    "- DEFAULT to `llm_step` for pure transforms (classify, extract, "
-                    "summarize, format a report). It's a single raw model call — no "
-                    "tools, no memory — so it's cheaper, faster (Haiku by default), and "
-                    "deterministic. Use `agent_step` ONLY when the step must call tools "
-                    "or use memory mid-reasoning.\n"
-                    "- Prefer `output_schema` on llm/agent steps so they emit STRUCTURED "
-                    "DATA (e.g. {is_subscription, service, amount}) the next step can "
-                    "filter/branch on — not prose a later step has to re-parse.\n"
-                    "- To gather results across a loop, use `collect` (see Loop config); "
-                    "read them at `steps.<loop_id>.collected`.\n\n"
-                    "### Worked example — 'scan my emails for subscriptions':\n"
-                    "WRONG (one mega-step): a single agent_step whose prompt loops over "
-                    "emails, classifies, formats a table, and totals it.\n"
-                    "RIGHT (a process):\n"
-                    "```yaml\n"
-                    "steps:\n"
-                    "  - id: fetch          # deterministic fetch\n"
-                    "    kind: tool_call\n"
-                    "    tool: gmail__gmail__fetch_emails\n"
-                    "    args: {query: 'after:2024/12/15 (receipt OR invoice OR subscription)'}\n"
-                    "  - id: scan           # iterate; collect one row per email\n"
-                    "    kind: loop\n"
-                    "    over: '{{ steps.fetch.result.messages }}'  # tool data is under .result\n"
-                    "    item_name: email\n"
-                    "    collect: '{{ steps.classify }}'\n"
-                    "    body:\n"
-                    "      - id: classify   # ONE judgment on ONE email, structured out\n"
-                    "        kind: llm_step  # raw model call — no tools needed\n"
-                    "        output_schema: {is_subscription: bool, service: str, amount: number}\n"
-                    "        prompt: 'Is THIS ONE email a paid subscription? {{ email }}'\n"
-                    "  - id: report         # consume the collected rows, filter, format\n"
-                    "    kind: llm_step      # pure formatting → Haiku, no tools\n"
-                    "    output_schema: {report: str}\n"
-                    "    prompt: |\n"
-                    "      Build a markdown report of subscriptions from these rows:\n"
-                    "      {{ steps.scan.collected | selectattr('is_subscription') | list }}\n"
-                    "  - id: notify         # surface it in chat\n"
-                    "    kind: tool_call\n"
-                    "    tool: send_chat_message\n"
-                    "    args: {message: '{{ steps.report.report }}'}\n"
-                    "```\n"
-                    "Each step is inspectable on the canvas, `classify` is reusable, and "
-                    "the data between steps is typed. THAT is a playbook.\n\n"
-                    "### CONTEXT ECONOMY — iterate, never dump (critical)\n"
-                    "Keep the AGENTIC CONTEXT small. The #1 way a playbook fails is "
-                    "dumping a big collection into ONE model call and exploding the "
-                    "context window. To process N items (emails, rows, docs, search "
-                    "results):\n"
-                    "- LOOP over them; read/summarize ONE per iteration with an "
-                    "`llm_step`; emit a SMALL structured result per item; `collect` it.\n"
-                    "- Then operate on the reduced set (filter/aggregate/format), or "
-                    "persist each item to a store/DB and query it later.\n"
-                    "- NEVER write a single step whose prompt interpolates a whole "
-                    "collection like `{{ steps.fetch.result.messages }}` for 1000 emails "
-                    "— that is brute force and will fail. The validator warns when it "
-                    "sees this; treat that warning as a redesign signal. Iteration beats "
-                    "brute force, always.\n\n"
-                    "### REFERENCE SHAPES — get the path right or the run fails LOUD\n"
-                    "Templates now fail loudly on an undefined reference (no more silent "
-                    "nulls). Two shapes trip everyone up — memorize them:\n"
-                    "- `tool_call` output is wrapped: read the tool's data under "
-                    "`.result`. A tool returning {messages: [...]} is "
-                    "`steps.<id>.result.messages` — NOT `steps.<id>.messages`.\n"
-                    "- A schemaless `llm_step`/`agent_step` returns `{_raw: <text>}`. "
-                    "Read it as `steps.<id>._raw`. There is NO `.output`. To get typed "
-                    "fields (`steps.<id>.field`), declare an `output_schema`. This is the "
-                    "#1 cause of a loop that collected nulls — `collect` an "
-                    "`output_schema` field, or `._raw`, never `.output`.\n"
-                    "- `loop` output is {iterations, results, collected, stopped} — gather "
-                    "with `steps.<loop_id>.collected`. `stopped` is null (drained), "
-                    "'break' (break_when), or 'max_iterations' (hit the cap).\n"
-                    "The validator checks these shapes statically — if it errors on a "
-                    "`.field`, you have the wrong path; copy the right one from "
-                    "`dry_run`'s `references`.\n\n"
-                    "### RUN-SCOPED STATE — stacks, queues, sets, counters (the big one)\n"
-                    "A `state` step mutates run-scoped variables that PERSIST across loop "
-                    "iterations. Read them in any template as `vars.<name>` (note: "
-                    "`vars.items` reads the KEY `items`, it is safe to name a queue "
-                    "`items`/`keys`/`values`). This is how you build a REAL recursive "
-                    "crawl / BFS / DFS / dedup / accumulator — instead of HARDCODING a "
-                    "list of things you guessed.\n"
-                    "Ops (one `state` step may carry several, applied in order):\n"
-                    "- `set` var=value | `append`/`extend` (list grow) | `merge` (dict)\n"
-                    "- `push_back` + `pop_back` = STACK (LIFO)\n"
-                    "- `push_back` + `pop_front` = QUEUE (FIFO)\n"
-                    "- `pop_back`/`pop_front` need `into: <var>` to capture what you "
-                    "popped (else it's discarded — the validator warns)\n"
-                    "- `add_unique` = SET (dedup) | `incr`/`decr` = COUNTER | `delete`\n"
-                    "`value` is a Jinja expression when it's a string: "
-                    "`value: \"[ inputs.start ]\"`, `value: \"{{ vars.url }}\"`, "
-                    "`value: \"[]\"`, `value: \"1\"`.\n"
-                    "Loops gained `while:` (loop WHILE truthy — the frontier pattern), "
-                    "`break_when:` (stop after an iteration), and `concurrency: N` "
-                    "(bounded parallel map; the body must NOT mutate shared state).\n\n"
-                    "### NEVER HARDCODE A DISCOVERABLE LIST (hard rule)\n"
-                    "If a task is 'scan/crawl/traverse a site / a tree / paginated "
-                    "results / a graph', you MUST discover items at RUN TIME with a "
-                    "frontier — do NOT write N sibling tool_calls to URLs/items you "
-                    "guessed or found yourself. Hand-listing items a loop could fetch is a "
-                    "junior mistake and the validator flags it. The pattern:\n"
-                    "```yaml\n"
-                    "steps:\n"
-                    "  - id: seed\n"
-                    "    kind: state\n"
-                    "    state:\n"
-                    "      - { op: set, var: frontier, value: '[ inputs.start_url ]' }\n"
-                    "      - { op: set, var: visited, value: '[]' }\n"
-                    "  - id: crawl\n"
-                    "    kind: loop\n"
-                    "    while: '{{ vars.frontier | length > 0 }}'   # grows + shrinks\n"
-                    "    max_iterations: 200                          # safety cap\n"
-                    "    body:\n"
-                    "      - id: take\n"
-                    "        kind: state\n"
-                    "        state:\n"
-                    "          - { op: pop_front, var: frontier, into: cur }  # FIFO = BFS\n"
-                    "          - { op: add_unique, var: visited, value: '{{ vars.cur }}' }\n"
-                    "      - id: fetch\n"
-                    "        kind: tool_call\n"
-                    "        tool: web_fetch\n"
-                    "        args: { url: '{{ vars.cur }}' }\n"
-                    "      - id: links            # extract links from THIS page only\n"
-                    "        kind: llm_step\n"
-                    "        output_schema: { links: array }\n"
-                    "        prompt: 'List internal link URLs on this page:\\n"
-                    "{{ steps.fetch.result }}'\n"
-                    "      - id: enqueue          # add unseen links to the frontier\n"
-                    "        kind: loop\n"
-                    "        over: '{{ steps.links.links }}'\n"
-                    "        item_name: link\n"
-                    "        body:\n"
-                    "          - id: gate\n"
-                    "            kind: condition\n"
-                    "            when: '{{ link not in vars.visited and link not in vars.frontier }}'\n"
-                    "            then:\n"
-                    "              - id: push\n"
-                    "                kind: state\n"
-                    "                state: [ { op: push_back, var: frontier, value: '{{ link }}' } ]\n"
-                    "```\n"
-                    "Swap `pop_front`→`pop_back` for DFS. The `visited` set makes it "
-                    "cycle-safe; `max_iterations` bounds it. THAT is a crawl.\n\n"
-                    "### Step kinds:\n"
-                    "- `tool_call`: calls a registered Luna tool with templated args\n"
-                    "- `llm_step`: a RAW model call (no tools/memory/identity) — PREFER "
-                    "this for transforms. Config: `prompt` (required), `output_schema` "
-                    "(structured out), `purpose` (router chain; default `summarization` "
-                    "→ Haiku; use `reasoning` for the big model), `model` "
-                    "(\"provider/model\" to force one), `system` (optional system text). "
-                    "Returns a structured dict (with output_schema) or `{_raw: text}`.\n"
-                    "- `agent_step`: FULL agent turn via run_turn() — system prompt, tool "
-                    "catalog, memory, skills. Use ONLY when the step needs tools/memory "
-                    "mid-reasoning; otherwise use `llm_step`. Returns structured dict.\n"
-                    "- `condition`: branches on a Jinja expression (then/else)\n"
-                    "- `parallel`: fan-out N branches, fan-in waits for all\n"
-                    "- `wait_for_approval`: pauses, resumes on owner click\n"
-                    "- `wait_for_event`: pauses, resumes on matching bus event\n"
-                    "- `subtask`: invokes another playbook with mapped inputs; add "
-                    "`returns: {key: '{{ steps.<sub_id>.field }}'}` to surface the "
-                    "sub-workflow's outputs to the parent as steps.<subtask_id>.key\n"
-                    "- `loop`: repeats body `over` a list, `while`/`until` a condition; "
-                    "supports `break_when` and `concurrency`\n"
-                    "- `state`: mutate run-scoped `vars` (stack/queue/set/counter/dict) — "
-                    "see RUN-SCOPED STATE above\n"
-                    "- `halt`: end the run early as SUCCESS (optional `when:` guard, "
-                    "optional `value:` result) — e.g. stop when nothing to do\n\n"
-                    "### Trigger syntax:\n"
-                    "```yaml\n"
-                    "triggers:\n"
-                    "  - event: email.received\n"
-                    "    filter: {label: 'support'}\n"
-                    "    map: {email: '{{event.payload}}'}\n"
-                    "```\n\n"
-                    "### Templates:\n"
-                    "Use Jinja2: `{{inputs.email.body}}`, `{{steps.classify.class}}`\n\n"
-                    "### Creating a new playbook (whole-YAML — the ONLY way):\n"
-                    "Write the COMPLETE YAML (steps, triggers, inputs) and call "
-                    "`playbook_propose(name, definition_yaml=...)`. Author the whole "
-                    "definition at once like a source file — do NOT build a playbook "
-                    "node by node. There are no add-step / add-trigger / save tools; "
-                    "everything is one YAML document. Validate first with "
-                    "`playbook_validate(definition_yaml=...)` if unsure.\n\n"
-                    "### Loop config (exact syntax — no other fields work):\n"
-                    "```json\n"
-                    "{\"over\": \"range(1, inputs.n + 1)\", \"item_name\": \"number\", \"max_iterations\": 100}\n"
-                    "```\n"
-                    "- `over`: a LITERAL LIST (e.g. `[1, 2, 3]`) or a Jinja expression "
-                    "producing a list (e.g. `\"range(1, inputs.n + 1)\"`)\n"
-                    "- `until`: alternative — Jinja condition, loops UNTIL true\n"
-                    "- `while`: loops WHILE true (the frontier/queue pattern; mutate a "
-                    "`vars.*` each iteration with a state step or it runs to the cap)\n"
-                    "- `break_when`: Jinja condition checked AFTER each iteration; stops "
-                    "the loop early (result `stopped: 'break'`)\n"
-                    "- `concurrency: N`: run up to N item bodies in parallel (default 1). "
-                    "Bodies are isolated — do NOT mutate shared state inside a "
-                    "concurrent loop; only `collect` merges back (in item order). "
-                    "PREFER `concurrency: 4` (or the item count if smaller) whenever "
-                    "the body is side-effect-free — pure reads, per-item LLM calls, "
-                    "fetches; sequential `over` loops waste wall-clock. Keep "
-                    "`concurrency: 1` only when the body mutates `vars.*`/shared "
-                    "state or when ordering between items matters\n"
-                    "- `max_iterations`: hard safety cap; on hit, result `stopped: "
-                    "'max_iterations'` (always set one on a `while` loop)\n"
-                    "- `count: N` is accepted as shorthand for `over: range(1, N + 1)`\n"
-                    "- `item_name`: name for the current item inside the body — "
-                    "`item_name: \"number\"` makes `{{ number }}` and `{{ number_index }}` work\n"
-                    "- `collect`: a Jinja expression evaluated AFTER each iteration's "
-                    "body (item vars still in scope); each result is appended to a list "
-                    "exposed as `{{ steps.<loop_id>.collected }}`. THIS is how you gather "
-                    "per-iteration outputs — without it, only the last iteration's step "
-                    "outputs survive the loop. Collect everything, then filter in the "
-                    "next step (e.g. `| selectattr('is_subscription')`).\n"
-                    "- `{{steps.<loop_id>._item}}` and `{{steps.<loop_id>._index}}` also work — "
-                    "there is NO `loop.index`\n"
-                    "- Keys like `iterator`, `from`, `to` DO NOT EXIST — unknown keys are rejected\n"
-                    "- Undefined variables in templates or `over`/`until` FAIL the run loudly\n"
-                    "- A loop with an empty body does NOTHING — you MUST nest steps inside it.\n\n"
-                    "### Nesting steps inside loops/conditions:\n"
-                    "Nesting is pure YAML structure. Put child steps under the parent's "
-                    "`body:` (loop) or `then:`/`else:` (condition) keys — see the loop "
-                    "and crawl examples above. A loop with an empty body does nothing, "
-                    "so always nest at least one step inside it.\n\n"
-                    "### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)\n"
-                    "A new requirement (e.g. 'for EACH job role, first search LinkedIn "
-                    "for comparables and make a list') is almost always an INSERTION "
-                    "mid-graph, NOT a step bolted on the end, and NEVER a second "
-                    "monolith. Recipe:\n"
-                    "1. `playbook_get_definition(name)` — read the current YAML.\n"
-                    "2. Find the SEAM — where the new work belongs. 'for each role' means "
-                    "inside the per-role `loop` body (before whatever consumes the role), "
-                    "not a new top-level step.\n"
-                    "3. Splice the new steps there, decomposed (a quantifier -> a loop; "
-                    "one judgment per item; collect). \n"
-                    "4. RE-POINT downstream refs — the steps that ran after the seam must "
-                    "now read the NEW step's output (e.g. the ranking step now also reads "
-                    "`steps.<comparables>.collected`). This rewiring is the real work of "
-                    "a change.\n"
-                    "5. `playbook_validate` -> `playbook_dry_run` -> `playbook_run`. The "
-                    "same lints apply, so the insertion can't reintroduce a monolith.\n\n"
-                    "### Editing an existing playbook (whole-YAML, version history):\n"
-                    "To modify a live playbook, edit it IN PLACE by NAME — NEVER create a "
-                    "new playbook (no '-v2' copies).\n\n"
-                    "1. `playbook_get_definition(name)` → read the current full YAML.\n"
-                    "2. Edit that YAML — make ALL your changes to the whole document.\n"
-                    "3. `playbook_edit(name, definition_yaml=...)` → it snapshots a "
-                    "version, validates, and replaces the definition in one step, the "
-                    "same way you'd save an edited source file.\n"
-                    "There is NO incremental/node-by-node edit path — always rewrite the "
-                    "whole YAML. After editing, re-run `playbook_validate` and "
-                    "`playbook_dry_run`.\n\n"
-                    "### Posting to the chat from a playbook (006.712):\n"
-                    "- Steps CAN post messages into the chat: call the `send_chat_message` "
-                    "tool (via a `tool_call` step with args `{\"message\": \"...\"}`, or "
-                    "instruct an `agent_step` to call it). Messages land in the "
-                    "conversation the run was started from, live.\n"
-                    "- An `llm_step`/`agent_step` output is only stored on the run record — "
-                    "if the owner should SEE something, a later `tool_call` step must "
-                    "pass it to `send_chat_message` (an `llm_step` can't call tools).\n"
-                    "- NEVER invent other tool names. A `tool_call` step must reference a tool "
-                    "from your actual tool list — unknown tools are rejected at authoring time."
-                ),
+                body=_AUTHORING_SKILL_BODY,
                 tools=[
                     "playbook_propose",
                     "playbook_edit",
@@ -404,6 +419,14 @@ class PlaybooksPlugin(LunaPlugin):
             for table in Base.metadata.sorted_tables:
                 await conn.run_sync(table.create, checkfirst=True)
 
+        # 0.8.0 (plans/002 phase 1): `table.create(checkfirst=True)` also
+        # skips COLUMNS on pre-existing tables — installs that predate the
+        # `code` column need an ALTER. Additive, nullable, SQLite/PG safe.
+        try:
+            await _ensure_code_columns(ctx.engine)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: code-column migration failed: %s", e)
+
         # plans/001: `table.create(checkfirst=True)` skips the whole table when
         # it already exists, indexes included — so installs that predate an
         # index never get it. Create each one on its own, and never let a
@@ -433,6 +456,14 @@ class PlaybooksPlugin(LunaPlugin):
             await self._runner.sweep_orphaned_runs()
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: orphan-run sweep failed: %s", e)
+
+        # 0.8.0: backfill pblang code for pre-code playbooks. Only stored when
+        # compile(codegen(ir)) reproduces the ir exactly; otherwise the code
+        # stays NULL and is derived on read.
+        try:
+            await backfill_code(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: code backfill failed: %s", e)
 
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,

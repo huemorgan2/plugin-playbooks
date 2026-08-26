@@ -24,7 +24,33 @@ from luna_sdk import EventBus, ToolDef
 
 from .definition import AgentAutonomy, PlaybookDef, parse_yaml
 from .models import Playbook, PlaybookRun, PlaybookStepRun, PlaybookVersion
+from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .validation import validate_definition
+
+
+def _compile_code(code: str, *, name: str) -> tuple[PlaybookDef | None, str | None]:
+    """(def, None) on success, (None, json error payload) on compile errors."""
+    try:
+        return compile_playbook(code, name=name), None
+    except PlaybookCompileError as e:
+        return None, json.dumps({
+            "error": "The playbook code does not compile — fix these and retry.",
+            "issues": [i.to_dict() for i in e.issues],
+        })
+
+
+def _derive_code(playbook: Playbook) -> str:
+    """The playbook's pblang source — stored, or derived via codegen."""
+    if playbook.code:
+        return playbook.code
+    return generate_code(PlaybookDef.model_validate(playbook.definition))
+
+
+def _codegen_or_none(pb_def: PlaybookDef) -> str | None:
+    try:
+        return generate_code(pb_def)
+    except Exception:  # noqa: BLE001 — code is derivable on read; never block
+        return None
 
 
 async def _load_all_playbook_steps(
@@ -60,13 +86,31 @@ def build_tools(
         display_name: str = "",
         description: str = "",
         when_to_use: str = "",
-        definition_yaml: str,
+        code: str = "",
+        definition_yaml: str = "",
         agent_autonomy: str = "agent_must_confirm",
     ) -> str:
-        try:
-            pb_def = parse_yaml(definition_yaml)
-        except Exception as e:
-            return json.dumps({"error": f"Invalid YAML: {e}"})
+        # 0.8.0 (plans/002 phase 1): code is the preferred authoring format;
+        # definition_yaml stays accepted until the migration phase removes it.
+        if bool(code) == bool(definition_yaml):
+            return json.dumps({
+                "error": "Provide exactly one of 'code' (preferred) or "
+                         "'definition_yaml'.",
+            })
+        if code:
+            pb_def, err = _compile_code(code, name=name)
+            if err:
+                return err
+            stored_code: str | None = code
+        else:
+            try:
+                pb_def = parse_yaml(definition_yaml)
+            except Exception as e:
+                return json.dumps({"error": f"Invalid YAML: {e}"})
+            stored_code = _codegen_or_none(pb_def)
+
+        defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
+        defn["name"] = name
 
         async with session_factory() as session:
             existing = (await session.execute(
@@ -76,11 +120,20 @@ def build_tools(
                 return json.dumps({"error": f"Playbook '{name}' already exists"})
             all_pb = await _load_all_playbook_steps(session, exclude=name)
 
-            import yaml as _yaml
+            # YAML path: validate the raw mapping so unknown keys (typos) are
+            # caught — the pydantic dump silently drops them. Code path: the
+            # compiler already rejects unknown kwargs, and the dump carries
+            # cross-kind defaults (fan_in/concurrency/...) the key checker
+            # would falsely flag — so skip the unknown-key check there.
+            if definition_yaml:
+                import yaml as _yaml
+                check_target = _yaml.safe_load(definition_yaml)
+            else:
+                check_target = defn
             issues = validate_definition(
-                _yaml.safe_load(definition_yaml),
+                check_target,
                 tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
-                check_unknown_keys=True,
+                check_unknown_keys=bool(definition_yaml),
             )
             errors = [i.to_dict() for i in issues if i.severity == "error"]
             if errors:
@@ -96,7 +149,8 @@ def build_tools(
                 description=description or pb_def.description,
                 when_to_use=when_to_use or pb_def.when_to_use,
                 inputs_schema=pb_def.inputs,
-                definition=pb_def.model_dump(mode="json", exclude_none=True, by_alias=True),
+                definition=defn,
+                code=stored_code,
                 agent_autonomy=agent_autonomy,
                 created_by="agent",
                 status="enabled",
@@ -132,10 +186,13 @@ def build_tools(
             name="playbook_propose",
             chat_only=True,
             description=(
-                "Create a new playbook from the FULL YAML definition (steps, "
-                "triggers, inputs all at once). This is how you author playbooks — "
-                "write the whole thing, do not build it step by step. Validate the "
-                "YAML first with playbook_validate if unsure."
+                "Create a new playbook from its FULL source, written all at "
+                "once. PREFERRED: pass `code` — the playbook language "
+                "(restricted Python: playbook(...) header, then "
+                "x = tool(...)/llm(...)/loop(...)/if_(...) steps; see the "
+                "playbook-authoring skill). The code is parsed and compiled, "
+                "never executed. Legacy: `definition_yaml` (full YAML IR). "
+                "Pass exactly one of the two."
             ),
             parameters={
                 "type": "object",
@@ -144,14 +201,21 @@ def build_tools(
                     "display_name": {"type": "string", "description": "Human-friendly name"},
                     "description": {"type": "string"},
                     "when_to_use": {"type": "string"},
-                    "definition_yaml": {"type": "string", "description": "Full YAML definition"},
+                    "code": {
+                        "type": "string",
+                        "description": "Full playbook code (preferred format)",
+                    },
+                    "definition_yaml": {
+                        "type": "string",
+                        "description": "Full YAML definition (legacy format)",
+                    },
                     "agent_autonomy": {
                         "type": "string",
                         "enum": ["agent_must_confirm", "agent_may_trigger"],
                         "default": "agent_must_confirm",
                     },
                 },
-                "required": ["name", "definition_yaml"],
+                "required": ["name"],
             },
         ),
         _propose,
@@ -463,6 +527,7 @@ def build_tools(
             playbook_id=playbook.id,
             version=playbook.version,
             definition=playbook.definition,
+            code=playbook.code,
             author=author,
             message=message,
             promoted_from=promoted_from,
@@ -470,7 +535,7 @@ def build_tools(
         session.add(v)
         return v
 
-    async def _playbook_get_definition(*, name: str) -> str:
+    async def _playbook_get_definition(*, name: str, format: str = "code") -> str:
         import yaml as _yaml
 
         async with session_factory() as session:
@@ -480,20 +545,37 @@ def build_tools(
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
 
-            return _yaml.dump(playbook.definition, default_flow_style=False, sort_keys=False)
+            if format == "yaml":
+                return _yaml.dump(
+                    playbook.definition, default_flow_style=False, sort_keys=False,
+                )
+            try:
+                return _derive_code(playbook)
+            except Exception as e:  # noqa: BLE001 — legacy defs must stay readable
+                return json.dumps({
+                    "error": f"Could not render code for '{name}': {e}",
+                    "hint": "retry with format='yaml'",
+                })
 
     tools.append((
         ToolDef(
             name="playbook_get_definition",
             description=(
-                "Get the full YAML of a playbook so you can edit it. Returns the "
-                "whole definition (steps, triggers, inputs) with step IDs. Edit the "
-                "YAML you get back and pass it to playbook_edit."
+                "Get a playbook's full source so you can edit it. Returns the "
+                "playbook CODE (the Python-like playbook language) by default — "
+                "edit it and pass it back via playbook_edit(code=...), or make a "
+                "targeted change with playbook_edit(old=..., new=...). "
+                "format='yaml' returns the raw YAML IR instead."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
+                    "format": {
+                        "type": "string",
+                        "enum": ["code", "yaml"],
+                        "default": "code",
+                    },
                 },
                 "required": ["name"],
             },
@@ -502,11 +584,26 @@ def build_tools(
     ))
 
     # --- playbook_validate (the compiler) ---
-    async def _validate(*, name: str = "", definition_yaml: str = "") -> str:
+    async def _validate(*, name: str = "", definition_yaml: str = "", code: str = "") -> str:
         import yaml as _yaml
 
         check_keys = False
-        if definition_yaml:
+        if code:
+            pb_def, err = _compile_code(code, name=name or "unnamed")
+            if err:
+                payload = json.loads(err)
+                return json.dumps({
+                    "ok": False,
+                    "errors": payload["issues"],
+                    "warnings": [],
+                    "saved": False,
+                    "note": "Compile errors — nothing was checked further.",
+                })
+            defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
+            # compiler already rejects unknown kwargs; the dump carries
+            # cross-kind defaults the key checker would falsely flag.
+            check_keys = False
+        elif definition_yaml:
             try:
                 defn: Any = _yaml.safe_load(definition_yaml)
             except Exception as e:
@@ -529,7 +626,7 @@ def build_tools(
                 return json.dumps({"error": f"Playbook '{name}' not found"})
             defn = pb.definition
         else:
-            return json.dumps({"error": "Provide 'name' or 'definition_yaml'."})
+            return json.dumps({"error": "Provide 'name', 'code', or 'definition_yaml'."})
 
         async with session_factory() as session:
             all_pb = await _load_all_playbook_steps(session, exclude=name or None)
@@ -558,15 +655,18 @@ def build_tools(
             name="playbook_validate",
             description=(
                 "Statically check a playbook WITHOUT running it (the compiler). "
-                "Returns ALL issues at once: schema errors, unknown keys, undefined "
-                "{{inputs}}/{{steps}} references, use-before-define, bad loops, unknown "
-                "tools, subtask cycles, and context-economy warnings. Pass a saved "
-                "playbook 'name' OR a 'definition_yaml'. Run this before saving or running."
+                "Returns ALL issues at once: compile errors, schema errors, unknown "
+                "keys, undefined {{inputs}}/{{steps}} references, use-before-define, "
+                "bad loops, unknown tools, subtask cycles, and context-economy "
+                "warnings. Pass a saved playbook 'name', playbook 'code' "
+                "(preferred), or a 'definition_yaml'. Run this before saving or "
+                "running."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Saved playbook name"},
+                    "code": {"type": "string", "description": "Full playbook code to check"},
                     "definition_yaml": {"type": "string", "description": "Full YAML to check"},
                 },
             },
@@ -617,12 +717,28 @@ def build_tools(
         _dry_run,
     ))
 
-    # --- playbook_edit (whole-YAML edit-in-place) ---
-    async def _playbook_edit(*, name: str, definition_yaml: str) -> str:
-        try:
-            pb_def = parse_yaml(definition_yaml)
-        except Exception as e:
-            return json.dumps({"error": f"Invalid YAML: {e}"})
+    # --- playbook_edit (whole-source edit-in-place) ---
+    async def _playbook_edit(
+        *,
+        name: str,
+        code: str = "",
+        old: str = "",
+        new: str = "",
+        definition_yaml: str = "",
+    ) -> str:
+        # 0.8.0 (plans/002 phase 1): three modes, exactly one —
+        #   code=            full code replace (preferred)
+        #   old= / new=      snippet diff applied to the current code
+        #   definition_yaml= full YAML replace (legacy)
+        snippet_mode = bool(old) or bool(new)
+        modes = sum([bool(code), snippet_mode, bool(definition_yaml)])
+        if modes != 1:
+            return json.dumps({
+                "error": "Provide exactly one of: 'code', 'old'+'new', or "
+                         "'definition_yaml'.",
+            })
+        if snippet_mode and not (old and new is not None):
+            return json.dumps({"error": "Snippet edits need both 'old' and 'new'."})
 
         async with session_factory() as session:
             playbook = (await session.execute(
@@ -633,12 +749,55 @@ def build_tools(
                     "error": f"Playbook '{name}' not found. Use playbook_propose to create it.",
                 })
 
+            stored_code: str | None
+            if snippet_mode:
+                try:
+                    current = _derive_code(playbook)
+                except Exception as e:  # noqa: BLE001
+                    return json.dumps({
+                        "error": f"Cannot snippet-edit '{name}': its code "
+                                 f"cannot be rendered ({e}). Use code= with "
+                                 f"the full source instead.",
+                    })
+                count = current.count(old)
+                if count == 0:
+                    return json.dumps({
+                        "error": "The 'old' snippet was not found in the "
+                                 "current code. Call playbook_get_definition "
+                                 "and copy the exact text.",
+                    })
+                if count > 1:
+                    return json.dumps({
+                        "error": f"The 'old' snippet matches {count} places — "
+                                 "include more surrounding context so it is "
+                                 "unique.",
+                    })
+                code = current.replace(old, new)
+
+            if code:
+                pb_def, err = _compile_code(code, name=name)
+                if err:
+                    return err
+                stored_code = code
+                check_target: Any = pb_def.model_dump(
+                    mode="json", exclude_none=True, by_alias=True,
+                )
+            else:
+                try:
+                    pb_def = parse_yaml(definition_yaml)
+                except Exception as e:
+                    return json.dumps({"error": f"Invalid YAML: {e}"})
+                stored_code = _codegen_or_none(pb_def)
+                import yaml as _yaml
+                check_target = _yaml.safe_load(definition_yaml)
+
             all_pb = await _load_all_playbook_steps(session, exclude=name)
-            import yaml as _yaml
             issues = validate_definition(
-                _yaml.safe_load(definition_yaml),
+                check_target,
                 tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
-                check_unknown_keys=True,
+                # compiled dumps carry cross-kind defaults the key checker
+                # would falsely flag; the compiler already rejects typos.
+                check_unknown_keys=bool(definition_yaml),
             )
             errors = [i.to_dict() for i in issues if i.severity == "error"]
             if errors:
@@ -648,11 +807,12 @@ def build_tools(
                 })
 
             await _snapshot_version(
-                session, playbook, author="agent", message="before whole-YAML edit",
+                session, playbook, author="agent", message="before edit",
             )
             data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
             data["name"] = name  # never rename via edit
             playbook.definition = data
+            playbook.code = stored_code
             playbook.version += 1
             playbook.description = pb_def.description or playbook.description
             playbook.when_to_use = pb_def.when_to_use or playbook.when_to_use
@@ -688,20 +848,31 @@ def build_tools(
             # approval gate as chat since luna 0.40.003, and the edit
             # validates + snapshots a version before replacing.
             description=(
-                "Change an existing playbook by rewriting its FULL YAML (edit the "
-                "whole 'file' at once). This is the ONLY way to edit a playbook — get "
-                "the current YAML with playbook_get_definition, change it, and pass "
-                "the complete new YAML here. Snapshots a version, validates, then "
-                "replaces the definition. Rejects invalid YAML. Do not edit playbooks "
-                "step by step."
+                "Change an existing playbook like you'd edit a source file. "
+                "Get the current code with playbook_get_definition, then either "
+                "pass the complete new source via code=, or make a targeted "
+                "change via old=/new= (the old snippet must match exactly one "
+                "place in the current code; include surrounding lines to make "
+                "it unique). Snapshots a version, compiles, validates, then "
+                "replaces the definition. Legacy: definition_yaml= replaces "
+                "from full YAML. Pass exactly one mode."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Existing playbook name"},
-                    "definition_yaml": {"type": "string", "description": "Full new YAML definition"},
+                    "code": {"type": "string", "description": "Full new playbook code"},
+                    "old": {
+                        "type": "string",
+                        "description": "Exact snippet of the current code to replace (must be unique)",
+                    },
+                    "new": {"type": "string", "description": "Replacement text for 'old'"},
+                    "definition_yaml": {
+                        "type": "string",
+                        "description": "Full new YAML definition (legacy format)",
+                    },
                 },
-                "required": ["name", "definition_yaml"],
+                "required": ["name"],
             },
         ),
         _playbook_edit,

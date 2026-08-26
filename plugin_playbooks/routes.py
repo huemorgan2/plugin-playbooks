@@ -350,6 +350,11 @@ async def create_playbook(body: PlaybookCreate):
         if existing:
             raise HTTPException(409, f"Playbook '{body.name}' already exists")
 
+        try:
+            from .pblang import generate_code
+            _code = generate_code(pb_def)
+        except Exception:  # noqa: BLE001
+            _code = None
         p = Playbook(
             name=body.name,
             display_name=body.display_name or pb_def.display_name or body.name,
@@ -357,6 +362,7 @@ async def create_playbook(body: PlaybookCreate):
             when_to_use=body.when_to_use or pb_def.when_to_use,
             inputs_schema=pb_def.inputs,
             definition=pb_def.model_dump(mode="json", exclude_none=True, by_alias=True),
+            code=_code,
             agent_autonomy=body.agent_autonomy,
             created_by="owner",
             status="enabled",
@@ -386,10 +392,18 @@ async def update_playbook(name: str, body: PlaybookUpdate):
             playbook_id=p.id,
             version=p.version,
             definition=p.definition,
+            code=p.code,
             author="owner",
             message=body.message or "REST update",
         ))
         p.definition = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
+        # 0.8.0: the YAML write invalidates any stored pblang code — regenerate
+        # (or NULL it so reads derive fresh; stale code must never survive).
+        try:
+            from .pblang import generate_code
+            p.code = generate_code(pb_def)
+        except Exception:  # noqa: BLE001
+            p.code = None
         p.version += 1
         p.description = pb_def.description or p.description
         p.when_to_use = pb_def.when_to_use or p.when_to_use
@@ -652,12 +666,15 @@ async def promote_version(name: str, body: PromoteBody):
             playbook_id=p.id,
             version=p.version,
             definition=p.definition,
+            code=p.code,
             author="owner",
             message=f"before promoting v{body.version}",
             promoted_from=body.version,
         ))
 
         p.definition = old_ver.definition
+        # 0.8.0: restore that version's code too (NULL = derive on read).
+        p.code = old_ver.code
         p.version += 1
 
         pb_def = PlaybookDef.model_validate(old_ver.definition)
