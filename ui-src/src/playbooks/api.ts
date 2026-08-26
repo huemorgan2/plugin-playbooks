@@ -1,4 +1,7 @@
-import type { PlaybookSummary, PlaybookRunSummary, PlaybookRunDetail } from './types'
+import type {
+  PlaybookSummary, PlaybookRunSummary, PlaybookRunDetail,
+  SpecEntry, ProbeEntry,
+} from './types'
 import { getToken, getTokenAsync, invalidateToken } from '../lib/auth'
 
 async function doFetch(path: string, tok: string, opts?: RequestInit): Promise<Response> {
@@ -34,7 +37,14 @@ export const playbooksApi = {
     apiFetch<PlaybookSummary[]>(`${BASE}/playbooks?status=${status}`),
 
   get: (name: string) =>
-    apiFetch<PlaybookSummary & { definition: any; inputs_schema: any }>(`${BASE}/playbooks/${name}`),
+    apiFetch<PlaybookSummary & {
+      definition: any
+      inputs_schema: any
+      code: string | null
+      manifest: string | null
+      candidate_definition: any | null
+      candidate_code: string | null
+    }>(`${BASE}/playbooks/${name}`),
 
   create: (body: {
     name: string
@@ -106,6 +116,58 @@ export const playbooksApi = {
     apiFetch<{ name: string; version: number; promoted_from: number; status: string }>(
       `${BASE}/playbooks/${name}/promote`,
       { method: 'POST', body: JSON.stringify({ version }) },
+    ),
+
+  // Candidate promote — no version in the body → the server gates
+  // (static_validation, specs, probes) and promotes the candidate.
+  promoteCandidate: (name: string) =>
+    apiFetch<{ name: string; live_version: number; promoted_from: number; status: string }>(
+      `${BASE}/playbooks/${name}/promote`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+
+  rollback: (name: string) =>
+    apiFetch<{ name: string; live_version: number; rolled_back_from: number; status: string }>(
+      `${BASE}/playbooks/${name}/rollback`,
+      { method: 'POST' },
+    ),
+
+  // Specs + probes (phase 6 Tests tab)
+  getSpecs: (name: string) =>
+    apiFetch<{ name: string; specs: SpecEntry[] }>(`${BASE}/playbooks/${name}/specs`),
+
+  runSpecs: (name: string) =>
+    apiFetch<{
+      name: string
+      ran_against_version: number
+      total: number
+      passed: number
+      failed: number
+      results: { spec: string; passed: boolean; failures: string[]; checked: number }[]
+    }>(`${BASE}/playbooks/${name}/specs/run`, { method: 'POST' }),
+
+  getProbes: (name: string) =>
+    apiFetch<{ name: string; probes: ProbeEntry[] }>(`${BASE}/playbooks/${name}/probes`),
+
+  runPreflight: (name: string) =>
+    apiFetch<{
+      name: string
+      checked_version: number
+      total: number
+      ok: number
+      unprobeable: number
+      failed: number
+      results: ProbeEntry[]
+    }>(`${BASE}/playbooks/${name}/preflight`, { method: 'POST' }),
+
+  // Manifest (the playbook's intent page)
+  getManifest: (name: string) =>
+    apiFetch<{ name: string; manifest: string | null }>(`${BASE}/playbooks/${name}/manifest`),
+
+  putManifest: (name: string, manifest: string) =>
+    apiFetch<{ name: string; version: number; status: string }>(
+      `${BASE}/playbooks/${name}/manifest`,
+      { method: 'PUT', body: JSON.stringify({ manifest }) },
     ),
 
   // Drafts

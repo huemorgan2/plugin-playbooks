@@ -380,6 +380,71 @@ class RunCreate(BaseModel):
     trigger: str = "api"
 
 
+async def _trust_summaries(session, playbook_ids):
+    """Phase 6: per-playbook trust data for the list badges — two batched
+    GROUP BY queries (specs + probes), never N+1."""
+    trust: dict[str, dict[str, Any]] = {
+        str(pid): {
+            "specs": {"total": 0, "failed": 0, "last_run_at": None},
+            "probes": {"total": 0, "failed": 0, "probed_at": None},
+        }
+        for pid in playbook_ids
+    }
+    if not playbook_ids:
+        return trust
+    spec_rows = (await session.execute(
+        select(
+            PlaybookSpec.playbook_id,
+            func.count(PlaybookSpec.id),
+            func.max(PlaybookSpec.last_run_at),
+        )
+        .where(PlaybookSpec.playbook_id.in_(playbook_ids))
+        .group_by(PlaybookSpec.playbook_id)
+    )).all()
+    # pass/fail needs the JSON last_result — fetch the failing count separately
+    # per DB-portable path: pull (playbook_id, last_result) and count in Python
+    # (spec counts are tiny).
+    spec_results = (await session.execute(
+        select(PlaybookSpec.playbook_id, PlaybookSpec.last_result)
+        .where(PlaybookSpec.playbook_id.in_(playbook_ids))
+    )).all()
+    failed_by_pb: dict[str, int] = {}
+    for pid, last in spec_results:
+        if isinstance(last, dict) and last.get("passed") is False:
+            failed_by_pb[str(pid)] = failed_by_pb.get(str(pid), 0) + 1
+    for pid, total, last_run in spec_rows:
+        trust[str(pid)]["specs"] = {
+            "total": total,
+            "failed": failed_by_pb.get(str(pid), 0),
+            "last_run_at": last_run.isoformat() if last_run else None,
+        }
+    probe_rows = (await session.execute(
+        select(
+            PlaybookProbeResult.playbook_id,
+            func.count(PlaybookProbeResult.id),
+            func.max(PlaybookProbeResult.probed_at),
+        )
+        .where(PlaybookProbeResult.playbook_id.in_(playbook_ids))
+        .group_by(PlaybookProbeResult.playbook_id)
+    )).all()
+    probe_failed = (await session.execute(
+        select(PlaybookProbeResult.playbook_id, func.count(PlaybookProbeResult.id))
+        .where(
+            PlaybookProbeResult.playbook_id.in_(playbook_ids),
+            PlaybookProbeResult.status == "failed",
+        )
+        .group_by(PlaybookProbeResult.playbook_id)
+    )).all()
+    failed_probes = {str(pid): n for pid, n in probe_failed}
+    for pid, total, probed_at in probe_rows:
+        trust[str(pid)]["probes"] = {
+            "total": total,
+            "failed": failed_probes.get(str(pid), 0),
+            "probed_at": probed_at.isoformat() if probed_at else None,
+        }
+    return trust
+
+
 @router.get("/playbooks")
 async def list_playbooks(status: str = "active"):
     async with _sf()() as session:
@@ -396,7 +461,19 @@ async def list_playbooks(status: str = "active"):
             # the list from rendering.
             logger.warning("playbooks: run stats unavailable: %s", e)
             stats = {}
+        try:
+            trust = await _trust_summaries(session, [p.id for p in rows])
+        except Exception as e:  # pragma: no cover - same posture as stats
+            logger.warning("playbooks: trust summaries unavailable: %s", e)
+            trust = {}
         return [{
+            "trust": {
+                **trust.get(str(p.id), {
+                    "specs": {"total": 0, "failed": 0, "last_run_at": None},
+                    "probes": {"total": 0, "failed": 0, "probed_at": None},
+                }),
+                "manifest_present": bool((p.manifest or "").strip()),
+            },
             "id": str(p.id),
             "name": p.name,
             "display_name": p.display_name,
@@ -423,6 +500,13 @@ async def get_playbook(name: str):
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
+        candidate_definition = None
+        candidate_code = None
+        if p.candidate_version:
+            cand = await _get_version_row(session, p, p.candidate_version)
+            if cand is not None:
+                candidate_definition = cand.definition
+                candidate_code = cand.code
         return {
             "id": str(p.id),
             "name": p.name,
@@ -438,6 +522,8 @@ async def get_playbook(name: str):
             "version": p.version,
             "live_version": _live_version_of(p),
             "candidate_version": p.candidate_version,
+            "candidate_definition": candidate_definition,
+            "candidate_code": candidate_code,
         }
 
 

@@ -18,6 +18,7 @@ import { ToolsGuide } from './ToolsGuide'
 import { setPlaybookConsumerReady } from './liveBus'
 import { applyActivity, runningNames as computeRunning } from './activityPresence'
 import { lastRunLabel, rateLabel } from './runStats'
+import { specsLabel, probesLabel, intentLabel, TONE_TEXT } from './trust'
 
 type SelectedItem = { kind: 'playbook'; name: string } | { kind: 'draft'; id: string }
 type Tab = 'active' | 'archived'
@@ -252,6 +253,25 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
                     </span>
                   )}
                 </div>
+                {/* 0.13.0: trust row — tests · tools · intent (+ candidate chip) */}
+                {tab === 'active' && (
+                  <div
+                    className="flex items-center gap-3 mt-1 text-[11px]"
+                    data-testid="playbook-trust-row"
+                  >
+                    {([specsLabel(pb.trust), probesLabel(pb.trust), intentLabel(pb.trust)]).map((l, i) => (
+                      <span key={i} className={TONE_TEXT[l.tone]}>{l.text}</span>
+                    ))}
+                    {pb.candidate_version != null && (
+                      <span
+                        className="inline-flex items-center rounded-full border border-violet-500/40 text-violet-300 px-2 py-px text-[10px]"
+                        data-testid="playbook-candidate-chip"
+                      >
+                        candidate v{pb.candidate_version} — review &amp; promote
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-3 shrink-0">

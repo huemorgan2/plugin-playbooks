@@ -85,6 +85,33 @@ export interface PlaybookDef {
   steps: StepDef[]
 }
 
+// 0.13.0 (plans/002 phase 6): per-playbook trust data for the list badges.
+export interface TrustSummary {
+  specs: { total: number; failed: number; last_run_at: string | null }
+  probes: { total: number; failed: number; probed_at: string | null }
+  manifest_present: boolean
+}
+
+export type ProbeStatus = 'ok' | 'unprobeable' | 'failed'
+
+export interface SpecEntry {
+  name: string
+  spec: Record<string, any>
+  created_by: string | null
+  last_result: Record<string, any> | null
+  last_run_at: string | null
+  last_version: number | null
+  updated_at: string | null
+}
+
+export interface ProbeEntry {
+  tool: string
+  status: ProbeStatus
+  failure_class: string | null
+  detail: string | null
+  probed_at: string | null
+}
+
 export interface PlaybookSummary {
   id: string
   name: string
@@ -93,6 +120,9 @@ export interface PlaybookSummary {
   status: string
   agent_autonomy: string
   version: number
+  live_version?: number
+  candidate_version?: number | null
+  trust?: TrustSummary
   // plans/001: run history, computed server-side over the last 30 days.
   last_run_at?: string | null
   runs_per_day?: number

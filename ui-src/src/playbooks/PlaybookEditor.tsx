@@ -13,11 +13,11 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
-  ArrowLeft, Play, Square, FileCode, Eye, Loader2, Rocket, Workflow,
+  ArrowLeft, Play, FileCode, Eye, Loader2, Rocket, Workflow,
   X, ChevronDown, ChevronRight, Settings, History,
   Bot, Wrench, GitBranch, Layers, Clock, Mail, RotateCcw, ExternalLink, Zap,
   ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle, Copy, Sparkles,
-  Database, Ban,
+  Database, Ban, FileText, FlaskConical,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { StepNode } from './nodes/StepNode'
@@ -32,16 +32,18 @@ import type {
   PlaybookRunDetail,
 } from './types'
 import { STEP_COLORS } from './types'
-import { PlaybookRuns } from './PlaybookRuns'
-import { StateVizPanel } from './StateVizPanel'
-import { buildTimeline, hasState, type TimelineFrame } from './runReplay'
+import { RunsTab } from './RunsTab'
+import { TestsTab } from './TestsTab'
+import { ManifestTab } from './ManifestTab'
 
 const nodeTypes = {
   stepNode: StepNode,
   triggerNode: TriggerNode,
 }
 
-type ViewMode = 'canvas' | 'yaml'
+// 0.13.0 (plans/002 phase 6): view modes became real tabs. Drafts keep
+// Canvas | Code only — the other tabs are live-playbook surfaces.
+type ViewMode = 'canvas' | 'code' | 'manifest' | 'tests' | 'runs'
 
 type Props =
   | { name: string; draftId?: undefined; onBack: () => void }
@@ -162,6 +164,22 @@ function execSummary(step: StepDef, exec: StepRunDetail): string {
   }
 }
 
+// The promote REST path refuses with a 422 whose body names the failing gate.
+// apiFetch surfaces it as "422: {json}" — dig the human message out.
+export function promoteRefusalMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  const jsonStart = raw.indexOf('{')
+  if (jsonStart >= 0) {
+    try {
+      const body = JSON.parse(raw.slice(jsonStart))
+      const detail = body.detail ?? body
+      if (detail?.message) return detail.message
+      if (detail?.gate) return `Promote refused — gate '${detail.gate}' failed`
+    } catch { /* fall through */ }
+  }
+  return raw
+}
+
 export function PlaybookEditor(props: Props) {
   const { onBack } = props
 
@@ -175,8 +193,14 @@ export function PlaybookEditor(props: Props) {
     isDraft: boolean
     draftId?: string
   } | null>(null)
+  // 0.13.0: live pblang source + candidate content for the canvas switch.
+  const [code, setCode] = useState<string | null>(null)
+  const [candidateVersion, setCandidateVersion] = useState<number | null>(null)
+  const [candidateDef, setCandidateDef] = useState<PlaybookDef | null>(null)
+  const [candidateCode, setCandidateCode] = useState<string | null>(null)
+  const [canvasSource, setCanvasSource] = useState<'live' | 'candidate'>('live')
+  const [promoteError, setPromoteError] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('canvas')
-  const [yamlText, setYamlText] = useState('')
   const [promoting, setPromoting] = useState(false)
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
   const [explainOpen, setExplainOpen] = useState(false)
@@ -184,24 +208,12 @@ export function PlaybookEditor(props: Props) {
   const [autonomy, setAutonomy] = useState<string>('agent_must_confirm')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [versionsOpen, setVersionsOpen] = useState(false)
-  const [runsOpen, setRunsOpen] = useState(false)
 
-  // 007.009.01 + viz: run-replay state for the canvas. A selected run drives the
-  // node-fire shimmer + the stack/queue panel from one cursor.
+  // A selected run colors the canvas by step status (no animation, 0.13.0).
   const [runDetail, setRunDetail] = useState<PlaybookRunDetail | null>(null)
-  const [timeline, setTimeline] = useState<TimelineFrame[]>([])
-  const [cursor, setCursor] = useState(-1)
-  const [playing, setPlaying] = useState(false)
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
-
-  const fireSeqRef = useRef(0)
-  const fireNode = useCallback((nodeId: string) => {
-    fireSeqRef.current += 1
-    const seq = fireSeqRef.current
-    setNodes((prev) => prev.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, fireSeq: seq } } : n)))
-  }, [setNodes])
 
   // 006.709: live patches from the agent. defRef mirrors `definition` so the
   // sequential queue can read-modify-write without stale closures.
@@ -225,7 +237,6 @@ export function PlaybookEditor(props: Props) {
             isDraft: true,
             draftId: d.id,
           })
-          setYamlText(JSON.stringify(def, null, 2))
           if (def.steps?.length) {
             const { nodes: n, edges: e } = buildGraph(def)
             setNodes(n)
@@ -240,10 +251,14 @@ export function PlaybookEditor(props: Props) {
           setMeta({
             display_name: pb.display_name,
             status: pb.status as string,
-            version: pb.version,
+            version: pb.live_version ?? pb.version,
             isDraft: false,
           })
-          setYamlText(JSON.stringify(def, null, 2))
+          setCode(pb.code ?? null)
+          setCandidateVersion(pb.candidate_version ?? null)
+          setCandidateDef((pb.candidate_definition as PlaybookDef) ?? null)
+          setCandidateCode(pb.candidate_code ?? null)
+          setCanvasSource('live')
           const { nodes: n, edges: e } = buildGraph(def)
           setNodes(n)
           setEdges(e)
@@ -254,73 +269,46 @@ export function PlaybookEditor(props: Props) {
 
   useEffect(() => { loadData() }, [loadData])
 
-  // --- Run replay (canvas) -------------------------------------------------
-  // Load a run's detail, color the graph by status, build the frame timeline,
-  // and (optionally) auto-play the node-fire shimmer + state viz.
-  const loadCanvasRun = useCallback(async (runId: string, autoplay = false) => {
+  // Rebuild the canvas from the chosen source (live definition, the candidate,
+  // or live + a selected run's statuses).
+  const showSource = useCallback((source: 'live' | 'candidate') => {
+    setCanvasSource(source)
+    setSelectedStep(null)
+    const def = source === 'candidate' ? candidateDef : defRef.current
+    if (!def) return
+    if (source === 'candidate') setRunDetail(null)
+    const { nodes: n, edges: e } = buildGraph(def)
+    setNodes(n)
+    setEdges(e)
+  }, [candidateDef, setNodes, setEdges])
+
+  // Load a run's detail and color the graph by step status (live def only).
+  const loadCanvasRun = useCallback(async (runId: string) => {
     try {
       const detail = await playbooksApi.getRun(runId)
       const def = defRef.current
       setRunDetail(detail)
-      const tl = buildTimeline(detail)
-      setTimeline(tl)
+      setCanvasSource('live')
       if (def) {
         const { nodes: n, edges: e } = buildGraph(def, detail.steps)
         setNodes(n)
         setEdges(e)
       }
-      setCursor(-1)
-      setPlaying(autoplay && tl.length > 0)
     } catch { /* ignore */ }
   }, [setNodes, setEdges])
 
-  // 007.013-B: play a run picked from the Runs list — switch to the canvas so
-  // the glow is visible, then load + autoplay it.
-  const playRunFromList = useCallback((runId: string) => {
-    setViewMode('canvas')
-    loadCanvasRun(runId, true)
-  }, [loadCanvasRun])
-
-  // 006.714: load a run onto the canvas WITHOUT animating — colors the graph by
-  // status so the owner can inspect steps. Replay only starts on an explicit Play.
+  // "Show on canvas" from the Runs tab — switch to the canvas, color by status.
   const loadRunStatic = useCallback((runId: string) => {
     setViewMode('canvas')
-    loadCanvasRun(runId, false)
+    loadCanvasRun(runId)
   }, [loadCanvasRun])
 
-  // 006.714: no auto-play. Opening a playbook shows the clean definition; a past
-  // run only renders when the owner picks one from the Runs panel (and only
-  // animates when they hit Play). The old auto-replay made it look like the
-  // playbook was running live on every open.
-
-  // Replay clock: advance the cursor one frame at a time while playing.
-  // 007.013-B: fixed cadence — the scrubber/speed control was removed; replay
-  // is now just play/stop driven from the Runs list.
-  useEffect(() => {
-    if (!playing) return
-    if (cursor >= timeline.length - 1) { setPlaying(false); return }
-    const t = setTimeout(() => setCursor((c) => c + 1), 680)
-    return () => clearTimeout(t)
-  }, [playing, cursor, timeline.length])
-
-  // Fire the node at the cursor (trigger first, then each step in order).
-  const timelineRef = useRef<TimelineFrame[]>([])
-  useEffect(() => { timelineRef.current = timeline }, [timeline])
-  useEffect(() => {
-    if (!runDetail) return
-    if (cursor < 0) { fireNode('trigger-0'); return }
-    const frame = timelineRef.current[cursor]
-    if (frame) fireNode(`step-${frame.stepId}`)
-  }, [cursor, runDetail, fireNode])
-
-  // Refresh a loaded run's statuses without a layout rebuild (so the shimmer
-  // keeps moving on the same node objects). Shared by the fallback poll and
-  // the live playbook.step.* nudges.
+  // Refresh a loaded run's statuses without a layout rebuild. Shared by the
+  // fallback poll and the live playbook.step.* nudges.
   const refreshRunStatuses = useCallback(async (runId: string) => {
     try {
       const fresh = await playbooksApi.getRun(runId)
       setRunDetail(fresh)
-      setTimeline(buildTimeline(fresh))
       const byStep = new Map(fresh.steps.map((s) => [s.step_id, s.status]))
       setNodes((prev) => prev.map((n) => {
         const sid = (n.data as any).stepId as string | undefined
@@ -332,7 +320,7 @@ export function PlaybookEditor(props: Props) {
 
   // Live attach: a run of THIS playbook started elsewhere (chat tool, trigger,
   // cron) — load it onto the canvas so the run is visible without the owner
-  // digging through the Runs panel. Step/completion events nudge an immediate
+  // digging through the Runs tab. Step/completion events nudge an immediate
   // refresh so movement is instant; the poll below covers anything missed.
   const runDetailRef = useRef<PlaybookRunDetail | null>(null)
   useEffect(() => { runDetailRef.current = runDetail }, [runDetail])
@@ -378,18 +366,13 @@ export function PlaybookEditor(props: Props) {
     }
     const cur = defRef.current
     if (!cur) return
-    // The agent is editing the playbook — drop any run replay so build-glow and
-    // run-shimmer don't fight over the same nodes.
-    if (defRef.current) {
-      setRunDetail(null)
-      setTimeline([])
-      setPlaying(false)
-      setCursor(-1)
-    }
+    // The agent is editing the playbook — drop any run coloring so build-glow
+    // and status colors don't fight over the same nodes.
+    setRunDetail(null)
+    setCanvasSource('live')
     const { def: nextDef, glowNodeId } = applyPlaybookPatch(cur, evt)
     defRef.current = nextDef
     setDefinition(nextDef)
-    setYamlText(JSON.stringify(nextDef, null, 2))
     if (glowNodeId) {
       glowSeqRef.current += 1
       glowMapRef.current.set(glowNodeId, glowSeqRef.current)
@@ -455,7 +438,7 @@ export function PlaybookEditor(props: Props) {
     setSelectedStep(null)
   }, [])
 
-  const handlePromote = async () => {
+  const handlePromoteDraft = async () => {
     if (!meta?.draftId || promoting) return
     setPromoting(true)
     try {
@@ -463,6 +446,23 @@ export function PlaybookEditor(props: Props) {
       onBack()
     } catch (e: any) {
       setError(e.message)
+    } finally {
+      setPromoting(false)
+    }
+  }
+
+  // 0.13.0: promote the pending candidate through the gates (static
+  // validation, tests, tool probes). A refusal names the failing gate inline.
+  const handlePromoteCandidate = async () => {
+    if (!props.name || promoting) return
+    setPromoting(true)
+    setPromoteError(null)
+    try {
+      await playbooksApi.promoteCandidate(props.name)
+      setLoading(true)
+      loadData()
+    } catch (e: any) {
+      setPromoteError(promoteRefusalMessage(e))
     } finally {
       setPromoting(false)
     }
@@ -499,7 +499,25 @@ export function PlaybookEditor(props: Props) {
   const isDraft = meta?.isDraft
   const hasSteps = !!(definition?.steps?.length)
   const displayName = meta?.display_name || props.name || 'Untitled'
-  const playbookExplanation = definition?.explanation
+  const canvasDef = canvasSource === 'candidate' && candidateDef ? candidateDef : definition
+  const playbookExplanation = canvasDef?.explanation
+  const codeShown = canvasSource === 'candidate' && candidateDef
+    ? (candidateCode || JSON.stringify(candidateDef, null, 2))
+    : (code || (definition ? JSON.stringify(definition, null, 2) : '{}'))
+
+  const tabs: { mode: ViewMode; label: string; icon: React.ComponentType<{ className?: string }> }[] =
+    isDraft
+      ? [
+          { mode: 'canvas', label: 'Canvas', icon: Eye },
+          { mode: 'code', label: 'Code', icon: FileCode },
+        ]
+      : [
+          { mode: 'canvas', label: 'Canvas', icon: Eye },
+          { mode: 'code', label: 'Code', icon: FileCode },
+          { mode: 'manifest', label: 'Manifest', icon: FileText },
+          { mode: 'tests', label: 'Tests', icon: FlaskConical },
+          { mode: 'runs', label: 'Runs', icon: Play },
+        ]
 
   return (
     <div className="h-full flex flex-col">
@@ -538,22 +556,22 @@ export function PlaybookEditor(props: Props) {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {!isDraft && candidateVersion != null && (
+            <button
+              onClick={handlePromoteCandidate}
+              disabled={promoting}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-violet-500/40 text-violet-300 hover:bg-violet-600/20 disabled:opacity-40 text-xs font-medium transition whitespace-nowrap shrink-0"
+              title="Run the gates (tests, tool checks) and make this candidate live"
+              data-testid="promote-candidate-btn"
+            >
+              {promoting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
+              Promote candidate v{candidateVersion}
+            </button>
+          )}
           {!isDraft && (
             <>
               <button
-                onClick={() => { setRunsOpen((v) => !v); setVersionsOpen(false); setSettingsOpen(false) }}
-                className={cn(
-                  'p-1.5 rounded-lg transition',
-                  runsOpen
-                    ? 'bg-luna-600/30 text-luna-200'
-                    : 'hover:bg-white/5 text-ink-400 hover:text-ink-100',
-                )}
-                title="Run history"
-              >
-                <Play className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => { setVersionsOpen(!versionsOpen); setSettingsOpen(false); setRunsOpen(false) }}
+                onClick={() => { setVersionsOpen(!versionsOpen); setSettingsOpen(false) }}
                 className={cn(
                   'p-1.5 rounded-lg transition',
                   versionsOpen
@@ -565,7 +583,7 @@ export function PlaybookEditor(props: Props) {
                 <History className="w-4 h-4" />
               </button>
               <button
-                onClick={() => { setSettingsOpen(!settingsOpen); setVersionsOpen(false); setRunsOpen(false) }}
+                onClick={() => { setSettingsOpen(!settingsOpen); setVersionsOpen(false) }}
                 className={cn(
                   'p-1.5 rounded-lg transition',
                   settingsOpen
@@ -580,7 +598,7 @@ export function PlaybookEditor(props: Props) {
           )}
           {isDraft && (
             <button
-              onClick={handlePromote}
+              onClick={handlePromoteDraft}
               disabled={promoting || !hasSteps}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium transition"
               title={!hasSteps ? 'Add steps before promoting' : 'Promote to live playbook'}
@@ -590,30 +608,42 @@ export function PlaybookEditor(props: Props) {
             </button>
           )}
           <div className="flex items-center gap-1 bg-ink-900/60 rounded-lg p-0.5">
-            <TabBtn active={viewMode === 'canvas'} onClick={() => setViewMode('canvas')}>
-              <Eye className="w-3.5 h-3.5" /> Canvas
-            </TabBtn>
-            <TabBtn active={viewMode === 'yaml'} onClick={() => setViewMode('yaml')}>
-              <FileCode className="w-3.5 h-3.5" /> YAML
-            </TabBtn>
+            {tabs.map(({ mode, label, icon: Icon }) => (
+              <TabBtn key={mode} active={viewMode === mode} onClick={() => setViewMode(mode)}>
+                <Icon className="w-3.5 h-3.5" /> {label}
+              </TabBtn>
+            ))}
           </div>
         </div>
       </div>
+
+      {/* A refused candidate promote names the failing gate right under the header. */}
+      {promoteError && (
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-rose-500/20 bg-rose-950/20 shrink-0">
+          <p className="text-xs text-rose-300 flex-1" data-testid="promote-error">{promoteError}</p>
+          <button
+            onClick={() => setPromoteError(null)}
+            className="p-0.5 rounded text-ink-500 hover:text-ink-200 transition"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Content */}
       <div className="flex-1 min-h-0 relative flex">
         <div className="flex-1 min-w-0 relative">
           {viewMode === 'canvas' && (
             <>
-              {hasSteps ? (
+              {hasSteps || (canvasSource === 'candidate' && candidateDef?.steps?.length) ? (
                 <>
                   {/* Name + foldable explanation overlay */}
                   <div className="absolute top-3 left-3 z-10 max-w-[340px]">
                     <span className="inline-flex items-center gap-1.5 text-sm font-mono text-white">
-                      {definition?.name || props.name}
+                      {canvasDef?.name || props.name}
                       <button
                         onClick={() => {
-                          navigator.clipboard.writeText(definition?.name || props.name || '')
+                          navigator.clipboard.writeText(canvasDef?.name || props.name || '')
                           setCopied(true)
                           setTimeout(() => setCopied(false), 1500)
                         }}
@@ -640,30 +670,56 @@ export function PlaybookEditor(props: Props) {
                       </div>
                     )}
                   </div>
-                  {/* 007.013-B: replay reduced to a single play/stop toggle.
-                      Run selection + stats live in the Runs tab. */}
-                  {!isDraft && runDetail && timeline.length > 0 && (
-                    <ReplayToggle
-                      playing={playing}
-                      startedAt={runDetail.started_at}
-                      trigger={runDetail.trigger}
-                      onToggle={() => {
-                        if (timeline.length === 0) return
-                        if (cursor >= timeline.length - 1) setCursor(-1)
-                        setPlaying((p) => !p)
-                      }}
-                      onClear={() => {
-                        setPlaying(false)
-                        setRunDetail(null)
-                        setTimeline([])
-                        setCursor(-1)
-                        if (defRef.current) {
-                          const { nodes: n, edges: e } = buildGraph(defRef.current)
-                          setNodes(n)
-                          setEdges(e)
-                        }
-                      }}
-                    />
+                  {/* 0.13.0: live/candidate switch — which version the canvas shows. */}
+                  {!isDraft && candidateVersion != null && candidateDef && (
+                    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-0.5 p-0.5 rounded-full border border-white/10 bg-ink-950/90 backdrop-blur-sm shadow-lg">
+                      <button
+                        onClick={() => showSource('live')}
+                        className={cn(
+                          'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
+                          canvasSource === 'live'
+                            ? 'bg-luna-600/30 text-luna-200'
+                            : 'text-ink-400 hover:text-ink-200',
+                        )}
+                        data-testid="canvas-source-live"
+                      >
+                        Live v{meta?.version}
+                      </button>
+                      <button
+                        onClick={() => showSource('candidate')}
+                        className={cn(
+                          'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
+                          canvasSource === 'candidate'
+                            ? 'bg-violet-600/30 text-violet-200'
+                            : 'text-ink-400 hover:text-ink-200',
+                        )}
+                        data-testid="canvas-source-candidate"
+                      >
+                        Candidate v{candidateVersion}
+                      </button>
+                    </div>
+                  )}
+                  {/* Run coloring banner: the canvas is showing a PAST run. */}
+                  {!isDraft && runDetail && canvasSource === 'live' && (
+                    <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border border-amber-500/30 bg-ink-950/90 backdrop-blur-sm shadow-lg text-xs text-amber-100">
+                      <span className="text-[10px] uppercase tracking-wide text-amber-400/80 font-medium">
+                        {runDetail.status === 'running' ? 'Live run' : 'Past run'}
+                      </span>
+                      <button
+                        onClick={() => {
+                          setRunDetail(null)
+                          if (defRef.current) {
+                            const { nodes: n, edges: e } = buildGraph(defRef.current)
+                            setNodes(n)
+                            setEdges(e)
+                          }
+                        }}
+                        title="Back to definition"
+                        className="p-0.5 rounded text-ink-500 hover:text-ink-200 transition"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   )}
                   <ReactFlow
                     nodes={nodes}
@@ -691,11 +747,6 @@ export function PlaybookEditor(props: Props) {
                       />
                     )}
                   </ReactFlow>
-                  {/* 007.009.01 (viz): live stack/queue/set/counter, synced to the
-                      same replay cursor as the node shimmer. */}
-                  {runDetail && hasState(timeline) && (
-                    <StateVizPanel timeline={timeline} idx={cursor} />
-                  )}
                 </>
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-ink-500 gap-4">
@@ -703,8 +754,8 @@ export function PlaybookEditor(props: Props) {
                   <div className="text-center">
                     <p className="text-sm font-medium text-ink-300">Empty playbook</p>
                     <p className="text-xs text-ink-500 mt-1 max-w-xs">
-                      Switch to the YAML tab to define steps, or ask Luna in chat
-                      to help build this playbook.
+                      Ask Luna in chat to build this playbook — steps appear
+                      here as she writes them.
                     </p>
                   </div>
                 </div>
@@ -712,27 +763,53 @@ export function PlaybookEditor(props: Props) {
             </>
           )}
 
-          {viewMode === 'yaml' && (
+          {viewMode === 'code' && (
             <div className="h-full p-4 overflow-auto">
-              <pre className="text-xs text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/40 rounded-lg p-4 border border-white/5">
-                {yamlText || '{}'}
+              {!isDraft && candidateVersion != null && candidateDef && (
+                <div className="flex items-center gap-1 mb-3">
+                  {(['live', 'candidate'] as const).map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => showSource(s)}
+                      className={cn(
+                        'px-2.5 py-1 rounded-md text-[11px] font-medium transition',
+                        canvasSource === s
+                          ? s === 'candidate' ? 'bg-violet-600/30 text-violet-200' : 'bg-luna-600/30 text-luna-200'
+                          : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
+                      )}
+                    >
+                      {s === 'live' ? `Live v${meta?.version}` : `Candidate v${candidateVersion}`}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <pre
+                className="text-xs text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/40 rounded-lg p-4 border border-white/5"
+                data-testid="code-view"
+              >
+                {codeShown}
               </pre>
+              <p className="text-[11px] text-ink-600 mt-2">
+                Luna writes this — ask her in chat to change the playbook.
+              </p>
             </div>
           )}
 
-        </div>
+          {viewMode === 'manifest' && !isDraft && props.name && (
+            <ManifestTab
+              name={props.name}
+              onSaved={(version) => setMeta((m) => (m ? { ...m, version } : m))}
+            />
+          )}
 
-        {/* Runs side panel (006.714): list opens on the side, picking a run
-            colors the canvas; per-step detail comes from clicking a node. */}
-        {runsOpen && !isDraft && props.name && (
-          <PlaybookRuns
-            name={props.name}
-            activeRunId={runDetail?.id ?? null}
-            onLoadRun={loadRunStatic}
-            onPlayRun={playRunFromList}
-            onClose={() => setRunsOpen(false)}
-          />
-        )}
+          {viewMode === 'tests' && !isDraft && props.name && (
+            <TestsTab name={props.name} />
+          )}
+
+          {viewMode === 'runs' && !isDraft && props.name && (
+            <RunsTab name={props.name} onShowOnCanvas={loadRunStatic} />
+          )}
+        </div>
 
         {/* Step detail panel */}
         {selectedStep && viewMode === 'canvas' && !settingsOpen && (
@@ -762,23 +839,7 @@ export function PlaybookEditor(props: Props) {
             onPromoted={() => {
               setVersionsOpen(false)
               setLoading(true)
-              playbooksApi.get(props.name!).then((pb) => {
-                const def = pb.definition as PlaybookDef
-                setDefinition(def)
-                setMeta({
-                  display_name: pb.display_name,
-                  status: pb.status as string,
-                  version: pb.version,
-                  isDraft: false,
-                })
-                setYamlText(JSON.stringify(def, null, 2))
-                const { nodes: n, edges: e } = buildGraph(def)
-                setNodes(n)
-                setEdges(e)
-              }).catch((e) => setError(e.message)).finally(() => {
-                setLoading(false)
-                setVersionsOpen(true)
-              })
+              loadData()
             }}
           />
         )}
@@ -1194,66 +1255,6 @@ function StepDetailPanel({
       </div>
     </div>
   )
-}
-
-// 006.714: the replay control makes it explicit that the canvas is showing a
-// PAST run — it names when the run happened ("from 3h ago") and its trigger, so
-// the animation is never mistaken for a live execution. A clear (×) returns the
-// canvas to the clean definition.
-function ReplayToggle({
-  playing,
-  startedAt,
-  trigger,
-  onToggle,
-  onClear,
-}: {
-  playing: boolean
-  startedAt: string | null
-  trigger: string | null
-  onToggle: () => void
-  onClear: () => void
-}) {
-  const when = fmtRelativeTime(startedAt)
-  const src = trigger && trigger !== 'manual' ? ` · ${trigger}` : ''
-  return (
-    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border border-amber-500/30 bg-ink-950/90 backdrop-blur-sm shadow-lg text-xs text-amber-100">
-      <span className="text-[10px] uppercase tracking-wide text-amber-400/80 font-medium">Past run</span>
-      <button
-        data-testid="replay-play"
-        onClick={onToggle}
-        title={playing ? 'Stop replay' : `Replay run from ${when}`}
-        className="flex items-center gap-1.5 pl-1 text-ink-100 transition hover:text-white"
-      >
-        {playing ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-        {playing ? 'Stop' : 'Replay'} · {when}{src}
-      </button>
-      <button
-        onClick={onClear}
-        title="Back to definition"
-        className="p-0.5 rounded text-ink-500 hover:text-ink-200 transition"
-      >
-        <X className="w-3.5 h-3.5" />
-      </button>
-    </div>
-  )
-}
-
-// 006.714: relative time for the replay banner ("3h ago"). Shared shape with
-// PlaybookRuns' fmtRelative (kept local to avoid a cross-file util import).
-function fmtRelativeTime(iso: string | null): string {
-  if (!iso) return 'unknown time'
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return 'unknown time'
-  const s = Math.max(0, Math.floor((Date.now() - t) / 1000))
-  if (s < 45) return 'just now'
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  const d = Math.floor(h / 24)
-  if (d < 30) return `${d}d ago`
-  const mo = Math.floor(d / 30)
-  return mo < 12 ? `${mo}mo ago` : `${Math.floor(mo / 12)}y ago`
 }
 
 function TabBtn({
