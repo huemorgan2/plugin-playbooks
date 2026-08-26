@@ -1,11 +1,11 @@
 name = "plugin-playbooks"
-version = "0.11.0"
+version = "0.12.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_runs", "playbook_step_runs", "playbook_drafts"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -22,7 +22,7 @@ agent edits stream in over the E12 `ui.plugin.event` bridge (`playbook.open`,
 `playbook.patch`, `navigate`), and run/step activity rides the `activity.*`
 SSE feed.
 
-Owns its **five DB tables via the SDK** (E4 isolated metadata) and binds
+Owns its **eight DB tables via the SDK** (E4 isolated metadata) and binds
 external trigger sources (cron, webhooks, connector events) through the SDK
 `TriggerSourceRegistry`. Chat messages sent from playbook runs are tagged
 `source=playbook` (E11) for generic badging in core. Imports only `luna_sdk`
@@ -34,7 +34,7 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 
 [requires]
 tools = 10
-tables = 5
+tables = 8
 
 [[tools]]
 name = "playbook_propose"

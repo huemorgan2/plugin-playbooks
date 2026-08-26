@@ -25,16 +25,19 @@ def test_identity():
 def test_tool_and_table_counts():
     assert MANIFEST["requires"]["tools"] == 10
     assert len(MANIFEST["tools"]) == 10
-    assert MANIFEST["requires"]["tables"] == 5
-    assert len(MANIFEST["db_tables"]) == 5
+    assert MANIFEST["requires"]["tables"] == 8
+    assert len(MANIFEST["db_tables"]) == 8
 
 
 def test_db_table_names():
     assert set(MANIFEST["db_tables"]) == {
         "playbooks",
         "playbook_versions",
+        "playbook_edit_tickets",
         "playbook_runs",
         "playbook_step_runs",
+        "playbook_specs",
+        "playbook_probe_results",
         "playbook_drafts",
     }
 

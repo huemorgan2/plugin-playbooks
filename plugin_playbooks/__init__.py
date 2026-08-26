@@ -427,6 +427,17 @@ changes to a playbook that has none, propose pinning one from a good run.
 - Keep specs SMALL — assert the few things that matter (right tools called,
 right values in args). Over-tight specs fail on harmless changes.
 
+### PREFLIGHT (are the tools alive?)
+Specs stub the outside world, so they can't catch a dead credential or a
+vanished resource. `playbook_preflight(name)` can: it probes every tool the
+playbook touches (subtask targets included) and reports per tool —
+`ok` (probed, works), `unprobeable` (tool exists but its plugin declares no
+probe — common today, NOT an error), `failed` (missing tool, blocked policy,
+dead credential, gone resource). Only `failed` blocks `playbook_promote`.
+Run it when a playbook misbehaves at run time despite passing its specs, or
+before promoting something that talks to external services. A daily sweep
+re-probes enabled playbooks and alerts the chat when a tool breaks.
+
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
 A new requirement (e.g. 'for EACH job role, first search LinkedIn for
 comparables') is almost always an INSERTION mid-graph, NOT a step bolted on the
@@ -462,7 +473,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.11.0",
+        version="0.12.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -504,6 +515,7 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_spec_delete",
                     "playbook_spec_run",
                     "playbook_spec_from_run",
+                    "playbook_preflight",
                 ],
             ),
         ],
@@ -650,6 +662,8 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_spec_delete",
         "playbook_spec_run",
         "playbook_spec_from_run",
+        # 0.12.0: preflight probes
+        "playbook_preflight",
     )
 
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:

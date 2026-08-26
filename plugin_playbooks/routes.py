@@ -24,11 +24,13 @@ from .definition import PlaybookDef, parse_yaml
 from .models import (
     Playbook,
     PlaybookDraft,
+    PlaybookProbeResult,
     PlaybookRun,
     PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
 )
+from .probes import run_preflight
 from .specs import run_all_specs
 from .validation import validate_definition
 
@@ -147,8 +149,46 @@ def register_routes(app: Any, ctx: Any) -> None:
 
         asyncio.create_task(_go())
 
+    # 0.12.0 (plans/002 phase 5): daily re-probe — catch a credential that
+    # died BEFORE a trigger fires into it. Scheduled here for the same
+    # reason as the binding sync: on_load's bootstrap loop dies under
+    # `luna serve`. New failures post a muted "moment" so the agent tells
+    # the owner in chat.
+    async def _reprobe_on_startup() -> None:
+        import asyncio
+
+        from .probes import reprobe_enabled
+
+        async def _loop() -> None:
+            await asyncio.sleep(30)  # let boot settle; first sweep is cheap
+            while True:
+                try:
+                    registry = getattr(_runner, "_tools", None)
+                    alerts = await reprobe_enabled(_sf(), registry)
+                    if alerts and ctx is not None:
+                        lines = "\n".join(
+                            f"- **{a['playbook']}** → `{a['tool']}` "
+                            f"({a['failure_class']}): {a['detail']}"
+                            for a in alerts
+                        )
+                        await ctx.send_muted_message(
+                            title="Playbook preflight found broken tools",
+                            content=(
+                                "The daily connection check found tools that "
+                                "stopped working — these playbooks would fail "
+                                "the next time their trigger fires:\n" + lines
+                            ),
+                            channel="moment",
+                        )
+                except Exception:  # noqa: BLE001 — the sweep must never die
+                    logger.exception("playbooks: re-probe sweep failed")
+                await asyncio.sleep(24 * 3600)
+
+        asyncio.create_task(_loop())
+
     # FastAPI ≥0.136 dropped add_event_handler; the Starlette router list remains.
     app.router.on_startup.append(_sync_bindings_on_startup)
+    app.router.on_startup.append(_reprobe_on_startup)
 
 
 def _sf() -> async_sessionmaker[AsyncSession]:
@@ -805,6 +845,22 @@ async def promote_version(name: str, body: PromoteBody):
                         r for r in spec_summary["results"] if not r["passed"]
                     ],
                 })
+            # 0.12.0: probes gate — no tool the candidate touches may be
+            # KNOWN-broken (unprobeable tools pass; see probes.py).
+            probe_summary = await run_preflight(
+                session, getattr(_runner, "_tools", None), p,
+                row.definition or {},
+            )
+            if probe_summary["failed"]:
+                await session.commit()  # persist the probe cache rows
+                raise HTTPException(422, {
+                    "message": "Promote refused — gate 'probes' failed",
+                    "gate": "probes",
+                    "failing_tools": [
+                        r for r in probe_summary["results"]
+                        if r["status"] == "failed"
+                    ],
+                })
 
         old_live = _live_version_of(p)
         await _ensure_live_row(session, p)
@@ -922,6 +978,61 @@ async def run_specs_route(name: str):
         )
         await session.commit()
         return {"name": name, "ran_against_version": version_n, **summary}
+
+
+# --- Probes (0.12.0, plans/002 phase 5) ---
+
+@router.get("/playbooks/{name}/probes")
+async def list_probes(name: str):
+    """Cached preflight results per tool — feeds the phase-6 trust badges."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        rows = (await session.execute(
+            select(PlaybookProbeResult)
+            .where(PlaybookProbeResult.playbook_id == p.id)
+            .order_by(PlaybookProbeResult.tool)
+        )).scalars().all()
+        return {
+            "name": name,
+            "probes": [
+                {
+                    "tool": r.tool,
+                    "status": r.status,
+                    "failure_class": r.failure_class,
+                    "detail": r.detail,
+                    "probed_at": r.probed_at.isoformat() if r.probed_at else None,
+                }
+                for r in rows
+            ],
+        }
+
+
+@router.post("/playbooks/{name}/preflight")
+async def run_preflight_route(name: str):
+    """Probe every tool the playbook touches now (candidate when one
+    exists, else live) — the Tests tab's connections check."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        if p.candidate_version:
+            row = await _get_version_row(session, p, p.candidate_version)
+            if not row:
+                raise HTTPException(409, "Candidate version row is missing")
+            definition, version_n = row.definition or {}, row.version
+        else:
+            definition, version_n = p.definition or {}, _live_version_of(p)
+        summary = await run_preflight(
+            session, getattr(_runner, "_tools", None), p, definition,
+        )
+        await session.commit()
+        return {"name": name, "checked_version": version_n, **summary}
 
 
 # --- Manifest (0.9.0, plans/002 phase 2) ---

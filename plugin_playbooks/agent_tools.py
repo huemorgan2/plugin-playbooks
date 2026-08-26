@@ -34,6 +34,7 @@ from .models import (
     PlaybookVersion,
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
+from .probes import preflight_note, run_preflight
 from .specs import parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 
@@ -346,6 +347,23 @@ def build_tools(
         ),
         _list,
     ))
+    # Attach the probe only when the SDK knows the field (luna plans/038).
+    try:
+        from luna_sdk import ProbeDef  # noqa: PLC0415
+
+        async def _db_probe() -> dict[str, Any]:
+            from sqlalchemy import text
+            try:
+                async with session_factory() as session:
+                    await session.execute(text("select 1"))
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "failure_class": "resource_gone",
+                        "detail": f"plugin database unreachable: {e}"}
+            return {"ok": True, "detail": "plugin database reachable"}
+
+        tools[-1][0].probe = ProbeDef(kind="resource_read", handler=_db_probe)
+    except ImportError:
+        pass  # older core: playbook_list is simply unprobeable
 
     # --- playbook_run ---
     # plans/009: hybrid-async. The old tool awaited the whole run and hit its
@@ -1520,7 +1538,34 @@ def build_tools(
                     else "checked at save time"
                 ),
             })
-            # (the probes gate plugs in here — phase 5.)
+            # gate 4 (0.12.0): probes — every tool the candidate touches must
+            # not be KNOWN-broken. Only `failed` probes block; `unprobeable`
+            # (no probe declared) passes with a note. Results are cached on
+            # playbook_probe_results (committed even on refusal).
+            probe_summary = await run_preflight(
+                session, runner._tools, playbook, row.definition or {},
+            )
+            gates.append({
+                "gate": "probes",
+                "ok": probe_summary["failed"] == 0,
+                "note": preflight_note(probe_summary),
+            })
+            if probe_summary["failed"]:
+                await session.commit()  # persist the probe cache rows
+                return json.dumps({
+                    "error": "Promote refused — gate 'probes' failed.",
+                    "gate": "probes",
+                    "failing_tools": [
+                        r for r in probe_summary["results"]
+                        if r["status"] == "failed"
+                    ],
+                    "hint": (
+                        "A tool this playbook uses is broken or missing "
+                        "(dead credential, removed plugin, blocked policy). "
+                        "Fix the connection/plugin, or edit the playbook to "
+                        "stop using the tool, then promote again."
+                    ),
+                })
 
             old_live = _live_version_of(playbook)
             await _ensure_live_row(session, playbook)
@@ -2080,6 +2125,74 @@ def build_tools(
             },
         ),
         _spec_from_run,
+    ))
+
+    # --- playbook_preflight (0.12.0, plans/002 phase 5) ---
+    async def _preflight(*, name: str, version: str = "auto") -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            resolved = await _spec_target(session, playbook, version)
+            if isinstance(resolved, str):
+                return json.dumps({"error": resolved})
+            target, version_n = resolved
+            summary = await run_preflight(
+                session, runner._tools, playbook, target.definition or {},
+            )
+            await session.commit()
+        result: dict[str, Any] = {
+            "playbook": name,
+            "checked_version": version_n,
+            "is_candidate": bool(
+                playbook.candidate_version
+                and version_n == playbook.candidate_version
+            ),
+            **summary,
+        }
+        if summary["failed"]:
+            broken = [r for r in summary["results"] if r["status"] == "failed"]
+            result["next"] = (
+                "BROKEN: " + "; ".join(
+                    f"{r['tool']} ({r['failure_class']})" for r in broken
+                ) + " — playbook_promote will refuse, and live runs would "
+                "fail at these steps. Fix the connection/plugin or edit the "
+                "playbook to stop using the tool."
+            )
+        elif summary["ok"] == 0:
+            result["note"] = (
+                "No tool declares a probe yet — nothing verified, nothing "
+                "known-broken. This is normal today; probes arrive per-plugin."
+            )
+        return json.dumps(result)
+
+    tools.append((
+        ToolDef(
+            name="playbook_preflight",
+            description=(
+                "Check that every tool a playbook touches would work RIGHT "
+                "NOW (credentials alive, resources reachable) — the check "
+                "specs can't do because they stub the outside world. Probes "
+                "each tool (including subtask targets' tools): ok / "
+                "unprobeable (no probe declared) / failed. Failed probes "
+                "block playbook_promote. version: auto (candidate when one "
+                "exists, else live) | candidate | live | a number."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "version": {
+                        "type": "string",
+                        "description": "auto | candidate | live | version number",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        _preflight,
     ))
 
     return tools

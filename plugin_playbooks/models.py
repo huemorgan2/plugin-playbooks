@@ -206,6 +206,31 @@ class PlaybookSpec(Base):
     )
 
 
+class PlaybookProbeResult(Base):
+    """0.12.0 (plans/002 phase 5): cached preflight probe results, one row
+    per (playbook, tool). status: ok | unprobeable | failed. Feeds the
+    promote gate note, UI badges, and the daily re-probe's transition
+    detection (a row flipping into `failed` triggers a chat alert)."""
+    __tablename__ = "playbook_probe_results"
+
+    __table_args__ = (
+        Index("ix_playbook_probe_results_playbook_tool", "playbook_id", "tool",
+              unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    tool: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    failure_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    probed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class PlaybookDraft(Base):
     """In-progress canvas drafts — persisted so page reloads don't lose work."""
     __tablename__ = "playbook_drafts"
