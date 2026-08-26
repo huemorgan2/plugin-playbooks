@@ -70,5 +70,39 @@ Phases 0–7 all executed and shipped (0.8.0 → 0.14.0): pblang code authoring 
 compiler + codegen/backfill, manifest + ticketed edit flow, candidate/promote
 with gates, specs, probes/preflight, trust-surface UI with tabbed editor and
 run view, and this cleanup. Remaining known debt: REST create/update still
-YAML (legacy), luna core ProbeDef commit (0.34.020) still local pending owner
-decision, and installed agents must be manually upgraded from the marketplace.
+YAML (legacy), and installed agents must be manually upgraded from the
+marketplace. ProbeDef shipped upstream as luna 0.84.002 (2cacd43).
+
+## Retest on luna 0.84.002 + latest plugins (2026-08-26)
+
+The original QA above ran on a stale 0.34.x luna. Everything was re-verified
+on a fresh environment: luna 0.84.002 (origin/main worktree, fresh DB
+`luna_qa084` migrated to head) with the latest marketplace set — playbooks
+0.14.0, chat-ui 0.13.0, files 0.11.0, mcp 0.2.0, connectors 0.1.4,
+interview 0.3.0, monday 0.3.0, recall 0.1.2 — all via `build_plugin_set.py`
+(sha256-verified artifacts, `LUNA_PLUGIN_SET_DIR`). **All green, no code
+change needed; 0.14.0 stands.**
+
+- Code propose + manifest: `qa84-hello` created from `code=`, manifest stored.
+- Specs: add ran the spec immediately (passed, 3 checks); solo `spec_run` 1/1.
+- Dry-run: correct trace + resolved args.
+- Edit ticket flow: read stage → `old=`/`new=` write → candidate v2; promote
+  behind owner-approval card; approved → live v2; live run recorded
+  **normalized structured step outputs** (`{"status": "sent", ...}` as dict).
+- Run autonomy: `playbook_run` under `agent_must_confirm` refused with the
+  steering hint → `playbook_set_autonomy` approval card → approved → runs done.
+- **ProbeDef first real integration** (core finally has the field): a managed
+  fixture plugin declared `ProbeDef(kind="auth", handler=...)` on two tools —
+  preflight returned `ok` / `failed(credential_dead)` exactly, and
+  `playbook_promote` was **blocked by the probes gate even after owner
+  approval**, with the failing tool + hint in the error.
+- Dojo manifest-refusal (fresh conversation): ticketed read surfaced the
+  manifest; the drift check refused the Spanish edit with correct reasoning;
+  the agent escalated to `playbook_edit_force`, which parked on an owner
+  approval (rejected). DB probes: 2 version rows, zero contain "hola".
+
+Environment notes (not plugin defects): 0.84 executes an agent's batched tool
+calls concurrently, so `spec_add`+`spec_run` in one batch race (run saw 0
+specs; solo run passed) — steering-hint candidate for later. Dead SSE turns
+plus queued messages re-fired `playbook_run` (3 duplicate runs). Old QA env's
+`LUNA_DB_POOL=1` breaks 0.84 (asyncpg single-connection contention) — drop it.
