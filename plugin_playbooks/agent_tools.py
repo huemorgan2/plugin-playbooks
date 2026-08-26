@@ -23,7 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from luna_sdk import EventBus, ToolDef
 
 from .definition import AgentAutonomy, PlaybookDef, parse_yaml
-from .models import Playbook, PlaybookRun, PlaybookStepRun, PlaybookVersion
+from .models import (
+    Playbook,
+    PlaybookEditTicket,
+    PlaybookRun,
+    PlaybookStepRun,
+    PlaybookVersion,
+)
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .validation import validate_definition
 
@@ -70,6 +76,77 @@ async def _load_all_playbook_steps(
     return out
 
 
+# 0.9.0 (plans/002 phase 2): staged-edit tickets — single-use, 15-minute TTL.
+_TICKET_TTL_SECONDS = 15 * 60
+
+
+def _aware(dt):
+    """SQLite round-trips tz-aware datetimes as naive UTC — normalize."""
+    from datetime import timezone
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+async def _issue_ticket(session: AsyncSession, playbook: Playbook) -> PlaybookEditTicket:
+    """Create a fresh edit ticket; convergently sweep dead ones while here."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import delete, or_
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_TICKET_TTL_SECONDS)
+    await session.execute(delete(PlaybookEditTicket).where(or_(
+        PlaybookEditTicket.created_at < cutoff,
+        PlaybookEditTicket.used_at.is_not(None),
+    )))
+    ticket = PlaybookEditTicket(
+        playbook_id=playbook.id, base_version=playbook.version,
+    )
+    session.add(ticket)
+    await session.flush()
+    return ticket
+
+
+_TICKET_HINT = (
+    "Call playbook_edit(name) with NO other arguments first — it returns the "
+    "manifest, the current code, and a fresh edit ticket."
+)
+
+
+async def _check_ticket(
+    session: AsyncSession, playbook: Playbook, ticket: str, *, consume: bool,
+) -> str | None:
+    """None when the ticket is valid, else a refusal message.
+
+    consume=True marks it used (call only at the point of a successful save —
+    a compile error or drift refusal must NOT burn the ticket).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if not ticket:
+        return "An edit ticket is required to save changes. " + _TICKET_HINT
+    try:
+        tid = uuid.UUID(ticket)
+    except ValueError:
+        return "Invalid edit ticket. " + _TICKET_HINT
+    row = (await session.execute(
+        select(PlaybookEditTicket).where(PlaybookEditTicket.id == tid)
+    )).scalar_one_or_none()
+    if row is None or row.playbook_id != playbook.id:
+        return "Unknown edit ticket for this playbook. " + _TICKET_HINT
+    if row.used_at is not None:
+        return "This edit ticket was already used. " + _TICKET_HINT
+    age = datetime.now(timezone.utc) - _aware(row.created_at)
+    if age > timedelta(seconds=_TICKET_TTL_SECONDS):
+        return "This edit ticket expired. " + _TICKET_HINT
+    if row.base_version != playbook.version:
+        return (
+            "The playbook changed while you were editing (your ticket was "
+            "issued for an older version). " + _TICKET_HINT
+        )
+    if consume:
+        row.used_at = datetime.now(timezone.utc)
+    return None
+
+
 def build_tools(
     session_factory: async_sessionmaker[AsyncSession],
     events: EventBus,
@@ -88,6 +165,7 @@ def build_tools(
         when_to_use: str = "",
         code: str = "",
         definition_yaml: str = "",
+        manifest: str = "",
         agent_autonomy: str = "agent_must_confirm",
     ) -> str:
         # 0.8.0 (plans/002 phase 1): code is the preferred authoring format;
@@ -151,6 +229,7 @@ def build_tools(
                 inputs_schema=pb_def.inputs,
                 definition=defn,
                 code=stored_code,
+                manifest=manifest,
                 agent_autonomy=agent_autonomy,
                 created_by="agent",
                 status="enabled",
@@ -208,6 +287,14 @@ def build_tools(
                     "definition_yaml": {
                         "type": "string",
                         "description": "Full YAML definition (legacy format)",
+                    },
+                    "manifest": {
+                        "type": "string",
+                        "description": (
+                            "Optional intent manifest (plain markdown: "
+                            "Purpose, Side effects, Never, Acceptance). "
+                            "Future edits are checked against it."
+                        ),
                     },
                     "agent_autonomy": {
                         "type": "string",
@@ -528,6 +615,7 @@ def build_tools(
             version=playbook.version,
             definition=playbook.definition,
             code=playbook.code,
+            manifest=playbook.manifest,
             author=author,
             message=message,
             promoted_from=promoted_from,
@@ -717,21 +805,108 @@ def build_tools(
         _dry_run,
     ))
 
-    # --- playbook_edit (whole-source edit-in-place) ---
-    async def _playbook_edit(
+    # --- playbook_edit (staged: read → ticket → write) ---
+    # 0.9.0 (plans/002 phase 2): the flow lives in the tool layer, not prose
+    # (memory: flows-belong-in-tool-layer). Calling with no payload is the
+    # READ stage (manifest + code + single-use ticket); the WRITE stage
+    # requires that ticket, so the agent has provably seen the manifest and
+    # the current source before saving.
+
+    async def _drift_check(
+        manifest: str, old_code: str, new_code: str,
+    ) -> tuple[dict | None, str | None]:
+        """(verdict, warning). verdict={'conflict','reason'} or None when the
+        check could not run — fail OPEN with the warning (an LLM outage must
+        not brick editing)."""
+        agent = getattr(runner, "_agent", None)
+        if agent is None:
+            return None, None
+        prompt = (
+            "A playbook is about to be edited. Its MANIFEST states the "
+            "owner's intent: purpose, side effects, invariants. Decide "
+            "whether the NEW CODE conflicts with the manifest — it removes "
+            "or changes behavior the manifest promises, or adds behavior "
+            "the manifest forbids. Refactors, cosmetic changes, and "
+            "additions the manifest does not address are NOT conflicts.\n\n"
+            f"MANIFEST:\n{manifest}\n\n"
+            f"OLD CODE:\n{old_code}\n\n"
+            f"NEW CODE:\n{new_code}\n"
+        )
+        try:
+            result, _usage = await agent.run_llm(
+                prompt,
+                purpose="summarization",
+                system=(
+                    "You check playbook edits against their owner-stated "
+                    "manifest. Flag only real conflicts with what the "
+                    "manifest says; when in doubt, no conflict."
+                ),
+                output_schema={"conflict": "bool", "reason": "str"},
+            )
+        except Exception as e:  # noqa: BLE001 — fail open
+            return None, f"Manifest drift check unavailable ({e}); edit allowed."
+        if isinstance(result, dict) and isinstance(result.get("conflict"), bool):
+            return (
+                {"conflict": result["conflict"],
+                 "reason": str(result.get("reason", ""))},
+                None,
+            )
+        return None, "Manifest drift check gave an unusable answer; edit allowed."
+
+    async def _edit_impl(
         *,
         name: str,
+        ticket: str = "",
         code: str = "",
         old: str = "",
         new: str = "",
         definition_yaml: str = "",
+        skip_drift: bool = False,
+        forced: bool = False,
     ) -> str:
-        # 0.8.0 (plans/002 phase 1): three modes, exactly one —
-        #   code=            full code replace (preferred)
-        #   old= / new=      snippet diff applied to the current code
-        #   definition_yaml= full YAML replace (legacy)
         snippet_mode = bool(old) or bool(new)
         modes = sum([bool(code), snippet_mode, bool(definition_yaml)])
+
+        # READ stage: no payload at all → manifest + code + fresh ticket.
+        if modes == 0:
+            async with session_factory() as session:
+                playbook = (await session.execute(
+                    select(Playbook).where(Playbook.name == name)
+                )).scalar_one_or_none()
+                if not playbook:
+                    return json.dumps({
+                        "error": f"Playbook '{name}' not found. Use "
+                                 "playbook_propose to create it.",
+                    })
+                try:
+                    current = _derive_code(playbook)
+                except Exception:  # noqa: BLE001 — legacy defs must stay editable
+                    current = ""
+                t = await _issue_ticket(session, playbook)
+                payload = {
+                    "stage": "read",
+                    "manifest": playbook.manifest,
+                    "code": current,
+                    "version": playbook.version,
+                    "ticket": str(t.id),
+                    "expires_in_seconds": _TICKET_TTL_SECONDS,
+                    "instructions": (
+                        "Read the manifest and the current code above — your "
+                        "edit must stay within what the manifest states. Then "
+                        "call playbook_edit again with this ticket and exactly "
+                        "one of: code= (full source), old=/new= (targeted "
+                        "snippet), or definition_yaml= (legacy). The ticket "
+                        "is single-use and expires."
+                    ),
+                }
+                if not playbook.manifest:
+                    payload["manifest_note"] = (
+                        "This playbook has no manifest yet. Consider "
+                        "proposing one to the owner via playbook_manifest_set."
+                    )
+                await session.commit()
+            return json.dumps(payload)
+
         if modes != 1:
             return json.dumps({
                 "error": "Provide exactly one of: 'code', 'old'+'new', or "
@@ -740,31 +915,40 @@ def build_tools(
         if snippet_mode and not (old and new is not None):
             return json.dumps({"error": "Snippet edits need both 'old' and 'new'."})
 
+        # WRITE stage, part 1: ticket check + compile + validate (no lock —
+        # the LLM drift call must not hold a row lock or an open session).
         async with session_factory() as session:
             playbook = (await session.execute(
-                select(Playbook).where(Playbook.name == name).with_for_update()
+                select(Playbook).where(Playbook.name == name)
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({
                     "error": f"Playbook '{name}' not found. Use playbook_propose to create it.",
                 })
+            refusal = await _check_ticket(session, playbook, ticket, consume=False)
+            if refusal:
+                return json.dumps({"error": refusal})
+            base_version = playbook.version
+            manifest = playbook.manifest
+            try:
+                old_code = _derive_code(playbook)
+            except Exception:  # noqa: BLE001
+                old_code = ""
 
             stored_code: str | None
             if snippet_mode:
-                try:
-                    current = _derive_code(playbook)
-                except Exception as e:  # noqa: BLE001
+                if not old_code:
                     return json.dumps({
                         "error": f"Cannot snippet-edit '{name}': its code "
-                                 f"cannot be rendered ({e}). Use code= with "
-                                 f"the full source instead.",
+                                 "cannot be rendered. Use code= with the "
+                                 "full source instead.",
                     })
-                count = current.count(old)
+                count = old_code.count(old)
                 if count == 0:
                     return json.dumps({
                         "error": "The 'old' snippet was not found in the "
-                                 "current code. Call playbook_get_definition "
-                                 "and copy the exact text.",
+                                 "current code. Use the code returned by the "
+                                 "read stage and copy the exact text.",
                     })
                 if count > 1:
                     return json.dumps({
@@ -772,7 +956,7 @@ def build_tools(
                                  "include more surrounding context so it is "
                                  "unique.",
                     })
-                code = current.replace(old, new)
+                code = old_code.replace(old, new)
 
             if code:
                 pb_def, err = _compile_code(code, name=name)
@@ -806,8 +990,50 @@ def build_tools(
                     "issues": errors,
                 })
 
+        # Drift gate: only when a manifest exists. Refusal does NOT burn the
+        # ticket — fix the code and retry with the same one.
+        drift_warning: str | None = None
+        if manifest.strip() and not skip_drift:
+            verdict, drift_warning = await _drift_check(
+                manifest, old_code, stored_code or definition_yaml,
+            )
+            if verdict and verdict["conflict"]:
+                return json.dumps({
+                    "error": "Edit refused — it conflicts with the playbook's manifest.",
+                    "reason": verdict["reason"],
+                    "your_options": [
+                        "Change the code so it stays within the manifest, "
+                        "then retry with the SAME ticket (still valid until "
+                        "it expires).",
+                        "If the manifest itself is outdated, update it with "
+                        "playbook_manifest_set (asks the owner for approval), "
+                        "then retry the edit.",
+                        "If the owner explicitly wants this change anyway, "
+                        "use playbook_edit_force (also asks the owner for "
+                        "approval).",
+                    ],
+                })
+
+        # WRITE stage, part 2: consume the ticket and save, under lock.
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name).with_for_update()
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            if playbook.version != base_version:
+                return json.dumps({
+                    "error": "The playbook changed while you were editing. "
+                             "Call playbook_edit(name) to re-read and get a "
+                             "fresh ticket.",
+                })
+            refusal = await _check_ticket(session, playbook, ticket, consume=True)
+            if refusal:
+                return json.dumps({"error": refusal})
+
             await _snapshot_version(
-                session, playbook, author="agent", message="before edit",
+                session, playbook, author="agent",
+                message="before forced edit" if forced else "before edit",
             )
             data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
             data["name"] = name  # never rename via edit
@@ -832,10 +1058,47 @@ def build_tools(
             "focus": True,
         })
         warnings = [i.to_dict() for i in issues if i.severity == "warning"]
-        return json.dumps({
+        result: dict[str, Any] = {
             "playbook": name, "version": new_version, "status": "edited",
             "warnings": warnings,
-        })
+        }
+        if forced:
+            result["note"] = "manifest drift gate skipped (forced edit)"
+        if drift_warning:
+            result["drift_warning"] = drift_warning
+        return json.dumps(result)
+
+    async def _playbook_edit(
+        *,
+        name: str,
+        ticket: str = "",
+        code: str = "",
+        old: str = "",
+        new: str = "",
+        definition_yaml: str = "",
+    ) -> str:
+        return await _edit_impl(
+            name=name, ticket=ticket, code=code, old=old, new=new,
+            definition_yaml=definition_yaml,
+        )
+
+    _EDIT_PAYLOAD_PROPS = {
+        "name": {"type": "string", "description": "Existing playbook name"},
+        "ticket": {
+            "type": "string",
+            "description": "Edit ticket from the read stage (required to save)",
+        },
+        "code": {"type": "string", "description": "Full new playbook code"},
+        "old": {
+            "type": "string",
+            "description": "Exact snippet of the current code to replace (must be unique)",
+        },
+        "new": {"type": "string", "description": "Replacement text for 'old'"},
+        "definition_yaml": {
+            "type": "string",
+            "description": "Full new YAML definition (legacy format)",
+        },
+    }
 
     tools.append((
         ToolDef(
@@ -848,34 +1111,113 @@ def build_tools(
             # approval gate as chat since luna 0.40.003, and the edit
             # validates + snapshots a version before replacing.
             description=(
-                "Change an existing playbook like you'd edit a source file. "
-                "Get the current code with playbook_get_definition, then either "
-                "pass the complete new source via code=, or make a targeted "
-                "change via old=/new= (the old snippet must match exactly one "
-                "place in the current code; include surrounding lines to make "
-                "it unique). Snapshots a version, compiles, validates, then "
-                "replaces the definition. Legacy: definition_yaml= replaces "
-                "from full YAML. Pass exactly one mode."
+                "Change an existing playbook — a two-step flow. STEP 1 (read): "
+                "call with ONLY the name; you get the playbook's manifest (its "
+                "owner-stated intent), the current code, and a single-use edit "
+                "ticket. STEP 2 (write): call again with that ticket plus "
+                "exactly one of code= (full new source), old=/new= (targeted "
+                "snippet; 'old' must match exactly one place), or "
+                "definition_yaml= (legacy). The write compiles, validates, "
+                "checks the edit against the manifest, snapshots a version, "
+                "then replaces the definition. Edits that conflict with the "
+                "manifest are refused."
             ),
             parameters={
                 "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Existing playbook name"},
-                    "code": {"type": "string", "description": "Full new playbook code"},
-                    "old": {
-                        "type": "string",
-                        "description": "Exact snippet of the current code to replace (must be unique)",
-                    },
-                    "new": {"type": "string", "description": "Replacement text for 'old'"},
-                    "definition_yaml": {
-                        "type": "string",
-                        "description": "Full new YAML definition (legacy format)",
-                    },
-                },
+                "properties": _EDIT_PAYLOAD_PROPS,
                 "required": ["name"],
             },
         ),
         _playbook_edit,
+    ))
+
+    # --- playbook_edit_force (drift override — owner approval) ---
+    async def _playbook_edit_force(
+        *,
+        name: str,
+        ticket: str = "",
+        code: str = "",
+        old: str = "",
+        new: str = "",
+        definition_yaml: str = "",
+    ) -> str:
+        return await _edit_impl(
+            name=name, ticket=ticket, code=code, old=old, new=new,
+            definition_yaml=definition_yaml, skip_drift=True, forced=True,
+        )
+
+    tools.append((
+        ToolDef(
+            name="playbook_edit_force",
+            description=(
+                "Save a playbook edit even though it conflicts with the "
+                "playbook's manifest. Same arguments and ticket flow as "
+                "playbook_edit; the manifest drift gate is skipped and the "
+                "version history records the override. Use ONLY after "
+                "playbook_edit refused for manifest conflict AND the owner "
+                "wants the change anyway — this raises an approval card."
+            ),
+            parameters={
+                "type": "object",
+                "properties": _EDIT_PAYLOAD_PROPS,
+                "required": ["name", "ticket"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _playbook_edit_force,
+    ))
+
+    # --- playbook_manifest_set (owner approval) ---
+    async def _manifest_set(*, name: str, manifest: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name).with_for_update()
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            await _snapshot_version(
+                session, playbook, author="agent", message="manifest updated",
+            )
+            playbook.manifest = manifest
+            # bump: version rows must stay unique per version number
+            # (promote resolves by version), so every snapshot bumps.
+            playbook.version += 1
+            await session.commit()
+            new_version = playbook.version
+        await events.emit("playbook.saved", {"name": name})
+        return json.dumps({
+            "playbook": name, "version": new_version, "status": "manifest_set",
+            "manifest_chars": len(manifest),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_manifest_set",
+            description=(
+                "Set or replace a playbook's MANIFEST — the owner-stated "
+                "intent in plain markdown: Purpose, Side effects, Never "
+                "(invariants), Acceptance. Future edits are checked against "
+                "it and refused when they conflict, so changing it is an "
+                "owner decision — this raises an approval card. Draft the "
+                "manifest from what the owner said and from the playbook's "
+                "code; keep it short and testable."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "manifest": {
+                        "type": "string",
+                        "description": "Full manifest text (markdown). Replaces the current one.",
+                    },
+                },
+                "required": ["name", "manifest"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _manifest_set,
     ))
 
     return tools

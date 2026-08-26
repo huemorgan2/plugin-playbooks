@@ -42,6 +42,9 @@ class Playbook(Base):
     # that changes `definition` without code MUST null this out (stale code is
     # worse than no code).
     code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 0.9.0 (plans/002 phase 2): free-text intent manifest (markdown). Empty
+    # string = no manifest yet; the drift gate only engages when non-empty.
+    manifest: Mapped[str] = mapped_column(Text, default="", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="enabled", nullable=False)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
@@ -68,6 +71,8 @@ class PlaybookVersion(Base):
     definition: Mapped[dict] = mapped_column(JSONB, nullable=False)
     # 0.8.0: pblang source at snapshot time (NULL = derive via codegen).
     code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 0.9.0: manifest at snapshot time — intent history travels with versions.
+    manifest: Mapped[str] = mapped_column(Text, default="", nullable=False)
     author: Mapped[str] = mapped_column(String(64), default="owner", nullable=False)
     message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     promoted_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -76,6 +81,31 @@ class PlaybookVersion(Base):
     )
     last_edit_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class PlaybookEditTicket(Base):
+    """0.9.0 (plans/002 phase 2): staged-edit tickets.
+
+    The write stage of playbook_edit requires a ticket issued by the read
+    stage — the gate that forces "read the manifest + current code before you
+    write". Single-use, 15-minute TTL; expired/used rows are swept
+    convergently whenever a new ticket is issued.
+    """
+    __tablename__ = "playbook_edit_tickets"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    # the playbook version the read stage handed out — a write against a
+    # playbook that changed since is refused (edit was authored on stale code).
+    base_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

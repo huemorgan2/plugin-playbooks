@@ -56,6 +56,12 @@ async def _get(sf, name: str) -> Playbook:
         )).scalar_one()
 
 
+async def _ticket(tools, name: str) -> str:
+    """0.9.0: the write stage of playbook_edit needs a read-stage ticket."""
+    out = json.loads(await tools["playbook_edit"](name=name))
+    return out["ticket"]
+
+
 @pytest.mark.asyncio
 async def test_propose_with_code_stores_code_and_definition(env):
     sf, tools = env
@@ -132,7 +138,7 @@ async def test_edit_with_code_snapshots_and_replaces(env):
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     new_code = CODE.replace("inputs.greeting", "inputs.name")
-    out = json.loads(await tools["playbook_edit"](name="greeter", code=new_code))
+    out = json.loads(await tools["playbook_edit"](name="greeter", ticket=await _ticket(tools, "greeter"), code=new_code))
     assert out["status"] == "edited"
     assert out["version"] == 2
     pb = await _get(sf, "greeter")
@@ -149,7 +155,8 @@ async def test_snippet_edit_unique_match(env):
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", old="inputs.greeting", new="inputs.name",
+        name="greeter", ticket=await _ticket(tools, "greeter"),
+        old="inputs.greeting", new="inputs.name",
     ))
     assert out["status"] == "edited", out
     pb = await _get(sf, "greeter")
@@ -161,11 +168,13 @@ async def test_snippet_edit_rejects_missing_and_ambiguous(env):
     _, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", old="not in the code", new="x",
+        name="greeter", ticket=await _ticket(tools, "greeter"),
+        old="not in the code", new="x",
     ))
     assert "not found" in out["error"]
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", old="in", new="x",   # matches many places
+        name="greeter", ticket=await _ticket(tools, "greeter"),
+        old="in", new="x",   # matches many places
     ))
     assert "matches" in out["error"]
 
@@ -175,7 +184,8 @@ async def test_snippet_edit_that_breaks_compile_is_rejected(env):
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", old="inputs.greeting", new="mystery.field",
+        name="greeter", ticket=await _ticket(tools, "greeter"),
+        old="inputs.greeting", new="mystery.field",
     ))
     assert "does not compile" in out["error"]
     pb = await _get(sf, "greeter")
@@ -188,9 +198,9 @@ async def test_edit_requires_exactly_one_mode(env):
     _, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await tools["playbook_edit"](name="greeter"))
-    assert "exactly one" in out["error"]
+    assert out["stage"] == "read"  # no payload = the read stage, not an error
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", code=CODE, old="a", new="b",
+        name="greeter", ticket=out["ticket"], code=CODE, old="a", new="b",
     ))
     assert "exactly one" in out["error"]
 
@@ -208,7 +218,8 @@ async def test_yaml_edit_regenerates_code(env):
         "    args: {message: 'hello'}\n"
     )
     out = json.loads(await tools["playbook_edit"](
-        name="greeter", definition_yaml=yaml_src,
+        name="greeter", ticket=await _ticket(tools, "greeter"),
+        definition_yaml=yaml_src,
     ))
     assert out["status"] == "edited"
     pb = await _get(sf, "greeter")

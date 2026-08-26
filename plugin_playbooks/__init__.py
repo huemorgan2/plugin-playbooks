@@ -12,23 +12,37 @@ from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, 
 logger = logging.getLogger(__name__)
 
 
-async def _ensure_code_columns(engine) -> None:
-    """Add the nullable `code` TEXT column to pre-0.8.0 installs."""
+# Columns added after a table first shipped. `table.create(checkfirst=True)`
+# skips existing tables entirely, so these need explicit ALTERs. Additive,
+# SQLite/PG-safe DDL only.
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, DDL type suffix)
+    ("playbooks", "code", "TEXT"),                        # 0.8.0
+    ("playbook_versions", "code", "TEXT"),                # 0.8.0
+    ("playbooks", "manifest", "TEXT NOT NULL DEFAULT ''"),          # 0.9.0
+    ("playbook_versions", "manifest", "TEXT NOT NULL DEFAULT ''"),  # 0.9.0
+]
+
+
+async def _ensure_columns(engine) -> None:
+    """Add late-added columns to installs that predate them."""
     from sqlalchemy import inspect, text
 
     def _missing(sync_conn):
         insp = inspect(sync_conn)
-        out = []
-        for table in ("playbooks", "playbook_versions"):
-            cols = {c["name"] for c in insp.get_columns(table)}
-            if "code" not in cols:
-                out.append(table)
-        return out
+        cols = {
+            t: {c["name"] for c in insp.get_columns(t)}
+            for t in {t for t, _, _ in _COLUMN_MIGRATIONS}
+        }
+        return [
+            (t, col, ddl) for t, col, ddl in _COLUMN_MIGRATIONS
+            if col not in cols[t]
+        ]
 
     async with engine.begin() as conn:
-        for table in await conn.run_sync(_missing):
-            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN code TEXT"))
-            logger.info("playbooks: added code column to %s", table)
+        for table, col, ddl in await conn.run_sync(_missing):
+            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+            logger.info("playbooks: added %s column to %s", col, table)
 
 
 async def backfill_code(session_factory) -> int:
@@ -92,10 +106,12 @@ step: `id -> kind -> the SINGLE operation`. Then self-check three rules:
 single step may carry the whole task — if one step would, you have one line,
 so keep decomposing until each line is atomic; (c) each `agent()`/`llm()` is
 ONE judgment on ONE thing. Only when the outline passes do you write code.
-1. WRITE: `playbook_propose(name, code=...)` to create. EDIT: get the current
-code with `playbook_get_definition(name)`, then `playbook_edit(name, code=...)`
-with the full new source, or `playbook_edit(name, old=..., new=...)` for a
-targeted change (the `old` snippet must match exactly one place).
+1. WRITE: `playbook_propose(name, code=...)` to create. EDIT: two steps —
+`playbook_edit(name)` alone first (returns the MANIFEST, the current code, and
+a single-use edit ticket), then `playbook_edit(name, ticket=..., code=...)`
+with the full new source, or `playbook_edit(name, ticket=..., old=..., new=...)`
+for a targeted change (the `old` snippet must match exactly one place). See
+MANIFEST + THE EDIT FLOW below.
 2. COMPILE: `playbook_validate(code=...)` or `playbook_validate(name=...)` —
 returns ALL errors at once (compile errors with line numbers, undefined
 steps/inputs references, unknown tools, bad loops, cycles). Fix every error.
@@ -328,15 +344,36 @@ scope); results append to `steps.<loop_id>.collected`. THIS is how you gather
 per-iteration outputs — without it only the last iteration survives.
 - A loop with an empty body does NOTHING — nest at least one step in `body=[]`.
 
+### MANIFEST + THE EDIT FLOW (read → ticket → write)
+Every playbook can carry a MANIFEST: the owner's intent in plain markdown —
+Purpose, Side effects, Never (invariants), Acceptance. Editing is a TWO-STEP
+flow enforced by the tools:
+1. READ: `playbook_edit(name)` with nothing else → returns `{manifest, code,
+version, ticket, expires_in_seconds}`. Read the manifest — your edit must stay
+within it.
+2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`,
+`old=`/`new=`, or `definition_yaml=`. The ticket is single-use and expires in
+15 minutes; a save without a valid ticket is refused.
+Every write is checked against the manifest. If it conflicts you get the
+reason and three legal moves: fix the code and retry with the SAME ticket
+(a refusal does not burn it); or update the manifest via
+`playbook_manifest_set(name, manifest)` (asks the owner); or, if the owner
+explicitly wants the conflicting change, `playbook_edit_force` (also asks the
+owner). NEVER work around a manifest refusal any other way.
+When you create a playbook, pass `manifest=` to `playbook_propose` — a few
+short lines stating purpose, side effects, and what must never happen. If a
+playbook has none, propose one to the owner via `playbook_manifest_set`.
+
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
 A new requirement (e.g. 'for EACH job role, first search LinkedIn for
 comparables') is almost always an INSERTION mid-graph, NOT a step bolted on the
 end, and NEVER a second monolith. Recipe:
-1. `playbook_get_definition(name)` — read the current code.
+1. `playbook_edit(name)` — the read stage: manifest + current code + ticket.
 2. Find the SEAM — 'for each role' means inside the per-role loop() body, not
 a new top-level step.
-3. Splice the new steps there, decomposed. Use `playbook_edit(old=..., new=...)`
-for a surgical splice, or `playbook_edit(code=...)` with the full new source.
+3. Splice the new steps there, decomposed. Use
+`playbook_edit(ticket=..., old=..., new=...)` for a surgical splice, or
+`playbook_edit(ticket=..., code=...)` with the full new source.
 4. RE-POINT downstream refs — steps after the seam must now read the NEW
 step's output. This rewiring is the real work of a change.
 5. `playbook_validate` -> `playbook_dry_run` -> `playbook_run`.
@@ -361,7 +398,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.8.0",
+        version="0.9.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -388,6 +425,8 @@ class PlaybooksPlugin(LunaPlugin):
                 tools=[
                     "playbook_propose",
                     "playbook_edit",
+                    "playbook_edit_force",
+                    "playbook_manifest_set",
                     "playbook_get_definition",
                     "playbook_validate",
                     "playbook_dry_run",
@@ -420,12 +459,12 @@ class PlaybooksPlugin(LunaPlugin):
                 await conn.run_sync(table.create, checkfirst=True)
 
         # 0.8.0 (plans/002 phase 1): `table.create(checkfirst=True)` also
-        # skips COLUMNS on pre-existing tables — installs that predate the
-        # `code` column need an ALTER. Additive, nullable, SQLite/PG safe.
+        # skips COLUMNS on pre-existing tables — late-added columns need an
+        # ALTER (see _COLUMN_MIGRATIONS).
         try:
-            await _ensure_code_columns(ctx.engine)
+            await _ensure_columns(ctx.engine)
         except Exception as e:  # noqa: BLE001
-            logger.warning("playbooks: code-column migration failed: %s", e)
+            logger.warning("playbooks: column migration failed: %s", e)
 
         # plans/001: `table.create(checkfirst=True)` skips the whole table when
         # it already exists, indexes included — so installs that predate an

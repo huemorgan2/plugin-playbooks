@@ -319,6 +319,7 @@ async def get_playbook(name: str):
             "description": p.description,
             "when_to_use": p.when_to_use,
             "definition": p.definition,
+            "manifest": p.manifest,
             "inputs_schema": p.inputs_schema,
             "status": p.status,
             "agent_autonomy": p.agent_autonomy,
@@ -393,6 +394,7 @@ async def update_playbook(name: str, body: PlaybookUpdate):
             version=p.version,
             definition=p.definition,
             code=p.code,
+            manifest=p.manifest,
             author="owner",
             message=body.message or "REST update",
         ))
@@ -667,6 +669,7 @@ async def promote_version(name: str, body: PromoteBody):
             version=p.version,
             definition=p.definition,
             code=p.code,
+            manifest=p.manifest,
             author="owner",
             message=f"before promoting v{body.version}",
             promoted_from=body.version,
@@ -675,6 +678,8 @@ async def promote_version(name: str, body: PromoteBody):
         p.definition = old_ver.definition
         # 0.8.0: restore that version's code too (NULL = derive on read).
         p.code = old_ver.code
+        # 0.9.0: manifest travels with the version as well.
+        p.manifest = old_ver.manifest
         p.version += 1
 
         pb_def = PlaybookDef.model_validate(old_ver.definition)
@@ -690,6 +695,53 @@ async def promote_version(name: str, body: PromoteBody):
             "promoted_from": body.version,
             "status": "promoted",
         }
+
+
+# --- Manifest (0.9.0, plans/002 phase 2) ---
+
+class ManifestBody(BaseModel):
+    manifest: str
+
+
+@router.get("/playbooks/{name}/manifest")
+async def get_manifest(name: str):
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        return {"name": name, "manifest": p.manifest}
+
+
+@router.put("/playbooks/{name}/manifest")
+async def put_manifest(name: str, body: ManifestBody):
+    """Owner sets the manifest directly — no approval gate on the REST path
+    (the UI IS the owner); the agent path goes through playbook_manifest_set,
+    which raises an approval card."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        session.add(PlaybookVersion(
+            playbook_id=p.id,
+            version=p.version,
+            definition=p.definition,
+            code=p.code,
+            manifest=p.manifest,
+            author="owner",
+            message="manifest updated",
+        ))
+        p.manifest = body.manifest
+        # bump: playbook_versions rows must stay unique per version number
+        # (promote resolves by version), so every snapshot-then-write bumps.
+        p.version += 1
+        await session.commit()
+        version = p.version
+    await _notify_changed(name)
+    return {"name": name, "version": version, "status": "manifest_set"}
 
 
 # --- Drafts ---
