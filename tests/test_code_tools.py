@@ -134,20 +134,25 @@ async def test_get_definition_derives_code_for_yaml_playbooks(env):
 
 
 @pytest.mark.asyncio
-async def test_edit_with_code_snapshots_and_replaces(env):
+async def test_edit_with_code_saves_a_candidate(env):
+    # 0.10.0: a save creates a CANDIDATE version row — live is untouched
+    # until playbook_promote.
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     new_code = CODE.replace("inputs.greeting", "inputs.name")
     out = json.loads(await tools["playbook_edit"](name="greeter", ticket=await _ticket(tools, "greeter"), code=new_code))
-    assert out["status"] == "edited"
-    assert out["version"] == 2
+    assert out["status"] == "candidate_saved"
+    assert out["candidate_version"] == 2
+    assert out["live_version"] == 1
     pb = await _get(sf, "greeter")
-    assert pb.code == new_code
-    assert pb.definition["steps"][0]["args"] == {"message": "{{ inputs.name }}"}
+    assert pb.code == CODE  # live untouched
+    assert pb.candidate_version == 2
     async with sf() as s:
-        vers = (await s.execute(select(PlaybookVersion))).scalars().all()
-    assert len(vers) == 1
-    assert vers[0].code == CODE  # the pre-edit source was snapshotted
+        vers = {v.version: v for v in (await s.execute(select(PlaybookVersion))).scalars().all()}
+    assert set(vers) == {1, 2}
+    assert vers[1].code == CODE       # live content recorded
+    assert vers[2].code == new_code   # the candidate holds the NEW content
+    assert vers[2].definition["steps"][0]["args"] == {"message": "{{ inputs.name }}"}
 
 
 @pytest.mark.asyncio
@@ -158,9 +163,12 @@ async def test_snippet_edit_unique_match(env):
         name="greeter", ticket=await _ticket(tools, "greeter"),
         old="inputs.greeting", new="inputs.name",
     ))
-    assert out["status"] == "edited", out
-    pb = await _get(sf, "greeter")
-    assert "inputs.name" in pb.code
+    assert out["status"] == "candidate_saved", out
+    async with sf() as s:
+        cand = (await s.execute(
+            select(PlaybookVersion).where(PlaybookVersion.version == out["candidate_version"])
+        )).scalar_one()
+    assert "inputs.name" in cand.code
 
 
 @pytest.mark.asyncio
@@ -221,9 +229,12 @@ async def test_yaml_edit_regenerates_code(env):
         name="greeter", ticket=await _ticket(tools, "greeter"),
         definition_yaml=yaml_src,
     ))
-    assert out["status"] == "edited"
-    pb = await _get(sf, "greeter")
-    assert "message='hello'" in pb.code  # regenerated, not the stale source
+    assert out["status"] == "candidate_saved"
+    async with sf() as s:
+        cand = (await s.execute(
+            select(PlaybookVersion).where(PlaybookVersion.version == out["candidate_version"])
+        )).scalar_one()
+    assert "message='hello'" in cand.code  # regenerated, not the stale source
 
 
 @pytest.mark.asyncio

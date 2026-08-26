@@ -135,7 +135,7 @@ async def test_ticket_is_single_use(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited", out
+    assert out["status"] == "candidate_saved", out
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=CODE,
     ))
@@ -194,7 +194,7 @@ async def test_compile_error_does_not_burn_the_ticket(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited", out
+    assert out["status"] == "candidate_saved", out
 
 
 @pytest.mark.asyncio
@@ -221,7 +221,7 @@ async def test_drift_check_skipped_without_manifest(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited"
+    assert out["status"] == "candidate_saved"
     assert agent.calls == []
 
 
@@ -233,7 +233,7 @@ async def test_drift_check_runs_with_manifest_and_passes(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited"
+    assert out["status"] == "candidate_saved"
     assert len(agent.calls) == 1
     prompt, kw = agent.calls[0]
     assert MANIFEST in prompt and CODE in prompt and NEW_CODE in prompt
@@ -260,7 +260,7 @@ async def test_drift_conflict_refuses_and_keeps_ticket(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,  # SAME ticket retries
     ))
-    assert out["status"] == "edited", out
+    assert out["status"] == "candidate_saved", out
 
 
 @pytest.mark.asyncio
@@ -272,7 +272,7 @@ async def test_drift_check_fails_open_on_llm_error(env):
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited"
+    assert out["status"] == "candidate_saved"
     assert "unavailable" in out["drift_warning"]
     assert (await _get(sf, "greeter")).version == 2
 
@@ -286,12 +286,14 @@ async def test_edit_force_skips_drift_and_records_override(env):
     out = json.loads(await tools["playbook_edit_force"](
         name="greeter", ticket=ticket, code=NEW_CODE,
     ))
-    assert out["status"] == "edited"
+    assert out["status"] == "candidate_saved"
     assert "forced" in out["note"]
     assert agent.calls == []  # drift gate never ran
     async with sf() as s:
-        v = (await s.execute(select(PlaybookVersion))).scalar_one()
-    assert v.message == "before forced edit"
+        v = (await s.execute(select(PlaybookVersion).where(
+            PlaybookVersion.version == out["candidate_version"]
+        ))).scalar_one()
+    assert "forced" in v.message  # the override is recorded on the candidate
 
 
 # --- manifest tool + snapshots ---
@@ -307,11 +309,13 @@ async def test_manifest_set_snapshots_and_bumps(env):
     assert out["version"] == 2
     pb = await _get(sf, "greeter")
     assert pb.manifest == MANIFEST
+    assert pb.live_version == 2  # the manifest is live content
     async with sf() as s:
-        v = (await s.execute(select(PlaybookVersion))).scalar_one()
-    assert v.version == 1
-    assert v.manifest == ""  # the pre-change manifest was snapshotted
-    assert v.message == "manifest updated"
+        vers = {v.version: v for v in (await s.execute(select(PlaybookVersion))).scalars().all()}
+    assert set(vers) == {1, 2}
+    assert vers[1].manifest == ""          # pre-change live recorded
+    assert vers[2].manifest == MANIFEST    # new live version carries it
+    assert vers[2].message == "manifest updated"
 
 
 @pytest.mark.asyncio
@@ -321,8 +325,8 @@ async def test_edit_snapshot_carries_manifest(env):
     ticket = (await _read_stage(tools))["ticket"]
     await tools["playbook_edit"](name="greeter", ticket=ticket, code=NEW_CODE)
     async with sf() as s:
-        v = (await s.execute(select(PlaybookVersion))).scalar_one()
-    assert v.manifest == MANIFEST
+        vers = (await s.execute(select(PlaybookVersion))).scalars().all()
+    assert vers and all(v.manifest == MANIFEST for v in vers)
 
 
 # --- policies ---

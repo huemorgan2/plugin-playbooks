@@ -204,7 +204,14 @@ class PlaybookRunner:
         async with self._sf() as session:
             run = PlaybookRun(
                 playbook_id=playbook.id,
-                playbook_version=playbook.version,
+                # 0.10.0: `version` is a monotonic counter; the content being
+                # executed is `live_version` (0 = pre-backfill "same as
+                # version"). Candidate test runs pass a transient shim whose
+                # live_version is the candidate number, so this stamp always
+                # names the content that actually ran.
+                playbook_version=(
+                    getattr(playbook, "live_version", 0) or playbook.version
+                ),
                 trigger=trigger,
                 inputs=inputs or {},
                 status="running",

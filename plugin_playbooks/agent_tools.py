@@ -230,6 +230,7 @@ def build_tools(
                 definition=defn,
                 code=stored_code,
                 manifest=manifest,
+                live_version=1,  # a brand-new playbook goes live directly
                 agent_autonomy=agent_autonomy,
                 created_by="agent",
                 status="enabled",
@@ -400,6 +401,14 @@ def build_tools(
             "playbook": name,
             "status": status,
         }
+        if playbook.candidate_version:
+            result["note"] = (
+                "This ran the LIVE version "
+                f"({playbook.live_version or playbook.version}) — an "
+                f"un-promoted candidate (v{playbook.candidate_version}) "
+                "exists. Use playbook_run_candidate to test it, "
+                "playbook_promote to make it live."
+            )
 
         if status == "running":
             result["message"] = (
@@ -623,6 +632,88 @@ def build_tools(
         session.add(v)
         return v
 
+    # 0.10.0 (plans/002 phase 3): candidate/live plumbing. `playbooks.version`
+    # is the monotonic counter; live content stays on the playbook row
+    # (version `live_version`); the one un-promoted candidate lives in a
+    # playbook_versions row pointed at by `candidate_version`. A version row
+    # holds the content OF that version number — which is what the historical
+    # "snapshot before change" rows already held; only the current live
+    # version may lack a row on legacy playbooks, hence _ensure_live_row.
+
+    def _live_version_of(playbook: Playbook) -> int:
+        return playbook.live_version or playbook.version
+
+    async def _get_version_row(
+        session: AsyncSession, playbook: Playbook, n: int,
+    ) -> PlaybookVersion | None:
+        return (await session.execute(
+            select(PlaybookVersion).where(
+                PlaybookVersion.playbook_id == playbook.id,
+                PlaybookVersion.version == n,
+            )
+        )).scalar_one_or_none()
+
+    async def _ensure_live_row(
+        session: AsyncSession, playbook: Playbook,
+    ) -> PlaybookVersion:
+        """Guarantee a version row exists for the current live content."""
+        n = _live_version_of(playbook)
+        row = await _get_version_row(session, playbook, n)
+        if row is None:
+            row = PlaybookVersion(
+                playbook_id=playbook.id,
+                version=n,
+                definition=playbook.definition,
+                code=playbook.code,
+                manifest=playbook.manifest,
+                author="system",
+                message="live content (recorded on first candidate/promote)",
+            )
+            session.add(row)
+        return row
+
+    def _version_code(row: PlaybookVersion) -> str:
+        """pblang source of a version row (stored, or derived on read)."""
+        if row.code:
+            return row.code
+        return generate_code(PlaybookDef.model_validate(row.definition))
+
+    def _apply_version_to_live(
+        playbook: Playbook, row: PlaybookVersion, *, restore_manifest: bool,
+    ) -> None:
+        """Make a version row's content the live content (pointer + fields)."""
+        defn = dict(row.definition)
+        defn["name"] = playbook.name  # never rename via promote/rollback
+        playbook.definition = defn
+        playbook.code = row.code
+        if restore_manifest:
+            playbook.manifest = row.manifest
+        playbook.description = defn.get("description") or playbook.description
+        playbook.when_to_use = defn.get("when_to_use") or playbook.when_to_use
+        playbook.display_name = defn.get("display_name") or playbook.display_name
+        playbook.inputs_schema = defn.get("inputs")
+        playbook.live_version = row.version
+
+    def _shim_playbook(playbook: Playbook, row: PlaybookVersion) -> Playbook:
+        """Transient Playbook carrying a version row's content — NEVER added
+        to a session. Lets the runner execute/dry-run a candidate untouched
+        (it only reads id/name/display_name/definition/live_version)."""
+        return Playbook(
+            id=playbook.id,
+            name=playbook.name,
+            display_name=playbook.display_name,
+            description=playbook.description,
+            when_to_use=playbook.when_to_use,
+            inputs_schema=dict(row.definition).get("inputs"),
+            definition=row.definition,
+            code=row.code,
+            manifest=row.manifest,
+            version=row.version,
+            live_version=row.version,
+            status=playbook.status,
+            agent_autonomy=playbook.agent_autonomy,
+        )
+
     async def _playbook_get_definition(*, name: str, format: str = "code") -> str:
         import yaml as _yaml
 
@@ -765,7 +856,7 @@ def build_tools(
     ))
 
     # --- playbook_dry_run (the test harness) ---
-    async def _dry_run(*, name: str, inputs: str = "{}") -> str:
+    async def _dry_run(*, name: str, inputs: str = "{}", version: str = "auto") -> str:
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
         except json.JSONDecodeError:
@@ -775,10 +866,57 @@ def build_tools(
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
             )).scalar_one_or_none()
-        if not playbook:
-            return json.dumps({"error": f"Playbook '{name}' not found"})
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
 
-        trace = await runner.dry_run(playbook, inputs=input_data)
+            # 0.10.0: default to the candidate when one exists — dry-running
+            # the thing you just edited is the point of the flow.
+            target = playbook
+            tested = _live_version_of(playbook)
+            want = (version or "auto").strip().lower()
+            if want == "auto":
+                want = "candidate" if playbook.candidate_version else "live"
+            if want == "candidate":
+                if not playbook.candidate_version:
+                    return json.dumps({
+                        "error": f"'{name}' has no candidate — save an edit "
+                                 "first, or dry-run version='live'.",
+                    })
+                row = await _get_version_row(
+                    session, playbook, playbook.candidate_version,
+                )
+                if row is None:
+                    return json.dumps({
+                        "error": "Candidate version row is missing (corrupt "
+                                 "state) — save the edit again.",
+                    })
+                target = _shim_playbook(playbook, row)
+                tested = row.version
+            elif want != "live":
+                try:
+                    n = int(want)
+                except ValueError:
+                    return json.dumps({
+                        "error": "version must be 'auto', 'candidate', "
+                                 "'live', or a version number.",
+                    })
+                if n == _live_version_of(playbook):
+                    pass  # live content lives on the playbook row itself
+                else:
+                    row = await _get_version_row(session, playbook, n)
+                    if row is None:
+                        return json.dumps({
+                            "error": f"No stored content for version {n}.",
+                        })
+                    target = _shim_playbook(playbook, row)
+                    tested = n
+
+        trace = await runner.dry_run(target, inputs=input_data)
+        if isinstance(trace, dict):
+            trace["tested_version"] = tested
+            trace["is_candidate"] = bool(
+                playbook.candidate_version and tested == playbook.candidate_version
+            )
         return json.dumps(trace)
 
     tools.append((
@@ -791,13 +929,22 @@ def build_tools(
                 "conditions, branches, and templates, but tool/LLM/wait steps are "
                 "stubbed. Returns a trace of resolved args, branches taken, and loop "
                 "iterations. Use to test logic before a real run. The outputs are "
-                "SIMULATED — never report them to the user as real results."
+                "SIMULATED — never report them to the user as real results. "
+                "Tests the CANDIDATE version by default when one exists "
+                "(version='live' or a number overrides)."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
                     "inputs": {"type": "string", "description": "JSON string of inputs"},
+                    "version": {
+                        "type": "string",
+                        "description": (
+                            "'auto' (default: candidate if one exists, else "
+                            "live), 'candidate', 'live', or a version number."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
@@ -878,16 +1025,26 @@ def build_tools(
                         "error": f"Playbook '{name}' not found. Use "
                                  "playbook_propose to create it.",
                     })
+                # 0.10.0: when a candidate exists you iterate ON the
+                # candidate — the read stage hands out its code, not live's.
+                cand_row = None
+                if playbook.candidate_version:
+                    cand_row = await _get_version_row(
+                        session, playbook, playbook.candidate_version,
+                    )
                 try:
-                    current = _derive_code(playbook)
+                    current = _version_code(cand_row) if cand_row else _derive_code(playbook)
                 except Exception:  # noqa: BLE001 — legacy defs must stay editable
                     current = ""
                 t = await _issue_ticket(session, playbook)
                 payload = {
                     "stage": "read",
+                    "editing": "candidate" if cand_row else "live",
                     "manifest": playbook.manifest,
                     "code": current,
                     "version": playbook.version,
+                    "live_version": _live_version_of(playbook),
+                    "candidate_version": playbook.candidate_version,
                     "ticket": str(t.id),
                     "expires_in_seconds": _TICKET_TTL_SECONDS,
                     "instructions": (
@@ -896,7 +1053,9 @@ def build_tools(
                         "call playbook_edit again with this ticket and exactly "
                         "one of: code= (full source), old=/new= (targeted "
                         "snippet), or definition_yaml= (legacy). The ticket "
-                        "is single-use and expires."
+                        "is single-use and expires. Saving creates a CANDIDATE "
+                        "— the live playbook keeps running unchanged until "
+                        "playbook_promote."
                     ),
                 }
                 if not playbook.manifest:
@@ -930,8 +1089,15 @@ def build_tools(
                 return json.dumps({"error": refusal})
             base_version = playbook.version
             manifest = playbook.manifest
+            # Edits build on the candidate when one exists (that's what the
+            # read stage handed out), else on live.
+            cand_row = None
+            if playbook.candidate_version:
+                cand_row = await _get_version_row(
+                    session, playbook, playbook.candidate_version,
+                )
             try:
-                old_code = _derive_code(playbook)
+                old_code = _version_code(cand_row) if cand_row else _derive_code(playbook)
             except Exception:  # noqa: BLE001
                 old_code = ""
 
@@ -1031,36 +1197,48 @@ def build_tools(
             if refusal:
                 return json.dumps({"error": refusal})
 
-            await _snapshot_version(
-                session, playbook, author="agent",
-                message="before forced edit" if forced else "before edit",
-            )
+            # 0.10.0: a save creates a CANDIDATE version row — live content
+            # on the playbook row is not touched. One candidate max: the
+            # pointer moves, the previous candidate row stays in history.
+            await _ensure_live_row(session, playbook)
             data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
             data["name"] = name  # never rename via edit
-            playbook.definition = data
-            playbook.code = stored_code
             playbook.version += 1
-            playbook.description = pb_def.description or playbook.description
-            playbook.when_to_use = pb_def.when_to_use or playbook.when_to_use
-            playbook.display_name = pb_def.display_name or playbook.display_name
-            playbook.inputs_schema = pb_def.inputs
+            session.add(PlaybookVersion(
+                playbook_id=playbook.id,
+                version=playbook.version,
+                definition=data,
+                code=stored_code,
+                manifest=playbook.manifest,
+                author="agent",
+                message=(
+                    "candidate (drift gate skipped — forced edit)"
+                    if forced else "candidate"
+                ),
+            ))
+            playbook.candidate_version = playbook.version
             await session.commit()
             new_version = playbook.version
+            live_version = _live_version_of(playbook)
 
-        # resync triggers/bindings + refresh the open canvas.
-        await events.emit("playbook.saved", {"name": name})
-        # 009.001/phase04: auto-follow the change — the iframe maps
-        # playbook.patch to open+patch, and focus brings the section up.
-        await events.emit("ui.plugin.event", {
-            "plugin": "plugin-playbooks",
-            "event": "playbook.patch",
-            "payload": {"draft_id": name, "action": "replace", "name": name},
-            "focus": True,
+        await events.emit("playbook.candidate.saved", {
+            "name": name, "candidate_version": new_version,
         })
         warnings = [i.to_dict() for i in issues if i.severity == "warning"]
         result: dict[str, Any] = {
-            "playbook": name, "version": new_version, "status": "edited",
+            "playbook": name,
+            "status": "candidate_saved",
+            "candidate_version": new_version,
+            "live_version": live_version,
             "warnings": warnings,
+            "next": (
+                "The LIVE playbook is unchanged — triggers and playbook_run "
+                "still execute version "
+                f"{live_version}. Test the candidate with playbook_dry_run "
+                "(it targets the candidate by default), then call "
+                "playbook_promote(name) to make it live. playbook_rollback "
+                "restores the previous live version after a promote."
+            ),
         }
         if forced:
             result["note"] = "manifest drift gate skipped (forced edit)"
@@ -1176,13 +1354,23 @@ def build_tools(
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
-            await _snapshot_version(
-                session, playbook, author="agent", message="manifest updated",
-            )
+            # 0.10.0: the manifest is LIVE content. Record the old live
+            # version, then create a new live version row carrying the new
+            # manifest. (Never snapshot at the counter — a pending candidate
+            # already owns that number, and version numbers must stay unique.)
+            await _ensure_live_row(session, playbook)
             playbook.manifest = manifest
-            # bump: version rows must stay unique per version number
-            # (promote resolves by version), so every snapshot bumps.
             playbook.version += 1
+            session.add(PlaybookVersion(
+                playbook_id=playbook.id,
+                version=playbook.version,
+                definition=playbook.definition,
+                code=playbook.code,
+                manifest=manifest,
+                author="agent",
+                message="manifest updated",
+            ))
+            playbook.live_version = playbook.version
             await session.commit()
             new_version = playbook.version
         await events.emit("playbook.saved", {"name": name})
@@ -1218,6 +1406,296 @@ def build_tools(
             risk_level="medium",
         ),
         _manifest_set,
+    ))
+
+    # --- playbook_promote (the gate: candidate → live) ---
+    # 0.10.0 (plans/002 phase 3): promotion runs an extensible gate list —
+    # static validation and manifest drift today; specs (phase 4) and probes
+    # (phase 5) plug in as new entries. A refusal names the failing gate.
+    async def _promote(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name).with_for_update()
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            if not playbook.candidate_version:
+                return json.dumps({
+                    "error": f"'{name}' has no candidate to promote. Save an "
+                             "edit first (playbook_edit).",
+                })
+            row = await _get_version_row(
+                session, playbook, playbook.candidate_version,
+            )
+            if row is None:
+                return json.dumps({
+                    "error": "Candidate version row is missing (corrupt "
+                             "state) — save the edit again.",
+                })
+
+            gates: list[dict[str, Any]] = []
+            # gate 1: static validation of the candidate definition.
+            all_pb = await _load_all_playbook_steps(session, exclude=name)
+            issues = validate_definition(
+                row.definition,
+                tool_registry=getattr(runner, "_tools", None),
+                all_playbooks=all_pb,
+                check_unknown_keys=False,
+            )
+            errors = [i.to_dict() for i in issues if i.severity == "error"]
+            gates.append({"gate": "static_validation", "ok": not errors})
+            if errors:
+                return json.dumps({
+                    "error": "Promote refused — gate 'static_validation' failed.",
+                    "gate": "static_validation",
+                    "issues": errors,
+                    "hint": "Fix the candidate via playbook_edit and retry.",
+                })
+            # gate 2: manifest drift — candidates only exist because the save
+            # passed the drift check or the owner approved a forced edit
+            # (recorded on the version row). Reported, never re-run here.
+            forced = "forced" in (row.message or "")
+            gates.append({
+                "gate": "manifest_drift", "ok": True,
+                "note": (
+                    "owner-approved forced edit" if forced
+                    else "checked at save time"
+                ),
+            })
+            # (specs and probes gates plug in here — phases 4 and 5.)
+
+            old_live = _live_version_of(playbook)
+            await _ensure_live_row(session, playbook)
+            _apply_version_to_live(playbook, row, restore_manifest=False)
+            row.promoted_from = old_live  # rollback lineage
+            playbook.candidate_version = None
+            new_live = playbook.live_version
+            await session.commit()
+
+        # live content changed — resync triggers and refresh the canvas.
+        await events.emit("playbook.saved", {"name": name})
+        await events.emit("ui.plugin.event", {
+            "plugin": "plugin-playbooks",
+            "event": "playbook.patch",
+            "payload": {"draft_id": name, "action": "replace", "name": name},
+            "focus": True,
+        })
+        return json.dumps({
+            "playbook": name,
+            "status": "promoted",
+            "live_version": new_live,
+            "previous_live_version": old_live,
+            "gates": gates,
+            "note": (
+                "The candidate is now LIVE — triggers and playbook_run "
+                "execute it. playbook_rollback(name) restores version "
+                f"{old_live} if it misbehaves."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_promote",
+            description=(
+                "Make a playbook's CANDIDATE version live. Runs the promotion "
+                "gate first (static validation; manifest drift was enforced "
+                "at save time) and refuses naming the failing gate. Until "
+                "this succeeds, triggers and playbook_run keep executing the "
+                "old live version. Test the candidate first: playbook_dry_run "
+                "targets it by default."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _promote,
+    ))
+
+    # --- playbook_rollback (live ← previous live) ---
+    async def _rollback(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name).with_for_update()
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            live_n = _live_version_of(playbook)
+            live_row = await _get_version_row(session, playbook, live_n)
+            target_n = live_row.promoted_from if live_row else None
+            if not target_n:
+                # legacy lineage: rows below live are plain history — take
+                # the newest one.
+                from sqlalchemy import func
+                target_n = (await session.execute(
+                    select(func.max(PlaybookVersion.version)).where(
+                        PlaybookVersion.playbook_id == playbook.id,
+                        PlaybookVersion.version < live_n,
+                    )
+                )).scalar()
+            if not target_n:
+                return json.dumps({
+                    "error": f"'{name}' has no previous version to roll back to.",
+                })
+            row = await _get_version_row(session, playbook, target_n)
+            if row is None:
+                return json.dumps({
+                    "error": f"No stored content for version {target_n} — "
+                             "cannot roll back.",
+                })
+            await _ensure_live_row(session, playbook)
+            _apply_version_to_live(playbook, row, restore_manifest=True)
+            await session.commit()
+
+        await events.emit("playbook.saved", {"name": name})
+        await events.emit("ui.plugin.event", {
+            "plugin": "plugin-playbooks",
+            "event": "playbook.patch",
+            "payload": {"draft_id": name, "action": "replace", "name": name},
+            "focus": True,
+        })
+        return json.dumps({
+            "playbook": name,
+            "status": "rolled_back",
+            "live_version": target_n,
+            "previous_live_version": live_n,
+            "note": (
+                f"Version {target_n} is live again (manifest included). "
+                f"Version {live_n} stays in history — playbook_promote a new "
+                "candidate to move forward."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_rollback",
+            description=(
+                "Restore a playbook's PREVIOUS live version (the one the "
+                "current live was promoted from). Use when a promoted change "
+                "misbehaves. The rolled-back-from version stays in history."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _rollback,
+    ))
+
+    # --- playbook_run_candidate (supervised real test run) ---
+    async def _run_candidate(
+        *, name: str, inputs: str = "{}", wait_seconds: float | None = None,
+    ) -> str:
+        try:
+            input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
+        except json.JSONDecodeError:
+            return json.dumps({"error": "Invalid JSON inputs"})
+        if wait_seconds is None:
+            wait_seconds = _RUN_WAIT_DEFAULT
+        wait_seconds = max(0.0, min(float(wait_seconds), _RUN_WAIT_MAX))
+
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            if not playbook.candidate_version:
+                return json.dumps({
+                    "error": f"'{name}' has no candidate — save an edit "
+                             "first, or use playbook_run for the live version.",
+                })
+            row = await _get_version_row(
+                session, playbook, playbook.candidate_version,
+            )
+            if row is None:
+                return json.dumps({
+                    "error": "Candidate version row is missing (corrupt "
+                             "state) — save the edit again.",
+                })
+            shim = _shim_playbook(playbook, row)
+            candidate_version = row.version
+
+        run = await runner.start_run_background(
+            shim, inputs=input_data, trigger="agent-candidate",
+        )
+        waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
+        status = waited.status if waited else run.status
+
+        result: dict[str, Any] = {
+            "run_id": str(run.id),
+            "playbook": name,
+            "candidate_version": candidate_version,
+            "status": status,
+            "note": (
+                "This was a REAL run of the CANDIDATE (side effects "
+                "included). The live playbook is unchanged — call "
+                "playbook_promote when satisfied."
+            ),
+        }
+        if status == "running":
+            result["message"] = (
+                "Still executing in the background — poll "
+                "playbook_status(run_id) until 'done'/'failed'. Do NOT "
+                "re-run, do NOT report results yet."
+            )
+        elif status == "failed":
+            result["error"] = (
+                "Candidate run FAILED. Do NOT fabricate results and do NOT "
+                "promote. Check playbook_status for the error details."
+            )
+        elif status == "done":
+            async with session_factory() as session:
+                steps = (await session.execute(
+                    select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
+                )).scalars().all()
+                result["step_results"] = {
+                    s.step_id: s.outputs for s in steps if s.outputs
+                }
+        return json.dumps(result)
+
+    tools.append((
+        ToolDef(
+            name="playbook_run_candidate",
+            chat_only=True,
+            timeout_seconds=120,
+            description=(
+                "REAL, supervised test run of a playbook's CANDIDATE version "
+                "— actual tools, actual side effects, recorded in run "
+                "history against the candidate version number. The live "
+                "playbook stays untouched. Prefer playbook_dry_run first; "
+                "use this when the owner wants proof against real systems "
+                "before playbook_promote."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "inputs": {"type": "string", "description": "JSON string of inputs"},
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": (
+                            "How long to wait for completion before returning "
+                            "(0–90, default 55)."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+            policy="prompt_always",
+            risk_level="medium",
+        ),
+        _run_candidate,
     ))
 
     return tools

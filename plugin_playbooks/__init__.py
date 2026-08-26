@@ -21,6 +21,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_versions", "code", "TEXT"),                # 0.8.0
     ("playbooks", "manifest", "TEXT NOT NULL DEFAULT ''"),          # 0.9.0
     ("playbook_versions", "manifest", "TEXT NOT NULL DEFAULT ''"),  # 0.9.0
+    ("playbooks", "live_version", "INTEGER NOT NULL DEFAULT 0"),    # 0.10.0
+    ("playbooks", "candidate_version", "INTEGER"),                  # 0.10.0
 ]
 
 
@@ -87,6 +89,29 @@ async def backfill_code(session_factory) -> int:
     return filled
 
 
+async def backfill_live_version(session_factory) -> int:
+    """0.10.0 (plans/002 phase 3): pin `live_version` on pre-0.10 rows.
+
+    0 means "same as version"; make that explicit so every reader can trust
+    `live_version` directly. Idempotent. Returns the number of rows updated.
+    """
+    from sqlalchemy import update
+
+    from .models import Playbook
+
+    async with session_factory() as session:
+        result = await session.execute(
+            update(Playbook)
+            .where(Playbook.live_version == 0)
+            .values(live_version=Playbook.version)
+        )
+        await session.commit()
+    n = result.rowcount or 0
+    if n:
+        logger.info("playbooks: backfilled live_version for %d playbook(s)", n)
+    return n
+
+
 # 0.8.0 (plans/002 phase 1): the authoring skill teaches playbook CODE —
 # the restricted-Python language compiled by pblang. Both examples are
 # compile-verified in tests/test_pblang.py (test_skill_examples_compile).
@@ -117,8 +142,9 @@ returns ALL errors at once (compile errors with line numbers, undefined
 steps/inputs references, unknown tools, bad loops, cycles). Fix every error.
 3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with tool/LLM
 steps STUBBED. It proves loops iterate, branches pick the right path, and
-templates resolve — no side effects, no token cost. Outputs are SIMULATED:
-NEVER report a dry-run value to the user as a real result.
+templates resolve — no side effects, no token cost. When a candidate exists it
+tests the CANDIDATE by default (`version='live'` overrides). Outputs are
+SIMULATED: NEVER report a dry-run value to the user as a real result.
    Reading the result: `references` shows the exact template namespace — i.e.
 precisely what every `steps.<id>.<field>` resolves to. Copy your paths from
 there. The `trace` list is execution order; its per-step `output` key is JUST
@@ -364,6 +390,24 @@ When you create a playbook, pass `manifest=` to `playbook_propose` — a few
 short lines stating purpose, side effects, and what must never happen. If a
 playbook has none, propose one to the owner via `playbook_manifest_set`.
 
+### CANDIDATE → PROMOTE (a save never changes the running playbook)
+Saving an edit creates a CANDIDATE version — the LIVE playbook keeps running
+unchanged (triggers, `playbook_run`) until you promote. The loop:
+1. `playbook_edit` (two-step, above) → `{status: 'candidate_saved',
+candidate_version, live_version}`. Editing again iterates on the candidate
+(the read stage hands out candidate code; one candidate max — a new save
+replaces the pointer, history keeps every version).
+2. `playbook_dry_run(name, inputs)` — tests the candidate by default.
+3. Real proof, if the owner wants it: `playbook_run_candidate(name, inputs)` —
+a REAL supervised run of the candidate (side effects included; asks the owner).
+4. `playbook_promote(name)` — runs the promotion gate (static validation;
+manifest drift was enforced at save time) and makes the candidate live. A
+refusal names the failing gate — fix the candidate, never bypass the gate.
+5. If a promoted change misbehaves: `playbook_rollback(name)` restores the
+previous live version.
+NEVER report an edit as done after `candidate_saved` — the owner's playbook
+still runs the old version until promote succeeds.
+
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
 A new requirement (e.g. 'for EACH job role, first search LinkedIn for
 comparables') is almost always an INSERTION mid-graph, NOT a step bolted on the
@@ -376,9 +420,10 @@ a new top-level step.
 `playbook_edit(ticket=..., code=...)` with the full new source.
 4. RE-POINT downstream refs — steps after the seam must now read the NEW
 step's output. This rewiring is the real work of a change.
-5. `playbook_validate` -> `playbook_dry_run` -> `playbook_run`.
-Never create a '-v2' copy — edit IN PLACE by name; every edit snapshots a
-version first, so history is kept.
+5. `playbook_validate` -> `playbook_dry_run` (candidate) -> `playbook_promote`
+-> `playbook_run`.
+Never create a '-v2' copy — edit IN PLACE by name; every version is kept in
+history and `playbook_rollback` restores the previous live one.
 
 ### Posting to the chat from a playbook:
 - Steps CAN post into the chat: `tool('send_chat_message', message='...')`.
@@ -398,7 +443,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.9.0",
+        version="0.10.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -427,6 +472,9 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_edit",
                     "playbook_edit_force",
                     "playbook_manifest_set",
+                    "playbook_promote",
+                    "playbook_rollback",
+                    "playbook_run_candidate",
                     "playbook_get_definition",
                     "playbook_validate",
                     "playbook_dry_run",
@@ -504,6 +552,12 @@ class PlaybooksPlugin(LunaPlugin):
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: code backfill failed: %s", e)
 
+        # 0.10.0: make live_version explicit on pre-candidate rows.
+        try:
+            await backfill_live_version(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: live_version backfill failed: %s", e)
+
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,
             sync_bindings=self.sync_trigger_bindings,
@@ -556,6 +610,11 @@ class PlaybooksPlugin(LunaPlugin):
     AUTHORING_TOOLS = (
         "playbook_propose",
         "playbook_edit",
+        "playbook_edit_force",       # 0.10.0: gate the whole edit flow
+        "playbook_manifest_set",
+        "playbook_promote",
+        "playbook_rollback",
+        "playbook_run_candidate",
         "playbook_get_definition",
         "playbook_validate",
         "playbook_dry_run",

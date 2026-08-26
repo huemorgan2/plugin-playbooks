@@ -46,6 +46,14 @@ class Playbook(Base):
     # string = no manifest yet; the drift gate only engages when non-empty.
     manifest: Mapped[str] = mapped_column(Text, default="", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # 0.10.0 (plans/002 phase 3): `version` is the monotonic counter (highest
+    # version number ever created). `live_version` is what triggers/runs
+    # execute — playbook.definition/code/manifest always hold ITS content.
+    # 0 means "same as version" (pre-0.10 rows; backfilled on load).
+    live_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # the one un-promoted candidate (its content lives in playbook_versions);
+    # NULL = no candidate. A new save overwrites the pointer, not the history.
+    candidate_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="enabled", nullable=False)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)

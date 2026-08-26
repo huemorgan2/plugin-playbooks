@@ -173,6 +173,44 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# 0.10.0 (plans/002 phase 3): candidate/live plumbing (mirrors agent_tools).
+# `version` is the monotonic counter; live content sits on the playbook row
+# at version `live_version` (0 = "same as version" on pre-0.10 rows); the one
+# un-promoted candidate is a playbook_versions row named by `candidate_version`.
+
+def _live_version_of(p: Playbook) -> int:
+    return p.live_version or p.version
+
+
+async def _get_version_row(
+    session: AsyncSession, p: Playbook, n: int,
+) -> PlaybookVersion | None:
+    return (await session.execute(
+        select(PlaybookVersion).where(
+            PlaybookVersion.playbook_id == p.id,
+            PlaybookVersion.version == n,
+        )
+    )).scalar_one_or_none()
+
+
+async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
+    """Guarantee a version row exists for the current live content."""
+    n = _live_version_of(p)
+    row = await _get_version_row(session, p, n)
+    if row is None:
+        row = PlaybookVersion(
+            playbook_id=p.id,
+            version=n,
+            definition=p.definition,
+            code=p.code,
+            manifest=p.manifest,
+            author="system",
+            message="live content (recorded on first candidate/promote)",
+        )
+        session.add(row)
+    return row
+
+
 def _runs_per_day(runs: int, created_at: datetime | None, now: datetime) -> float:
     """Runs per day over the days the playbook actually existed in the window.
 
@@ -296,6 +334,8 @@ async def list_playbooks(status: str = "active"):
             "status": p.status,
             "agent_autonomy": p.agent_autonomy,
             "version": p.version,
+            "live_version": _live_version_of(p),
+            "candidate_version": p.candidate_version,
             "cost_estimate_cents": p.cost_estimate_cents,
             "duration_estimate_ms": p.duration_estimate_ms,
             **stats.get(str(p.id), {
@@ -319,11 +359,14 @@ async def get_playbook(name: str):
             "description": p.description,
             "when_to_use": p.when_to_use,
             "definition": p.definition,
+            "code": p.code,
             "manifest": p.manifest,
             "inputs_schema": p.inputs_schema,
             "status": p.status,
             "agent_autonomy": p.agent_autonomy,
             "version": p.version,
+            "live_version": _live_version_of(p),
+            "candidate_version": p.candidate_version,
         }
 
 
@@ -364,6 +407,7 @@ async def create_playbook(body: PlaybookCreate):
             inputs_schema=pb_def.inputs,
             definition=pb_def.model_dump(mode="json", exclude_none=True, by_alias=True),
             code=_code,
+            live_version=1,  # a brand-new playbook goes live directly
             agent_autonomy=body.agent_autonomy,
             created_by="owner",
             status="enabled",
@@ -389,15 +433,11 @@ async def update_playbook(name: str, body: PlaybookUpdate):
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
 
-        session.add(PlaybookVersion(
-            playbook_id=p.id,
-            version=p.version,
-            definition=p.definition,
-            code=p.code,
-            manifest=p.manifest,
-            author="owner",
-            message=body.message or "REST update",
-        ))
+        # 0.10.0: the owner edits LIVE directly (the UI is the owner) — record
+        # the old live content, then create a row for the new live version.
+        # Never snapshot at the counter: a pending candidate may own that
+        # number, and version numbers must stay unique.
+        await _ensure_live_row(session, p)
         p.definition = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
         # 0.8.0: the YAML write invalidates any stored pblang code — regenerate
         # (or NULL it so reads derive fresh; stale code must never survive).
@@ -407,6 +447,16 @@ async def update_playbook(name: str, body: PlaybookUpdate):
         except Exception:  # noqa: BLE001
             p.code = None
         p.version += 1
+        session.add(PlaybookVersion(
+            playbook_id=p.id,
+            version=p.version,
+            definition=p.definition,
+            code=p.code,
+            manifest=p.manifest,
+            author="owner",
+            message=body.message or "REST update",
+        ))
+        p.live_version = p.version
         p.description = pb_def.description or p.description
         p.when_to_use = pb_def.when_to_use or p.when_to_use
         p.display_name = pb_def.display_name or p.display_name
@@ -614,17 +664,23 @@ async def list_versions(name: str):
         for ver_num, cnt in rows:
             run_counts[ver_num] = cnt
 
-        current_runs = run_counts.get(p.version, 0)
-
-        result = [{
-            "version": p.version,
-            "title": "",
-            "author": "",
-            "created_at": p.updated_at.isoformat(),
-            "runs": current_runs,
-            "promoted_from": None,
-            "current": True,
-        }]
+        # 0.10.0: rows are the history; live/candidate are pointers into it.
+        # Legacy playbooks may lack a row for the current live version — the
+        # synthesized entry covers that gap only (no duplicates).
+        live_n = _live_version_of(p)
+        result = []
+        if not any(v.version == live_n for v in versions):
+            result.append({
+                "version": live_n,
+                "title": "",
+                "author": "",
+                "created_at": p.updated_at.isoformat(),
+                "runs": run_counts.get(live_n, 0),
+                "promoted_from": None,
+                "current": True,
+                "live": True,
+                "candidate": False,
+            })
 
         for v in versions:
             result.append({
@@ -634,19 +690,44 @@ async def list_versions(name: str):
                 "created_at": v.created_at.isoformat(),
                 "runs": run_counts.get(v.version, 0),
                 "promoted_from": v.promoted_from,
-                "current": False,
+                "current": v.version == live_n,
+                "live": v.version == live_n,
+                "candidate": v.version == p.candidate_version,
             })
 
+        result.sort(key=lambda r: r["version"], reverse=True)
         return result
 
 
 class PromoteBody(BaseModel):
-    version: int
+    # None → promote the CANDIDATE through the gate; a number → owner-restore
+    # that stored version to live (pointer move, no gate beyond existence).
+    version: int | None = None
+
+
+def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: bool) -> None:
+    """Make a version row's content the live content (pointer + fields)."""
+    defn = dict(row.definition)
+    defn["name"] = p.name
+    p.definition = defn
+    p.code = row.code
+    if restore_manifest:
+        p.manifest = row.manifest
+    p.description = defn.get("description") or p.description
+    p.when_to_use = defn.get("when_to_use") or p.when_to_use
+    p.display_name = defn.get("display_name") or p.display_name
+    p.inputs_schema = defn.get("inputs")
+    p.live_version = row.version
 
 
 @router.post("/playbooks/{name}/promote")
 async def promote_version(name: str, body: PromoteBody):
-    """Promote an old version's definition to become the active one."""
+    """0.10.0: pointer semantics — no new version numbers are minted.
+
+    Without a version: promote the pending CANDIDATE through the gate
+    (static validation; drift was enforced when the candidate was saved).
+    With a version: owner-restore that stored version to live.
+    """
     async with _sf()() as session:
         p = (await session.execute(
             select(Playbook).where(Playbook.name == name)
@@ -654,47 +735,91 @@ async def promote_version(name: str, body: PromoteBody):
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
 
-        old_ver = (await session.execute(
-            select(PlaybookVersion)
-            .where(
-                PlaybookVersion.playbook_id == p.id,
-                PlaybookVersion.version == body.version,
+        target_n = body.version
+        candidate = target_n is None
+        if candidate:
+            if not p.candidate_version:
+                raise HTTPException(409, f"'{name}' has no candidate to promote")
+            target_n = p.candidate_version
+
+        row = await _get_version_row(session, p, target_n)
+        if not row:
+            raise HTTPException(404, f"Version {target_n} not found")
+
+        if candidate:
+            # THE GATE (extensible — specs/probes gates plug in here).
+            issues = validate_definition(
+                row.definition,
+                tool_registry=getattr(_runner, "_tools", None),
+                check_unknown_keys=False,
             )
-        )).scalar_one_or_none()
-        if not old_ver:
-            raise HTTPException(404, f"Version {body.version} not found")
+            errors = [i.to_dict() for i in issues if i.severity == "error"]
+            if errors:
+                raise HTTPException(422, {
+                    "message": "Promote refused — gate 'static_validation' failed",
+                    "gate": "static_validation",
+                    "issues": errors,
+                })
 
-        session.add(PlaybookVersion(
-            playbook_id=p.id,
-            version=p.version,
-            definition=p.definition,
-            code=p.code,
-            manifest=p.manifest,
-            author="owner",
-            message=f"before promoting v{body.version}",
-            promoted_from=body.version,
-        ))
-
-        p.definition = old_ver.definition
-        # 0.8.0: restore that version's code too (NULL = derive on read).
-        p.code = old_ver.code
-        # 0.9.0: manifest travels with the version as well.
-        p.manifest = old_ver.manifest
-        p.version += 1
-
-        pb_def = PlaybookDef.model_validate(old_ver.definition)
-        p.description = pb_def.description
-        p.when_to_use = pb_def.when_to_use
-        p.display_name = pb_def.display_name or p.display_name
-        p.inputs_schema = pb_def.inputs
+        old_live = _live_version_of(p)
+        await _ensure_live_row(session, p)
+        # candidate promote keeps the live manifest (manifest is live-owned);
+        # an owner restore of an old version brings its manifest back too.
+        _apply_row_to_live(p, row, restore_manifest=not candidate)
+        row.promoted_from = old_live  # rollback lineage
+        if p.candidate_version == target_n:
+            p.candidate_version = None
 
         await session.commit()
-        return {
+        result = {
             "name": name,
+            "live_version": target_n,
             "version": p.version,
-            "promoted_from": body.version,
+            "promoted_from": old_live,
             "status": "promoted",
         }
+    await _notify_changed(name)
+    return result
+
+
+@router.post("/playbooks/{name}/rollback")
+async def rollback_playbook(name: str):
+    """Restore the previous live version (the one live was promoted from)."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+
+        live_n = _live_version_of(p)
+        live_row = await _get_version_row(session, p, live_n)
+        target_n = live_row.promoted_from if live_row else None
+        if not target_n:
+            from sqlalchemy import func as sa_func
+            target_n = (await session.execute(
+                select(sa_func.max(PlaybookVersion.version)).where(
+                    PlaybookVersion.playbook_id == p.id,
+                    PlaybookVersion.version < live_n,
+                )
+            )).scalar()
+        if not target_n:
+            raise HTTPException(409, f"'{name}' has no previous version to roll back to")
+        row = await _get_version_row(session, p, target_n)
+        if not row:
+            raise HTTPException(404, f"No stored content for version {target_n}")
+
+        await _ensure_live_row(session, p)
+        _apply_row_to_live(p, row, restore_manifest=True)
+        await session.commit()
+        result = {
+            "name": name,
+            "live_version": target_n,
+            "rolled_back_from": live_n,
+            "status": "rolled_back",
+        }
+    await _notify_changed(name)
+    return result
 
 
 # --- Manifest (0.9.0, plans/002 phase 2) ---
@@ -725,6 +850,12 @@ async def put_manifest(name: str, body: ManifestBody):
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
+        # 0.10.0: manifest is LIVE content — record old live, then create the
+        # new live version row (never snapshot at the counter: a pending
+        # candidate may own that number).
+        await _ensure_live_row(session, p)
+        p.manifest = body.manifest
+        p.version += 1
         session.add(PlaybookVersion(
             playbook_id=p.id,
             version=p.version,
@@ -734,10 +865,7 @@ async def put_manifest(name: str, body: ManifestBody):
             author="owner",
             message="manifest updated",
         ))
-        p.manifest = body.manifest
-        # bump: playbook_versions rows must stay unique per version number
-        # (promote resolves by version), so every snapshot-then-write bumps.
-        p.version += 1
+        p.live_version = p.version
         await session.commit()
         version = p.version
     await _notify_changed(name)
@@ -845,6 +973,7 @@ async def promote_draft(draft_id: str):
             when_to_use=defn.get("when_to_use", ""),
             inputs_schema=defn.get("inputs", {}),
             definition=defn,
+            live_version=1,  # a brand-new playbook goes live directly
             agent_autonomy=defn.get("agent_autonomy", "manual_only"),
             created_by="owner",
             status="enabled",
