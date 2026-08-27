@@ -14,6 +14,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1406,6 +1407,44 @@ def _render_template_dict(
     return result
 
 
+# 0.14.2: a `steps.<id>` reference chain — dot or bracket segments — so an
+# undefined reference can be diagnosed against the step's REAL output keys
+# instead of a hardcoded (and often wrong) "schemaless llm_step" guess.
+_STEP_PATH = re.compile(
+    r"\bsteps(?:\.([A-Za-z_]\w*)|\[[\"']([^\"'\]]+)[\"']\])"
+    r"((?:\.[A-Za-z_]\w*|\[[\"'][^\"'\]]+[\"']\])*)"
+)
+_PATH_SEG = re.compile(r"\.([A-Za-z_]\w*)|\[[\"']([^\"'\]]+)[\"']\]")
+
+
+def _undefined_ref_detail(expr: str, ctx: "_RunContext") -> str:
+    """Walk each `steps.<id>...` chain in `expr` against the outputs that
+    actually exist and name the first segment that doesn't resolve, plus the
+    keys present at that level. Empty string when nothing diagnosable."""
+    details: list[str] = []
+    for m in _STEP_PATH.finditer(expr):
+        sid = m.group(1) or m.group(2)
+        if sid not in ctx.step_outputs:
+            details.append(f"steps.{sid} has no output yet (it did not run before this step)")
+            continue
+        node: Any = ctx.step_outputs[sid]
+        path = f"steps.{sid}"
+        for a, b in _PATH_SEG.findall(m.group(3) or ""):
+            seg = a or b
+            if isinstance(node, dict) and seg in node:
+                node = node[seg]
+                path += f".{seg}"
+            else:
+                have = (
+                    f"a dict with keys: {', '.join(node.keys())}"
+                    if isinstance(node, dict)
+                    else f"of type {type(node).__name__}, not a dict"
+                )
+                details.append(f"{path}.{seg} does not exist — {path} is {have}")
+                break
+    return "; ".join(details)
+
+
 def _eval_expression(
     expr: str,
     ctx: _RunContext,
@@ -1443,6 +1482,16 @@ def _eval_expression(
         # to Undefined — strict collect now raises here instead of appending
         # null for every iteration while the run reports "done".
         if strict and isinstance(result, Undefined):
+            # 0.14.2: diagnose against the REAL output — the old hardcoded
+            # "schemaless llm_step" hint sent agents fixing the wrong side
+            # (deleting a correct `result` wrapper on a tool_call ref).
+            detail = _undefined_ref_detail(expr, ctx)
+            if detail:
+                raise ValueError(
+                    f"reference resolved to undefined — {detail}. Fix the "
+                    "path to match these real keys (tool_call output is "
+                    "{tool, result} — the tool's payload sits under .result)"
+                )
             raise ValueError(
                 f"reference resolved to undefined "
                 f"(a schemaless llm_step/agent_step has only `_raw`; "

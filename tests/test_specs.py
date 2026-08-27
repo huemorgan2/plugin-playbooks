@@ -445,3 +445,50 @@ def test_spec_tools_are_skill_gated():
         assert name in gated
     # phase-3 rule: every SkillDef tool must be in AUTHORING_TOOLS
     assert skill_tools <= gated
+
+
+# ---- 0.14.2: unmatched stubs fail loudly; undefined refs name real keys ----
+
+@pytest.mark.asyncio
+async def test_spec_with_unmatched_stub_key_fails(env):
+    sf, runner, handlers, _ = env
+    from plugin_playbooks.specs import run_spec
+    pb = Playbook(
+        name="p2", display_name="p2", status="enabled",
+        definition={"name": "p2", "steps": [
+            {"id": "fetch", "kind": "tool_call", "tool": "t", "args": {}},
+        ]},
+    )
+    spec = SpecDef(stubs={"fetch_sourcez": {"rows": []}})
+    res = await run_spec(runner, pb, spec)
+    assert res["passed"] is False
+    assert any("matches no step id or tool name" in f for f in res["failures"])
+    assert any("fetch" in f and "t" in f for f in res["failures"])
+
+    # a correctly keyed stub does not trigger the check
+    ok = await run_spec(runner, pb, SpecDef(stubs={"fetch": {"rows": []}}))
+    assert not any("matches no step id" in f for f in ok["failures"])
+
+
+@pytest.mark.asyncio
+async def test_undefined_ref_error_names_real_keys(env):
+    sf, runner, handlers, _ = env
+    # loop over a path that doesn't exist in the (unstubbed) dry output:
+    # the error must name the real keys at the failing segment, not blame
+    # a "schemaless llm_step".
+    pb = Playbook(
+        name="p3", display_name="p3", status="enabled",
+        definition={"name": "p3", "steps": [
+            {"id": "fetch", "kind": "tool_call", "tool": "t", "args": {}},
+            {"id": "crawl", "kind": "loop",
+             "over": "steps.fetch[\"result\"][\"rows\"]",
+             "body": [
+                 {"id": "inner", "kind": "tool_call", "tool": "t", "args": {}},
+             ]},
+        ]},
+    )
+    out = await runner.dry_run(pb)
+    assert out["status"] == "failed"
+    assert "steps.fetch.result.rows does not exist" in out["error"]
+    assert "_dry" in out["error"]  # the real key present at that level
+    assert "schemaless llm_step" not in out["error"]

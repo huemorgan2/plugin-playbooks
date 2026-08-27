@@ -178,11 +178,58 @@ def evaluate_spec(spec: SpecDef, dry_result: dict[str, Any]) -> dict[str, Any]:
     return {"passed": not failures, "failures": failures, "checked": checked}
 
 
+def _stub_key_report(definition: Any, stubs: dict[str, Any]) -> tuple[list[str], set[str], set[str], bool]:
+    """(unmatched stub keys, step ids, tool names, has_subtask) for a raw
+    playbook definition dict. A stub key must be a step id or a tool name —
+    anything else is silently ignored by the runner, which makes the spec
+    test something other than what it claims."""
+    ids: set[str] = set()
+    tools: set[str] = set()
+    has_subtask = False
+
+    def walk(steps: Any) -> None:
+        nonlocal has_subtask
+        for s in steps or []:
+            if not isinstance(s, dict):
+                continue
+            if s.get("id"):
+                ids.add(s["id"])
+            if s.get("tool"):
+                tools.add(s["tool"])
+            if s.get("kind") == "subtask":
+                has_subtask = True
+            for key in ("then", "else", "body"):
+                walk(s.get(key))
+            for br in s.get("branches") or []:
+                walk(br)
+
+    if isinstance(definition, dict):
+        walk(definition.get("steps"))
+    unmatched = sorted(k for k in stubs if k not in ids and k not in tools)
+    return unmatched, ids, tools, has_subtask
+
+
 async def run_spec(runner: Any, playbook: Any, spec: SpecDef) -> dict[str, Any]:
     """Dry-run `playbook` (a real row or a candidate shim) with the spec's
     fixtures and evaluate the assertions."""
     dry = await runner.dry_run(playbook, inputs=spec.inputs, stubs=spec.stubs)
-    return evaluate_spec(spec, dry)
+    result = evaluate_spec(spec, dry)
+    # 0.14.2: a stub keyed by neither step id nor tool name never fires — the
+    # dry-run substitutes {_dry: true} and downstream refs die with a message
+    # blaming the playbook. Fail the spec loudly instead. Subtask playbooks
+    # are exempt (stubs may target the sub-playbook's steps, unknowable here).
+    unmatched, ids, tools, has_subtask = _stub_key_report(
+        getattr(playbook, "definition", None), spec.stubs
+    )
+    if unmatched and not has_subtask:
+        result["failures"] = [
+            f"stub '{k}' matches no step id or tool name in this playbook — "
+            f"it is never applied (step ids: {', '.join(sorted(ids)) or 'none'}; "
+            f"tools: {', '.join(sorted(tools)) or 'none'})"
+            for k in unmatched
+        ] + result["failures"]
+        result["passed"] = False
+    return result
 
 
 async def run_all_specs(
