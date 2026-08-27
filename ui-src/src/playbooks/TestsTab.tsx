@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { playbooksApi } from './api'
+import { useAgentName } from './agentIdentity'
 import type { SpecEntry, ProbeEntry } from './types'
 import { specsHeadline, probesHeadline, failureWords, TONE_TEXT } from './trust'
 
@@ -39,6 +40,7 @@ function Dot({ tone }: { tone: 'ok' | 'warn' | 'bad' }) {
 }
 
 export function TestsTab({ name }: { name: string }) {
+  const agentName = useAgentName()
   const [specs, setSpecs] = useState<SpecEntry[] | null>(null)
   const [probes, setProbes] = useState<ProbeEntry[] | null>(null)
   const [runningSpecs, setRunningSpecs] = useState(false)
@@ -125,7 +127,7 @@ export function TestsTab({ name }: { name: string }) {
           </div>
           <p className="text-xs text-ink-500 mt-0.5">
             {specs.length === 0
-              ? 'Ask Luna to write tests from a good run, or from what this playbook should do.'
+              ? `Ask ${agentName} to write tests from a good run, or from what this playbook should do.`
               : 'Each test dry-runs the playbook and checks what it should do.'}
           </p>
           {specs.length > 0 && (

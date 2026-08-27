@@ -3,11 +3,12 @@
  * table of every playbook tool the agent can use, so owners can see exactly
  * what Luna is able to do with playbooks on their behalf.
  */
+import { useAgentName } from './agentIdentity'
 
 const TOOLS: { name: string; what: string }[] = [
   { name: 'playbook_list', what: 'List your playbooks — names, descriptions, and who is allowed to run each one.' },
-  { name: 'playbook_propose', what: 'Create a new playbook from a full YAML definition (steps, triggers, and inputs all at once).' },
-  { name: 'playbook_get_definition', what: 'Read the complete YAML of an existing playbook before making changes.' },
+  { name: 'playbook_propose', what: 'Create a new playbook from code — steps, triggers, and inputs all at once.' },
+  { name: 'playbook_get_definition', what: 'Read the complete code of an existing playbook before making changes.' },
   { name: 'playbook_edit', what: 'Rewrite a playbook in place. A version snapshot is saved first, so every change can be traced.' },
   { name: 'playbook_validate', what: 'Statically check a playbook without running it — schema errors, bad references, unknown tools, cycles.' },
   { name: 'playbook_dry_run', what: 'Simulate a run with no side effects: real loops and branches, but tool and LLM steps are stubbed.' },
@@ -18,14 +19,16 @@ const TOOLS: { name: string; what: string }[] = [
 ]
 
 export function ToolsGuide() {
+  const agentName = useAgentName()
   return (
     <div className="mx-6 mt-3 rounded-xl border border-white/10 bg-white/[.03] p-5 shrink-0 max-h-[50vh] overflow-y-auto" data-testid="tools-guide">
       <h3 className="text-sm font-semibold text-ink-100">What playbooks can do</h3>
       <p className="text-xs text-ink-400 mt-1.5 leading-relaxed max-w-3xl">
         A playbook is a saved multi-step workflow — searches, tool calls, loops, decisions —
-        that Luna authors as YAML and runs step by step, with every step&apos;s inputs and
-        outputs recorded. You can ask Luna in chat to build, change, test, or run one, or edit
-        it yourself in the canvas. These are the tools Luna uses under the hood:
+        that {agentName} authors as code and runs step by step, with every step&apos;s inputs
+        and outputs recorded. You can ask {agentName} in chat to build, change, test, or run
+        one, or edit it yourself in the canvas. These are the tools {agentName} uses under
+        the hood:
       </p>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-left text-xs">

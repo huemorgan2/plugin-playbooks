@@ -12,6 +12,7 @@ import {
 import { cn } from '../lib/cn'
 import { subscribeActivityEvents } from '../lib/events'
 import { playbooksApi } from './api'
+import { useAgentName } from './agentIdentity'
 import type { PlaybookSummary } from './types'
 import { PlaybookEditor } from './PlaybookEditor'
 import { ToolsGuide } from './ToolsGuide'
@@ -24,6 +25,7 @@ type SelectedItem = { kind: 'playbook'; name: string } | { kind: 'draft'; id: st
 type Tab = 'active' | 'archived'
 
 export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (section: string) => void }) {
+  const agentName = useAgentName()
   const [playbooks, setPlaybooks] = useState<PlaybookSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<SelectedItem | null>(null)
@@ -147,7 +149,7 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
           <div>
             <h2 className="text-lg font-semibold text-ink-50">Playbooks</h2>
             <p className="text-xs text-ink-500 mt-0.5">
-              Multi-step workflows Luna builds and runs for you
+              Multi-step workflows {agentName} builds and runs for you
             </p>
           </div>
           <button
@@ -207,7 +209,7 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
           <Workflow className="w-12 h-12 text-ink-600" />
           <p className="text-sm text-center">
             {tab === 'active'
-              ? 'No playbooks yet. Click "New playbook" to create one, or ask Luna in chat to build one for you.'
+              ? `No playbooks yet. Click "New playbook" to create one, or ask ${agentName} in chat to build one for you.`
               : 'No archived playbooks.'}
           </p>
         </div>

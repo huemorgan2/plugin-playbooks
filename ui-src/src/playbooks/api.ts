@@ -194,3 +194,11 @@ export const playbooksApi = {
   deleteDraft: (draftId: string) =>
     apiFetch<{ id: string }>(`${BASE}/drafts/${draftId}`, { method: 'DELETE' }),
 }
+
+// The agent's identity (plugin-identity). Used to address the agent by its
+// real name in UI copy instead of a hardcoded "Luna".
+export type AgentIdentity = { name: string; emoji: string }
+
+export const identityApi = {
+  get: () => apiFetch<AgentIdentity>('/api/p/plugin-identity/'),
+}

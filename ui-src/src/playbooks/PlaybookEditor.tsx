@@ -27,6 +27,7 @@ import { applyPlaybookPatch, patchMatchesEditor, type PlaybookPatchEvt } from '.
 import { setPlaybookConsumerReady } from './liveBus'
 import { subscribePlaybookEvents } from '../lib/events'
 import { playbooksApi } from './api'
+import { useAgentName } from './agentIdentity'
 import type {
   PlaybookDef, StepDef, StepKind, StepRunDetail,
   PlaybookRunDetail,
@@ -181,6 +182,7 @@ export function promoteRefusalMessage(err: unknown): string {
 }
 
 export function PlaybookEditor(props: Props) {
+  const agentName = useAgentName()
   const { onBack } = props
 
   const [loading, setLoading] = useState(true)
@@ -754,8 +756,8 @@ export function PlaybookEditor(props: Props) {
                   <div className="text-center">
                     <p className="text-sm font-medium text-ink-300">Empty playbook</p>
                     <p className="text-xs text-ink-500 mt-1 max-w-xs">
-                      Ask Luna in chat to build this playbook — steps appear
-                      here as she writes them.
+                      Ask {agentName} in chat to build this playbook — steps
+                      appear here as they are written.
                     </p>
                   </div>
                 </div>
@@ -790,7 +792,7 @@ export function PlaybookEditor(props: Props) {
                 {codeShown}
               </pre>
               <p className="text-[11px] text-ink-600 mt-2">
-                Luna writes this — ask her in chat to change the playbook.
+                {agentName} writes this — ask in chat to change the playbook.
               </p>
             </div>
           )}
