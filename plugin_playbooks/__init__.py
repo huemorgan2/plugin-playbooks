@@ -479,7 +479,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.23.0",
+        version="0.24.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -604,6 +604,7 @@ class PlaybooksPlugin(LunaPlugin):
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,
             sync_bindings=self.sync_trigger_bindings,
+            trigger_sources=ctx.trigger_sources,
         )
 
         for tool_def, handler in build_tools(

@@ -13,6 +13,7 @@ import {
   Code, Expr, KVTable, NamePill, SchemaTree, SectionLabel, StepList,
   TemplateText, Value,
 } from './primitives'
+import { IntegrationIcon, toolIconUrl, useIconRef } from '../icons'
 import { stepReads, stepWrites } from './dataflow'
 
 export interface ExplainProps {
@@ -21,12 +22,19 @@ export interface ExplainProps {
 }
 
 function ToolCallExplain({ step }: ExplainProps) {
+  const iconRef = useIconRef()
+  const toolUrl = toolIconUrl(iconRef, step.tool)
   return (
     <div className="space-y-3">
       {step.tool && (
         <div>
           <SectionLabel>Tool</SectionLabel>
-          <NamePill text={step.tool} className="border-teal-500/30 text-teal-200 bg-teal-950/40" />
+          <span className="inline-flex items-center gap-1.5">
+            {toolUrl && (
+              <IntegrationIcon url={toolUrl} fallback={() => null} className="w-4 h-4" />
+            )}
+            <NamePill text={step.tool} className="border-teal-500/30 text-teal-200 bg-teal-950/40" />
+          </span>
         </div>
       )}
       {step.args && Object.keys(step.args).length > 0 && (

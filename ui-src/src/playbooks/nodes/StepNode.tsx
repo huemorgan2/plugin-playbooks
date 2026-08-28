@@ -11,7 +11,8 @@ import {
   RotateCcw, CircleDot, Zap, ExternalLink, Info, Sparkles, Database, Ban, Code2,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
-import { type StepKind, type RunStatus, STEP_COLORS, STATUS_COLORS } from '../types'
+import { type StepKind, type RunStatus, type StepDef, STEP_COLORS, STATUS_COLORS } from '../types'
+import { IntegrationIcon, toolIconUrl, useIconRef } from '../icons'
 
 interface StepNodeData {
   stepId: string
@@ -52,6 +53,11 @@ function StepNodeComponent({ data, selected }: NodeProps) {
   // canvas (it did, for `llm_step`, before it was added to STEP_COLORS).
   const colors = STEP_COLORS[kind] || STEP_COLORS.tool_call
   const Icon = KIND_ICONS[kind] || Zap
+  // plans/011: a tool step wears the icon of the integration behind the tool.
+  const iconRef = useIconRef()
+  const toolUrl = kind === 'tool_call'
+    ? toolIconUrl(iconRef, (d.stepDef as StepDef | undefined)?.tool)
+    : null
   const statusClass = d.runStatus ? STATUS_COLORS[d.runStatus] : ''
 
   const isCondition = kind === 'condition'
@@ -104,7 +110,12 @@ function StepNodeComponent({ data, selected }: NodeProps) {
             kind === 'halt' ? 'bg-rose-800/60' :
             'bg-ink-800/60'
           )}>
-            <Icon className={cn('w-3.5 h-3.5', colors.text)} />
+            <IntegrationIcon
+              url={toolUrl}
+              fallback={Icon}
+              fallbackClass={cn('w-3.5 h-3.5', colors.text)}
+              className="w-3.5 h-3.5"
+            />
           </div>
           <div className="min-w-0 flex-1">
             <div className={cn('text-xs font-medium truncate', colors.text)}>
