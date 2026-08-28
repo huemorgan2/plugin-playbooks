@@ -1,7 +1,8 @@
 # 013 — playbook sub-agent: focused delegate with a live progress card in chat
 
-Status: IN EXECUTION 2026-08-28 (phased; see phase folders). Depends on
-plans/012 — satisfied (012 EXECUTED 2026-08-28, shipped through 0.23.0).
+Status: EXECUTED 2026-08-28 (phased; see phase folders and
+execution_summary.md — shipped as 0.25.0). Depends on plans/012 —
+satisfied (012 EXECUTED 2026-08-28, shipped through 0.23.0).
 
 ## Amendments (2026-08-28, pre-execution — verified against luna 0.85.006)
 
