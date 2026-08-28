@@ -53,8 +53,23 @@ class _ToolReturnPart:
 
 
 class FunctionToolResultEvent:
+    """pydantic-ai <2 shape: the ToolReturnPart rides on .result."""
+
     def __init__(self, tool_name: str, call_id: str, content) -> None:
         self.result = _ToolReturnPart(tool_name, call_id, content)
+
+
+class _FunctionToolResultEventV2:
+    """pydantic-ai >=2 shape (QA runs 2.35): the part rides on .part,
+    .content is the model-facing echo, and there is no .result at all."""
+
+    def __init__(self, tool_name: str, call_id: str, content) -> None:
+        self.part = _ToolReturnPart(tool_name, call_id, content)
+        self.content = content
+
+
+_FunctionToolResultEventV2.__name__ = "FunctionToolResultEvent"
+_FunctionToolResultEventV2.__qualname__ = "FunctionToolResultEvent"
 
 
 class _TextPart:
@@ -300,6 +315,27 @@ async def test_events_recorded_with_inferred_phases(env):
     _, status = tools["playbook_agent_status"]
     st = json.loads(await status(delegation_id=out["delegation_id"]))
     assert 0 < len(st["recent_events"]) <= 5
+
+
+async def test_v2_result_events_still_stamp_duration_and_detail(env):
+    # QA's pydantic-ai 2.35 sends results as .part/.content with no .result
+    # — the shape that shipped ms=None to the live card until this test.
+    agent = FakeAgent(
+        result="ok",
+        events=[
+            FunctionToolCallEvent("playbook_spec_run", "c1"),
+            _FunctionToolResultEventV2("playbook_spec_run", "c1", "2/2 pass"),
+        ],
+    )
+    tools = _tools(FakeCtx(agent), env)
+    _, run = tools["playbook_agent"]
+    out = json.loads(await run(task="check", wait_seconds=10))
+    async with env() as s:
+        row = await s.get(PlaybookDelegation, uuid.UUID(out["delegation_id"]))
+    runs = [e for e in row.events if e["label"] == "playbook_spec_run"]
+    assert len(runs) == 1  # call + result still collapse to one line
+    assert runs[0]["ms"] is not None
+    assert runs[0]["detail"] == "2/2 pass"
 
 
 async def test_typeerror_fallback_runs_uncontained_and_says_so(env):

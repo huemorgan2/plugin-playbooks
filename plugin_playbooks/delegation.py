@@ -213,8 +213,11 @@ class _EventFeed:
             self.steps_used += 1
             self._append("tool", tool_name, phase=phase_for_tool(tool_name))
             return
-        # A tool result (FunctionToolResultEvent has .result ToolReturnPart).
+        # A tool result. pydantic-ai <2 carried the ToolReturnPart as
+        # .result; >=2 (QA runs 2.35) carries it as .part. Accept both.
         result = getattr(ev, "result", None)
+        if type(ev).__name__ == "FunctionToolResultEvent" and result is None:
+            result = part
         if type(ev).__name__ == "FunctionToolResultEvent" and result is not None:
             rname = getattr(result, "tool_name", "") or ""
             rid = str(getattr(result, "tool_call_id", "") or "")
