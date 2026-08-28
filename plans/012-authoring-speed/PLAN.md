@@ -1,6 +1,16 @@
 # 012 — authoring speed: cut the LLM round trips, not the tools
 
-Status: PLANNED 2026-08-28. Phase 1 executes immediately (owner ask).
+Status: EXECUTED 2026-08-28. Phase 1 shipped as 0.17.0; phases 2–4 ran
+as phased execution (folders `phase-2..4-*/` with PHASE.md +
+execution_summary.md each) and shipped as 0.20.0 (readable framed read
+stage), 0.21.0 (payload diet: skill 22,695→12,259B, read stage carries
+LANGUAGE_MINIREF), and 0.23.0 (real shapes first: failed runs pinnable
+via playbook_spec_from_run, failure hint on playbook_status). 0.22.0 in
+between was plans/014 (separate). All verified on tenant
+vaselin-scanny-2; suite 211 tests green at close. The measured pain
+points are each addressed: batch specs (one call), code readable in
+place (no re-read fumbling), ~19KB less context per edit cycle, and
+stub shapes steered to recorded reality instead of memory.
 
 ## Evidence — measured on a live tenant chat
 
