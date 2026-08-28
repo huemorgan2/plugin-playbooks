@@ -7,16 +7,20 @@ isolation and downstream phases can reuse the same fakes. Provides:
 - `make_fake_tool` / `build_tool_registry` — deterministic tool_call steps.
 - `FakeTriggerSource` — a luna.triggers source for binding tests (records
   ensure/release transitions).
-- `build_test_runner` — in-memory SQLite + EventBus + fakes → a ready
-  PlaybookRunner.
+- `build_test_runner` — temp-file SQLite + EventBus + fakes → a ready
+  PlaybookRunner (file removed on engine dispose).
 - `make_playbook` — insert a Playbook row from a definition dict.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from luna_sdk import EventBus, ToolDef, ToolRegistry, TriggerInfo
@@ -195,14 +199,32 @@ async def build_test_runner(
     agent: FakeAgent | None = None,
     events: EventBus | None = None,
 ) -> TestRunnerBundle:
-    """Wire an in-memory SQLite DB + EventBus + FakeAgent + fake tools into a
-    ready PlaybookRunner. Caller disposes via `bundle.engine.dispose()`."""
+    """Wire a temp-file SQLite DB + EventBus + FakeAgent + fake tools into a
+    ready PlaybookRunner. Caller disposes via `bundle.engine.dispose()`, which
+    also deletes the temp DB file.
+
+    A file-backed DB (not :memory:) is required: with :memory: every pooled
+    connection is a separate empty database, so concurrent sessions land on
+    table-less connections; StaticPool shares one connection and interleaves
+    transactions. Separate connections + one file + SQLite locking is the only
+    shape that survives concurrent step runs."""
     from .models import (
         Playbook, PlaybookDraft, PlaybookRun, PlaybookStepRun, PlaybookVersion,
     )
     from .runner import PlaybookRunner
 
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    fd, db_path = tempfile.mkstemp(suffix=".db", prefix="pb-test-")
+    os.close(fd)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}", connect_args={"timeout": 30}
+    )
+
+    @event.listens_for(engine.sync_engine, "engine_disposed")
+    def _remove_db_file(_engine) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.remove(db_path + suffix)
+
     async with engine.begin() as conn:
         for table in (
             Playbook.__table__, PlaybookVersion.__table__,
