@@ -537,9 +537,13 @@ class PlaybooksPlugin(LunaPlugin):
             SkillDef(
                 name="playbook-authoring",
                 description=(
-                    "how to build, edit, and debug playbooks — load before creating or "
-                    "modifying any playbook; the authoring tools (propose, edit, "
-                    "validate, dry_run, …) unlock on your next turn"
+                    "how to build, edit, and debug playbooks INLINE, in this "
+                    "conversation — load only when the owner asked to work "
+                    "through the playbook together step by step (or told you "
+                    "not to hand it off); for any other create/fix/change job "
+                    "load playbook-delegation instead. The authoring tools "
+                    "(propose, edit, validate, dry_run, …) unlock on your "
+                    "next turn"
                 ),
                 body=_AUTHORING_SKILL_BODY,
                 tools=[
@@ -569,10 +573,12 @@ class PlaybooksPlugin(LunaPlugin):
             SkillDef(
                 name="playbook-delegation",
                 description=(
-                    "delegate playbook building/fixing to a focused background "
-                    "agent with a live progress card — load when the owner wants "
-                    "a playbook created, fixed, or changed and you are not "
-                    "authoring it inline; playbook_agent unlocks on your next turn"
+                    "hand playbook work to a focused background agent with a "
+                    "live progress card — the DEFAULT whenever the owner wants "
+                    "a playbook created, fixed, or changed (it keeps this "
+                    "conversation small); load playbook-authoring instead only "
+                    "when the owner asked to build it together step by step. "
+                    "playbook_agent unlocks on your next turn"
                 ),
                 body=_DELEGATION_SKILL_BODY,
                 tools=[

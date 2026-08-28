@@ -408,3 +408,20 @@ def test_delegation_tools_are_skill_gated_and_chat_only(env):
                  if s.name == "playbook-delegation")
     assert set(skill.tools) == set(by_name)
     assert len(skill.body) < 2048  # the point: a SMALL unlock, not 12KB
+
+
+def test_skill_descriptions_steer_playbook_jobs_to_delegation():
+    # plans/013 phase 4, found in the dojo: "fix the playbook and make it
+    # live" loaded playbook-authoring and ran the whole loop in the main
+    # context — the old authoring description claimed EVERY create/modify
+    # job ("load before creating or modifying any playbook"), beating the
+    # delegation skill at its own scenario. The steering contract:
+    # authoring presents itself as the inline / build-it-together path and
+    # points at delegation; delegation presents itself as the default.
+    skills = {s.name: s for s in PlaybooksPlugin.manifest.skills}
+    auth = skills["playbook-authoring"].description
+    deleg = skills["playbook-delegation"].description
+    assert "inline" in auth.lower()
+    assert "playbook-delegation" in auth
+    assert "default" in deleg.lower()
+    assert "any playbook" not in auth  # the phrasing that caused the miss
