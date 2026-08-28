@@ -54,7 +54,6 @@ export interface StepDef {
   while?: string
   break_when?: string
   concurrency?: number
-  count?: number
   item_name?: string
   collect?: string
   max_iterations?: number

@@ -36,10 +36,11 @@ import { RunsTab } from './RunsTab'
 import { TestsTab } from './TestsTab'
 import { ManifestTab } from './ManifestTab'
 
-import { KIND_LABELS, kindIcon } from './explain/primitives'
+import { KIND_LABELS, kindIcon, Code } from './explain/primitives'
 import { headline } from './explain/headline'
 import { STEP_EXPLAINERS, DataFlow, FooterChips } from './explain/registry'
 import { findStepById } from './explain/dataflow'
+import { JsonTree } from './explain/jsontree'
 
 const nodeTypes = {
   stepNode: StepNode,
@@ -728,12 +729,9 @@ export function PlaybookEditor(props: Props) {
                   ))}
                 </div>
               )}
-              <pre
-                className="text-xs text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/40 rounded-lg p-4 border border-white/5"
-                data-testid="code-view"
-              >
-                {codeShown}
-              </pre>
+              <div data-testid="code-view">
+                <Code source={codeShown} />
+              </div>
               <p className="text-[11px] text-ink-600 mt-2">
                 {agentName} writes this — ask in chat to change the playbook.
               </p>
@@ -1176,17 +1174,13 @@ function StepDetailPanel({
                         {lastExec.inputs && Object.keys(lastExec.inputs).length > 0 && (
                           <div>
                             <div className="text-[10px] text-ink-500 mb-0.5">Resolved inputs</div>
-                            <pre className="text-[10px] text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/60 rounded p-2 max-h-48 overflow-auto">
-                              {JSON.stringify(lastExec.inputs, null, 2)}
-                            </pre>
+                            <JsonTree data={lastExec.inputs} />
                           </div>
                         )}
                         {lastExec.outputs != null && (
                           <div>
                             <div className="text-[10px] text-ink-500 mb-0.5">Output</div>
-                            <pre className="text-[10px] text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/60 rounded p-2 max-h-56 overflow-auto">
-                              {JSON.stringify(lastExec.outputs, null, 2)}
-                            </pre>
+                            <JsonTree data={lastExec.outputs} />
                           </div>
                         )}
                       </div>

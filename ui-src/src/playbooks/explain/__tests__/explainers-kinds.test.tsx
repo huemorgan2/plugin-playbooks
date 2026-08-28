@@ -112,6 +112,26 @@ describe('loop explainer', () => {
     expect(text).not.toContain('iterations')
     expect(text).not.toContain('at a time')
   })
+
+  it('renders a literal list over as a value, not an expression', () => {
+    const { container } = renderKind({
+      id: 'lp', kind: 'loop', over: ['alpha', 'beta'],
+      body: [{ id: 'proc', kind: 'code', source: 'return 1' }],
+    })
+    const text = container.textContent!
+    expect(text).toContain('alpha')
+    expect(text).toContain('beta')
+  })
+
+  it('renders while/until guards when present', () => {
+    const { container } = renderKind({
+      id: 'lp', kind: 'loop', over: 'inputs.items',
+      while: 'vars.keep_going', until: 'vars.done',
+    })
+    const text = container.textContent!
+    expect(text).toContain('vars.keep_going')
+    expect(text).toContain('vars.done')
+  })
 })
 
 describe('parallel explainer', () => {
@@ -129,6 +149,27 @@ describe('parallel explainer', () => {
     expect(text).toContain('b1s1')
     expect(text).toContain('b2s1')
     expect(text).toContain('all')
+  })
+
+  it('renders a fan_in count variant verbatim', () => {
+    const { container } = renderKind({
+      id: 'p1', kind: 'parallel', fan_in: '2',
+      branches: [[{ id: 'b1', kind: 'halt' }], [{ id: 'b2', kind: 'halt' }]],
+    })
+    expect(container.textContent).toContain('2')
+    expect(container.textContent).toContain('branches finish')
+  })
+
+  it('renders no fan-in line when fan_in is absent, and empty branches stay empty', () => {
+    const { container } = renderKind({
+      id: 'p1', kind: 'parallel',
+      branches: [[], [{ id: 'only', kind: 'halt' }]],
+    })
+    const text = container.textContent!
+    expect(text).not.toContain('branches finish')
+    expect(text).toContain('Branch 1')
+    expect(text).toContain('Branch 2')
+    expect(text).toContain('only')
   })
 })
 
@@ -158,6 +199,14 @@ describe('wait_for_approval explainer', () => {
   it('renders nothing without show', () => {
     const { container } = renderKind({ id: 'ap', kind: 'wait_for_approval' })
     expect(container.textContent).toBe('')
+  })
+
+  it('renders template-bearing show entries with their refs visible', () => {
+    const { container } = renderKind({
+      id: 'ap', kind: 'wait_for_approval',
+      show: ['Draft: {{ steps.draft.result }}'],
+    })
+    expect(container.textContent).toContain('steps.draft.result')
   })
 })
 
@@ -193,6 +242,16 @@ describe('state explainer', () => {
     expect(rows[1].textContent).toContain('pop_front')
     expect(rows[1].textContent).toContain('queue')
     expect(rows[1].textContent).toContain('current')
+  })
+
+  it('renders a delete op with just the var', () => {
+    const { container } = renderKind({
+      id: 'st', kind: 'state', state: [{ op: 'delete', var: 'scratch' }],
+    })
+    const rows = container.querySelectorAll('[data-state-op]')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].textContent).toContain('delete')
+    expect(rows[0].textContent).toContain('scratch')
   })
 })
 
