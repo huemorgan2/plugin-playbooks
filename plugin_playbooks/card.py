@@ -98,6 +98,10 @@ details[open] summary::before{{content:"▾ "}}
 .ev.thought .lbl{{color:var(--faint);font-style:italic}}
 .ev .ms{{margin-left:auto;color:var(--faint);
   font-variant-numeric:tabular-nums;white-space:nowrap}}
+.waiting{{display:none;margin-top:12px;padding:8px 12px;font-size:13px;
+  color:var(--amber);background:rgba(245,165,36,.08);
+  border:1px solid rgba(245,165,36,.35);border-left-width:3px;
+  border-radius:8px}}
 .result{{margin-top:12px;padding:10px 12px;background:var(--panel-2);
   border:1px solid var(--line);border-radius:8px;font-size:13px;
   color:var(--dim);white-space:pre-wrap;display:none}}
@@ -114,6 +118,7 @@ details[open] summary::before{{content:"▾ "}}
   <h1 id="headline">Starting…</h1>
   <div class="support" id="support">Handing the job to the delegate</div>
   <div class="phases" id="phases"></div>
+  <div class="waiting" id="waiting"></div>
   <details id="detail"><summary>What it did</summary>
     <div class="feed" id="feed"></div>
   </details>
@@ -125,8 +130,15 @@ var BOOT={boot};
 var card=document.getElementById('card'),headline=document.getElementById('headline'),
     support=document.getElementById('support'),phasesEl=document.getElementById('phases'),
     feed=document.getElementById('feed'),resultEl=document.getElementById('result'),
-    elapsedEl=document.getElementById('elapsed');
+    elapsedEl=document.getElementById('elapsed'),waitingEl=document.getElementById('waiting');
 var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='';
+var WAIT_WORDS={{playbook_promote:'make the change live',
+  playbook_rollback:'roll back the live version',
+  playbook_edit_force:'force past failing specs',
+  playbook_manifest_set:"change the playbook's contract",
+  playbook_spec_delete:'delete a spec',
+  playbook_set_autonomy:'change how it runs on its own',
+  playbook_run_candidate:'test-run the draft version'}};
 
 function esc(s){{var d=document.createElement('span');d.textContent=String(s==null?'':s);return d.innerHTML;}}
 
@@ -198,6 +210,16 @@ function render(st){{
     return '<div class="ev '+esc(e.kind)+'"><span class="lbl">'+
       esc(e.label)+'</span>'+ms+'</div>';
   }}).join('');
+
+  var waitTool=(st.status==='running')?st.waiting_for_approval:null;
+  if(waitTool){{
+    waitingEl.style.display='block';
+    waitingEl.textContent='Waiting for your approval — '+
+      (WAIT_WORDS[waitTool]||String(waitTool).replace(/_/g,' '));
+    support.textContent='Paused until you decide';
+  }}else{{
+    waitingEl.style.display='none';
+  }}
 
   if(st.status!=='running'&&st.result){{
     resultEl.style.display='block';resultEl.textContent=st.result;

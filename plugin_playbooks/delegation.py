@@ -80,6 +80,60 @@ def phase_for_tool(tool_name: str) -> str:
     return _PHASE_BY_TOOL.get(tool_name, "Understand")
 
 
+# Our own prompt_always tools — the calls that park the delegate on an
+# approval card. Kept in sync with agent_tools.py by a drift test.
+_GATED_TOOLS = frozenset({
+    "playbook_set_autonomy",
+    "playbook_edit_force",
+    "playbook_manifest_set",
+    "playbook_promote",
+    "playbook_rollback",
+    "playbook_run_candidate",
+    "playbook_spec_delete",
+})
+
+# A gated call normally resolves in well under a second; one still pending
+# after this long means the delegate is parked waiting for the owner.
+_WAITING_THRESHOLD_S = 8.0
+
+# Owner words for the gated tools — what the wait means to the person who
+# has to approve it. The tool code itself must never reach the owner's eyes
+# (vocabulary rule): the status message hands the model these words instead.
+_GATED_TOOL_OWNER_WORDS = {
+    "playbook_promote": "make the change live",
+    "playbook_rollback": "roll back the live version",
+    "playbook_edit_force": "force past failing specs",
+    "playbook_manifest_set": "change the playbook's contract",
+    "playbook_spec_delete": "delete a spec",
+    "playbook_set_autonomy": "change how it runs on its own",
+    "playbook_run_candidate": "test-run the draft version",
+}
+
+
+def waiting_on_owner(events: list[dict] | None,
+                     now: datetime | None = None) -> str | None:
+    """Tool name the delegate is parked on awaiting approval, or None.
+
+    Derived from the event feed — never a status value, and never a code the
+    model emits: the LAST event is a gated tool call with no result yet
+    (`ms` unset), older than the threshold.
+    """
+    if not events:
+        return None
+    last = events[-1]
+    if last.get("kind") != "tool" or last.get("ms") is not None:
+        return None
+    tool = str(last.get("label") or "")
+    if tool not in _GATED_TOOLS:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(last.get("ts")))
+    except (ValueError, TypeError):
+        return None
+    age = ((now or _utcnow()) - ts).total_seconds()
+    return tool if age >= _WAITING_THRESHOLD_S else None
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -359,19 +413,37 @@ _LIVE_FEEDS: dict[uuid.UUID, _EventFeed] = {}
 
 
 def _delegation_payload(row: PlaybookDelegation, *, for_status_tool: bool) -> dict:
+    # While running, prefer the live in-process feed over the row: the DB
+    # flush is throttled, and a delegate that parks on an approval right
+    # after a gated call may never flush that last event — the row would
+    # then hide the very wait we need to surface.
+    feed = _LIVE_FEEDS.get(row.id) if row.status == "running" else None
+    events = feed.events if feed is not None else (row.events or [])
     payload: dict[str, Any] = {
         "delegation_id": str(row.id),
         "status": row.status,
         "playbook": row.playbook or None,
-        "steps_used": row.steps_used,
+        "steps_used": feed.steps_used if feed is not None else row.steps_used,
     }
     if row.status == "running":
-        payload["message"] = (
-            "The delegate is working in the background; a progress card in "
-            "the chat tracks it live. Tell the owner the card shows the "
-            "progress, then END YOUR TURN. Do not poll playbook_agent_status "
-            "unless the owner asks later."
-        )
+        waiting = waiting_on_owner(events)
+        if waiting is not None:
+            words = _GATED_TOOL_OWNER_WORDS.get(
+                waiting, waiting.replace("_", " "))
+            payload["waiting_for_approval"] = waiting
+            payload["message"] = (
+                "The delegate is PAUSED waiting for the owner's approval to "
+                f"{words} — an approval card is in the chat. Tell the owner "
+                "(in those words, never the tool name) that their approval "
+                "is needed, then END YOUR TURN."
+            )
+        else:
+            payload["message"] = (
+                "The delegate is working in the background; a progress card in "
+                "the chat tracks it live. Tell the owner the card shows the "
+                "progress, then END YOUR TURN. Do not poll playbook_agent_status "
+                "unless the owner asks later."
+            )
     elif row.status in ("done", "failed", "needs_owner"):
         if row.result:
             payload["report"] = row.result[:_RESULT_CAP]
@@ -382,10 +454,10 @@ def _delegation_payload(row: PlaybookDelegation, *, for_status_tool: bool) -> di
                 "The delegate stopped and needs the owner's decision — relay "
                 "the report."
             )
-    if for_status_tool and row.events:
+    if for_status_tool and events:
         payload["recent_events"] = [
             {k: e.get(k) for k in ("phase", "kind", "label", "ms")}
-            for e in row.events[-5:]
+            for e in events[-5:]
         ]
     return payload
 

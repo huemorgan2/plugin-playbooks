@@ -120,3 +120,31 @@ async def test_events_tail_capped(env):
     body = (await c.get(_url(row.id, TOKEN))).json()
     assert len(body["events"]) == 200
     assert body["events"][-1]["label"] == "t449"
+
+
+async def test_running_payload_surfaces_waiting_for_approval(env):
+    # plans/013 phase 3 — a stale pending gated call marks the payload.
+    c, sf, row = env
+    from datetime import datetime, timedelta, timezone
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    async with sf() as s:
+        fresh = await s.get(PlaybookDelegation, row.id)
+        fresh.events = list(fresh.events) + [
+            {"ts": stale, "phase": "Ship", "kind": "tool",
+             "label": "playbook_promote", "detail": "", "ms": None},
+        ]
+        await s.commit()
+
+    body = (await c.get(_url(row.id, TOKEN))).json()
+    assert body["status"] == "running"
+    assert body["waiting_for_approval"] == "playbook_promote"
+
+    # Resolved (ms stamped) → field clears.
+    async with sf() as s:
+        fresh = await s.get(PlaybookDelegation, row.id)
+        events = list(fresh.events)
+        events[-1] = {**events[-1], "ms": 900}
+        fresh.events = events
+        await s.commit()
+    body = (await c.get(_url(row.id, TOKEN))).json()
+    assert body["waiting_for_approval"] is None

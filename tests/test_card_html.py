@@ -50,3 +50,15 @@ def test_hostile_playbook_name_is_escaped():
 def test_no_playbook_means_no_chip():
     assert '<span class="chip">' not in _card(playbook="")
     assert '<span class="chip">' in _card()
+
+
+def test_waiting_banner_wiring_present():
+    # plans/013 phase 3 — the parked-state banner: element, owner-words map,
+    # and the render keyed on waiting_for_approval.
+    doc = _card()
+    assert 'id="waiting"' in doc
+    assert "waiting_for_approval" in doc
+    assert "Waiting for your approval" in doc
+    # Owner words, not tool codes, reach the reader.
+    assert "make the change live" in doc
+    assert "roll back the live version" in doc

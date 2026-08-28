@@ -145,7 +145,7 @@ _CARD_EVENTS_TAIL = 200
 async def delegation_card_status(delegation_id: str, token: str = ""):
     import secrets as _secrets
 
-    from .delegation import _LIVE_FEEDS
+    from .delegation import _LIVE_FEEDS, waiting_on_owner
     from .models import PlaybookDelegation
 
     try:
@@ -173,6 +173,11 @@ async def delegation_card_status(delegation_id: str, token: str = ""):
         "finished_at": row.finished_at.isoformat() if row.finished_at else None,
         "result": row.result if row.status != "running" else None,
         "events": events[-_CARD_EVENTS_TAIL:],
+        # Phase 3: parked-on-approval is DERIVED from the feed (a gated call
+        # still unresolved after a few seconds), never a status value.
+        "waiting_for_approval": (
+            waiting_on_owner(events) if row.status == "running" else None
+        ),
     }
     return Response(
         content=json.dumps(payload),
