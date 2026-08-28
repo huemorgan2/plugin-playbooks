@@ -618,6 +618,55 @@ def build_tools(
         _set_autonomy,
     ))
 
+    # --- playbook_ack_failures ---
+    # plans/014: dismisses the failing-playbooks prompt digest for the
+    # CURRENT live version only. A later edit+promote re-arms the digest by
+    # itself (the ack is version-scoped), so "ignore it" never silences a
+    # playbook the owner has since changed.
+    async def _ack_failures(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            live = playbook.live_version or playbook.version
+            playbook.failures_acked_version = live
+            await session.commit()
+        return json.dumps({
+            "playbook": name,
+            "acked_version": live,
+            "status": "acked",
+            "note": (
+                "Failure digest dismissed for this version. It re-appears "
+                "only if the playbook changes and the new version fails."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_ack_failures",
+            chat_only=True,
+            description=(
+                "Dismiss the 'playbook failures needing your attention' notice "
+                "for one playbook. Call this ONLY after the owner has decided "
+                "what to do about the failures (ignore / fix later). Fixing the "
+                "playbook (edit + promote) clears the notice by itself — no ack "
+                "needed then."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _ack_failures,
+    ))
+
     # --- Whole-YAML authoring helpers + tools ---
 
     async def _snapshot_version(
