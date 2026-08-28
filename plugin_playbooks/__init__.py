@@ -310,8 +310,8 @@ tool-name → pretended output), and `expect` assertions over the dry-run
 trace. Specs run automatically on every candidate save and are a PROMOTE
 GATE — a failing spec blocks `playbook_promote` until the code is fixed or
 the spec updated.
-- After a good real run, prefer `playbook_spec_from_run(name)` — a spec
-proposal with stubs from real outputs; trim it, save with `playbook_spec_add`.
+- Write stubs from recorded reality, not memory: after ANY real run — even
+a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
 - BATCH: ALL the specs you intend to add go in ONE
 `playbook_spec_add(name, specs=...)` call (YAML mapping of name → body).
 One call per spec wastes the owner's time.
@@ -479,7 +479,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.22.0",
+        version="0.23.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

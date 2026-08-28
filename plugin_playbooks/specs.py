@@ -316,7 +316,10 @@ def spec_from_run(
     step_rows: list[Any],
     definition: dict[str, Any],
 ) -> dict[str, Any]:
-    """Record & replay: build a spec document from a completed run.
+    """Record & replay: build a spec document from a finished run.
+
+    Failed runs are welcome: stubs pin every step that DID run and
+    ``expect`` documents the failure point (status + error_contains).
 
     ``stubs`` come from the recorded tool-step outputs (keyed by step id;
     the tool result payload, not the wrapper), ``inputs`` from the run row,
@@ -353,4 +356,10 @@ def spec_from_run(
     }
     if not spec_doc["expect"]["tool_calls"]:
         del spec_doc["expect"]["tool_calls"]
+    if run.status != "done":
+        # 012 phase 4: pin the failure point too — the last failing step's
+        # error, truncated (error_contains is a substring match).
+        errors = [r.error for r in step_rows if getattr(r, "error", None)]
+        if errors:
+            spec_doc["expect"]["error_contains"] = errors[-1][:120]
     return spec_doc

@@ -428,6 +428,100 @@ async def test_spec_from_run_no_runs(env):
     assert "error" in out
 
 
+# 012 phase 4 — real shapes first: failed runs are pinnable too.
+
+FAIL_CODE = (
+    "playbook(name='crasher', description='fails on step b')\n"
+    "a = tool('t')\n"
+    "b = tool('send_chat_message', message='{{ steps.a.result.nope }}')\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_spec_from_run_failed_run_pins_failure(env):
+    sf, runner, handlers, _ = env
+    await handlers["playbook_propose"](
+        name="crasher", code=FAIL_CODE, agent_autonomy="agent_may_trigger",
+    )
+    out = json.loads(await handlers["playbook_run"](name="crasher"))
+    assert out.get("status") == "failed", out
+    # auto-pick with no done run falls back to the latest failed run
+    pin = json.loads(await handlers["playbook_spec_from_run"](name="crasher"))
+    assert pin["run_id"] == out["run_id"]
+    assert "FAILED run" in pin["next"]
+    doc = parse_spec_yaml(pin["spec_yaml"])
+    assert doc.expect.status == "failed"
+    # step a DID run — its real output is pinned; failing step b is not
+    assert doc.stubs["a"] == {"ok": True}
+    assert "b" not in doc.stubs
+    # the failure point is pinned as a substring expectation
+    assert doc.expect.error_contains
+    status = json.loads(await handlers["playbook_status"](run_id=out["run_id"]))
+    assert doc.expect.error_contains in status["error"]
+    # the proposal round-trips: saved as-is it documents current behavior
+    saved = json.loads(await handlers["playbook_spec_add"](
+        name="crasher", spec_name="pinned-failure", spec_yaml=pin["spec_yaml"],
+    ))
+    assert saved["result"]["passed"] is True, saved
+
+
+@pytest.mark.asyncio
+async def test_spec_from_run_prefers_done_over_newer_failed(env):
+    sf, _, handlers, _ = env
+    code = (
+        "playbook(name='flaky', description='d')\n"
+        "say = tool('send_chat_message', message='{{ inputs.x.y }}')\n"
+    )
+    await handlers["playbook_propose"](
+        name="flaky", code=code, agent_autonomy="agent_may_trigger",
+    )
+    good = json.loads(await handlers["playbook_run"](
+        name="flaky", inputs=json.dumps({"x": {"y": "hi"}}),
+    ))
+    assert good["status"] == "done", good
+    bad = json.loads(await handlers["playbook_run"](
+        name="flaky", inputs=json.dumps({"x": {}}),
+    ))
+    assert bad["status"] == "failed", bad
+    pin = json.loads(await handlers["playbook_spec_from_run"](name="flaky"))
+    assert pin["run_id"] == good["run_id"]  # done wins over newer failed
+    # the failed run is still reachable explicitly
+    pin2 = json.loads(await handlers["playbook_spec_from_run"](
+        name="flaky", run_id=bad["run_id"],
+    ))
+    assert parse_spec_yaml(pin2["spec_yaml"]).expect.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_spec_from_run_rejects_unfinished_run(env):
+    sf, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    pb = await _get(sf, "greeter")
+    async with sf() as s:
+        run = PlaybookRun(playbook_id=pb.id, playbook_version=1, status="running")
+        s.add(run)
+        await s.commit()
+        run_id = str(run.id)
+    out = json.loads(await handlers["playbook_spec_from_run"](
+        name="greeter", run_id=run_id,
+    ))
+    assert "still 'running'" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_status_failed_run_hints_spec_from_run(env):
+    _, _, handlers, _ = env
+    await handlers["playbook_propose"](
+        name="crasher", code=FAIL_CODE, agent_autonomy="agent_may_trigger",
+    )
+    out = json.loads(await handlers["playbook_run"](name="crasher"))
+    assert out["status"] == "failed", out
+    status = json.loads(await handlers["playbook_status"](run_id=out["run_id"]))
+    hint = status.get("hint", "")
+    assert "playbook_spec_from_run" in hint
+    assert "crasher" in hint and out["run_id"] in hint
+
+
 @pytest.mark.asyncio
 async def test_spec_tool_policies(env):
     _, _, _, tools = env

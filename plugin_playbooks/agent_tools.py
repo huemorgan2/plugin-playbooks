@@ -525,6 +525,18 @@ def build_tools(
                     "Still running — poll playbook_status again in a bit. "
                     "Completed steps above already show their outputs."
                 )
+            elif run.status == "failed":
+                # 012 phase 4: a failed run still recorded the REAL outputs
+                # of every step that ran — steer the agent to pin them as
+                # spec stubs before it starts fixing from memory.
+                pb = await session.get(Playbook, run.playbook_id)
+                if pb is not None:
+                    payload["hint"] = (
+                        "Failed — but every step that ran recorded its real "
+                        "output above. Pin those shapes as spec stubs before "
+                        "fixing: playbook_spec_from_run("
+                        f"name='{pb.name}', run_id='{run_id}')."
+                    )
             return json.dumps(payload)
 
     tools.append((
@@ -2214,14 +2226,29 @@ def build_tools(
                     q = q.where(PlaybookRun.id == uuid.UUID(run_id))
                 except ValueError:
                     return json.dumps({"error": f"'{run_id}' is not a run id"})
+                run = (await session.execute(q)).scalars().first()
+                if run is not None and run.status not in ("done", "failed"):
+                    return json.dumps({
+                        "error": f"Run {run_id} is still '{run.status}' — "
+                                 "only finished runs (done or failed) can "
+                                 "be pinned.",
+                    })
             else:
-                q = q.where(PlaybookRun.status == "done").order_by(
-                    PlaybookRun.started_at.desc()
-                ).limit(1)
-            run = (await session.execute(q)).scalars().first()
+                # 012 phase 4: prefer the latest done run, but fall back to
+                # the latest failed one — even a failed run's recorded
+                # outputs are the truth about real tool shapes.
+                run = None
+                for status in ("done", "failed"):
+                    run = (await session.execute(
+                        q.where(PlaybookRun.status == status).order_by(
+                            PlaybookRun.started_at.desc()
+                        ).limit(1)
+                    )).scalars().first()
+                    if run is not None:
+                        break
             if run is None:
                 return json.dumps({
-                    "error": f"No completed run of '{name}' to pin"
+                    "error": f"No finished run of '{name}' to pin"
                              + (f" (run {run_id} not found)" if run_id else "")
                              + ".",
                 })
@@ -2241,6 +2268,12 @@ def build_tools(
                 "and expectations you don't care about (over-tight specs "
                 "fail on harmless changes), give it a name, then save it "
                 "with playbook_spec_add."
+            ) if run.status == "done" else (
+                "This is a PROPOSAL built from a FAILED run: the stubs pin "
+                "the real outputs of every step that DID run — that part is "
+                "the value. The expect block documents the current failure; "
+                "after you fix the code, update expect to the good behavior "
+                "and keep the stubs. Save with playbook_spec_add."
             ),
         })
 
@@ -2249,12 +2282,15 @@ def build_tools(
             name="playbook_spec_from_run",
             description=(
                 "Record & replay: build a spec PROPOSAL from a real "
-                "completed run — recorded tool outputs become stubs, the "
+                "finished run — recorded tool outputs become stubs, the "
                 "run's inputs become fixture inputs, expectations are "
                 "seeded from what the run actually did (status, step order, "
-                "tool call counts). Defaults to the latest completed run; "
-                "pass run_id= to pin a specific one. Returns YAML to trim "
-                "and save via playbook_spec_add — nothing is stored yet."
+                "tool call counts). FAILED runs work too: stubs pin every "
+                "step that DID run, expect documents the failure point. "
+                "Defaults to the latest done run (falls back to the latest "
+                "failed one); pass run_id= to pin a specific run. Returns "
+                "YAML to trim and save via playbook_spec_add — nothing is "
+                "stored yet."
             ),
             parameters={
                 "type": "object",
