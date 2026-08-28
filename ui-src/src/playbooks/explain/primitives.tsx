@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import { STEP_COLORS, type StepDef, type StepKind } from '../types'
+import { IntegrationIcon, toolIconUrl, useIconRef } from '../icons'
 import { tokenizeExpr, tokenizePython, splitTemplate, type Tok, type TokCls } from './tokens'
 
 export const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> = {
@@ -227,12 +228,14 @@ export function StepList({
   steps: StepDef[]
   onSelect?: (step: StepDef) => void
 }) {
+  const iconRef = useIconRef()
   if (!steps.length) return null
   return (
     <div className="space-y-0.5">
       {steps.map((s) => {
         const colors = STEP_COLORS[s.kind] || STEP_COLORS.tool_call
         const Icon = kindIcon(s.kind)
+        const toolUrl = s.kind === 'tool_call' ? toolIconUrl(iconRef, s.tool) : null
         return (
           <button
             key={s.id}
@@ -240,7 +243,12 @@ export function StepList({
             className="w-full flex items-center gap-2 px-2 py-1 rounded-md text-left hover:bg-white/5 transition min-w-0"
             data-steplist-id={s.id}
           >
-            <Icon className={cn('w-3 h-3 shrink-0', colors.text)} />
+            <IntegrationIcon
+              url={toolUrl}
+              fallback={Icon}
+              fallbackClass={cn('w-3 h-3 shrink-0', colors.text)}
+              className="w-3 h-3"
+            />
             <span className={cn('text-[11px] font-mono truncate', colors.text)}>{s.id}</span>
             <span className="text-[10px] text-ink-500 truncate ml-auto shrink-0">
               {KIND_LABELS[s.kind] || s.kind}

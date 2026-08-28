@@ -37,6 +37,7 @@ import { TestsTab } from './TestsTab'
 import { ManifestTab } from './ManifestTab'
 
 import { KIND_LABELS, kindIcon, Code } from './explain/primitives'
+import { IntegrationIcon, toolIconUrl, useIconRef } from './icons'
 import { headline } from './explain/headline'
 import { STEP_EXPLAINERS, DataFlow, FooterChips } from './explain/registry'
 import { findStepById } from './explain/dataflow'
@@ -1042,6 +1043,9 @@ function StepDetailPanel({
   const kind = step.kind as StepKind
   const colors = STEP_COLORS[kind] || STEP_COLORS.tool_call
   const Icon = kindIcon(kind)
+  // plans/011: a tool step's header wears the integration icon.
+  const iconRef = useIconRef()
+  const toolUrl = kind === 'tool_call' ? toolIconUrl(iconRef, step.tool) : null
   // plans/010: per-kind explain renderer, 100% derived from the definition.
   const Explainer = STEP_EXPLAINERS[kind] || STEP_EXPLAINERS.tool_call
   // Loop bodies run once per iteration → many rows. Show the last execution and
@@ -1070,7 +1074,12 @@ function StepDetailPanel({
             kind === 'halt' ? 'bg-rose-800/60' :
             'bg-ink-800/60'
           )}>
-            <Icon className={cn('w-3.5 h-3.5', colors.text)} />
+            <IntegrationIcon
+              url={toolUrl}
+              fallback={Icon}
+              fallbackClass={cn('w-3.5 h-3.5', colors.text)}
+              className="w-3.5 h-3.5"
+            />
           </div>
           <span className={cn('text-[10px] uppercase tracking-[0.16em] font-semibold shrink-0', colors.text)}>
             {KIND_LABELS[kind] || kind}

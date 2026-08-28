@@ -46,6 +46,7 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 _runner: Any = None
 _events: Any = None
 _sync_bindings: Any = None
+_trigger_sources: Any = None
 
 
 def init_routes(
@@ -53,12 +54,15 @@ def init_routes(
     runner: Any,
     events: Any = None,
     sync_bindings: Any = None,
+    trigger_sources: Any = None,
 ) -> None:
-    global _session_factory, _runner, _events, _sync_bindings
+    global _session_factory, _runner, _events, _sync_bindings, _trigger_sources
     _session_factory = sf
     _runner = runner
     _events = events
     _sync_bindings = sync_bindings
+    _trigger_sources = trigger_sources
+    _reset_icon_cache()
 
 
 async def _notify_changed(name: str) -> None:
@@ -212,6 +216,71 @@ def _reset_stats_cache() -> None:
     """Drop the memoised aggregate — used by tests and after a run finishes."""
     global _stats_cache
     _stats_cache = None
+
+
+# plans/011: integration-icon reference. Maps every registered tool to its
+# owning plugin and every advertised trigger to its publisher plugin, so the
+# UI can render real integration icons instead of the generic kind glyphs.
+# Registries change only on plugin (un)load — a short TTL keeps this free.
+
+_ICON_TTL_SECONDS = 300.0
+_icon_cache: dict[str, Any] | None = None
+
+
+def _reset_icon_cache() -> None:
+    global _icon_cache
+    _icon_cache = None
+
+
+async def build_icon_reference(tool_registry: Any, trigger_sources: Any) -> dict[str, Any]:
+    """Assemble {tools: {name: plugin}, triggers: [...]}. Never raises —
+    an unavailable registry just yields an empty section."""
+    tools: dict[str, str] = {}
+    try:
+        for rt in (tool_registry.all() if tool_registry is not None else []):
+            plugin = getattr(rt, "plugin", None)
+            name = getattr(getattr(rt, "definition", None), "name", None)
+            if name and plugin:
+                tools[name] = plugin
+    except Exception as e:  # noqa: BLE001
+        logger.warning("playbooks: icon reference tool scan failed: %s", e)
+
+    triggers: list[dict[str, Any]] = []
+    if trigger_sources is not None:
+        # The registry keys sources by owning plugin; build source→plugin so a
+        # trigger resolves to the plugin whose icon represents it.
+        source_plugin: dict[str, str] = {}
+        for plugin_name, sources in getattr(trigger_sources, "_by_plugin", {}).items():
+            for s in sources:
+                src = getattr(s, "source_name", None)
+                if src:
+                    source_plugin[src] = plugin_name
+        try:
+            infos = await trigger_sources.all_triggers()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: icon reference trigger scan failed: %s", e)
+            infos = []
+        for i in infos:
+            triggers.append({
+                "event_pattern": i.event_pattern,
+                "source": i.source,
+                "app": i.app,
+                "label": i.label,
+                "plugin": source_plugin.get(i.source),
+            })
+    return {"tools": tools, "triggers": triggers}
+
+
+@router.get("/reference/icons")
+async def icon_reference():
+    global _icon_cache
+    now = time.monotonic()
+    if _icon_cache is not None and now - _icon_cache["at"] < _ICON_TTL_SECONDS:
+        return _icon_cache["payload"]
+    tool_registry = getattr(_runner, "_tools", None)
+    payload = await build_icon_reference(tool_registry, _trigger_sources)
+    _icon_cache = {"at": now, "payload": payload}
+    return payload
 
 
 def _aware(dt: datetime | None) -> datetime | None:

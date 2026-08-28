@@ -202,3 +202,27 @@ export type AgentIdentity = { name: string; emoji: string }
 export const identityApi = {
   get: () => apiFetch<AgentIdentity>('/api/p/plugin-identity/'),
 }
+
+// plans/011: integration icons — tool → owning plugin, trigger → publisher
+// plugin, joined client-side with core's plugin list (has_image) and the
+// connectors app logos.
+export type IconReference = {
+  tools: Record<string, string>
+  triggers: {
+    event_pattern: string
+    source: string
+    app: string
+    label: string
+    plugin: string | null
+  }[]
+}
+
+export type PluginListEntry = { name: string; has_image: boolean }
+
+export type ConnectorsStatus = { apps: { slug: string; logo?: string | null }[] }
+
+export const iconsApi = {
+  reference: () => apiFetch<IconReference>(`${BASE}/reference/icons`),
+  plugins: () => apiFetch<PluginListEntry[]>('/api/plugins'),
+  connectorsStatus: () => apiFetch<ConnectorsStatus>('/api/p/plugin-connectors/status'),
+}

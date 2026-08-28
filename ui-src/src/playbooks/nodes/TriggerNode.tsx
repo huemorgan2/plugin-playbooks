@@ -7,6 +7,7 @@ import { memo, useEffect, useState } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Zap, Clock } from 'lucide-react'
 import { cn } from '../../lib/cn'
+import { IntegrationIcon, triggerIconUrl, useIconRef } from '../icons'
 
 interface TriggerNodeData {
   event?: string
@@ -20,6 +21,9 @@ interface TriggerNodeData {
 function TriggerNodeComponent({ data, selected }: NodeProps) {
   const d = data as unknown as TriggerNodeData
   const isCron = !!d.cron
+  // plans/011: event triggers wear the integration's logo (cron keeps Clock).
+  const iconRef = useIconRef()
+  const eventUrl = isCron ? null : triggerIconUrl(iconRef, d.event)
 
   // 006.709: glow-and-fade on live add (slate, matching the trigger color).
   const [glowing, setGlowing] = useState(false)
@@ -57,7 +61,12 @@ function TriggerNodeComponent({ data, selected }: NodeProps) {
         />
         <div className="relative flex items-center gap-2 z-10">
           <div className="w-6 h-6 rounded-md bg-slate-800/60 flex items-center justify-center shrink-0">
-            {isCron ? <Clock className="w-3.5 h-3.5 text-slate-300" /> : <Zap className="w-3.5 h-3.5 text-slate-300" />}
+            <IntegrationIcon
+              url={eventUrl}
+              fallback={isCron ? Clock : Zap}
+              fallbackClass="w-3.5 h-3.5 text-slate-300"
+              className="w-3.5 h-3.5"
+            />
           </div>
           <div className="min-w-0">
             <div className="text-xs font-medium text-slate-200 truncate">{d.label}</div>

@@ -12,6 +12,7 @@ import {
 import { cn } from '../lib/cn'
 import { playbooksApi } from './api'
 import { useAgentName } from './agentIdentity'
+import { IntegrationIcon, toolIconUrl, useIconRef } from './icons'
 import type { SpecEntry, ProbeEntry } from './types'
 import { specsHeadline, probesHeadline, failureWords, TONE_TEXT } from './trust'
 
@@ -221,6 +222,8 @@ function SpecRow({ spec }: { spec: SpecEntry }) {
 }
 
 function ProbeRow({ probe }: { probe: ProbeEntry }) {
+  const iconRef = useIconRef()
+  const toolUrl = toolIconUrl(iconRef, probe.tool)
   const tone = probe.status === 'failed' ? 'bad' as const
     : probe.status === 'ok' ? 'ok' as const : 'warn' as const
   const label = probe.status === 'failed'
@@ -233,6 +236,7 @@ function ProbeRow({ probe }: { probe: ProbeEntry }) {
       title={probe.detail || undefined}
     >
       <Dot tone={tone} />
+      {toolUrl && <IntegrationIcon url={toolUrl} fallback={() => null} className="w-4 h-4" />}
       <span className="text-xs font-mono text-ink-200 truncate flex-1">{probe.tool}</span>
       <span className={cn('text-[10px] shrink-0',
         tone === 'bad' ? 'text-rose-400' : tone === 'ok' ? 'text-emerald-400' : 'text-amber-400',
