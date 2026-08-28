@@ -65,7 +65,7 @@ function TriggerNodeComponent({ data, selected }: NodeProps) {
               url={eventUrl}
               fallback={isCron ? Clock : Zap}
               fallbackClass="w-3.5 h-3.5 text-slate-300"
-              className="w-3.5 h-3.5"
+              className="w-6 h-6 rounded-md"
             />
           </div>
           <div className="min-w-0">

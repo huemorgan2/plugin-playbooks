@@ -114,7 +114,7 @@ function StepNodeComponent({ data, selected }: NodeProps) {
               url={toolUrl}
               fallback={Icon}
               fallbackClass={cn('w-3.5 h-3.5', colors.text)}
-              className="w-3.5 h-3.5"
+              className="w-6 h-6 rounded-md"
             />
           </div>
           <div className="min-w-0 flex-1">

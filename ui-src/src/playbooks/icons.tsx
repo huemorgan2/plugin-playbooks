@@ -31,15 +31,21 @@ export function buildIconRef(
   const pluginIcon = (plugin: string | null | undefined): string | null =>
     plugin && hasImage.has(plugin) ? `${base}/api/plugins/${encodeURIComponent(plugin)}/icon` : null
 
-  const toolIcons: Record<string, string> = {}
-  for (const [tool, plugin] of Object.entries(reference.tools || {})) {
-    const url = pluginIcon(plugin)
-    if (url) toolIcons[tool] = url
-  }
-
   const appLogos: Record<string, string> = {}
   for (const a of connectors?.apps || []) {
     if (a.logo) appLogos[a.slug] = a.logo
+  }
+
+  // Connectors registers each app's tools under "plugin-connectors:app:<slug>"
+  // so they get the real integration logo (Composio CDN), not the plugin icon.
+  const connectorApp = /^plugin-connectors:app:(.+)$/
+  const toolIcons: Record<string, string> = {}
+  for (const [tool, plugin] of Object.entries(reference.tools || {})) {
+    const app = plugin?.match(connectorApp)?.[1]
+    const url = app
+      ? appLogos[app] || pluginIcon('plugin-connectors')
+      : pluginIcon(plugin)
+    if (url) toolIcons[tool] = url
   }
 
   const triggerIcons: { pattern: string; url: string }[] = []

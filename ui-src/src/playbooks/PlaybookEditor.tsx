@@ -1078,7 +1078,7 @@ function StepDetailPanel({
               url={toolUrl}
               fallback={Icon}
               fallbackClass={cn('w-3.5 h-3.5', colors.text)}
-              className="w-3.5 h-3.5"
+              className="w-6 h-6 rounded-md"
             />
           </div>
           <span className={cn('text-[10px] uppercase tracking-[0.16em] font-semibold shrink-0', colors.text)}>

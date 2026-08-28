@@ -40,6 +40,28 @@ describe('buildIconRef', () => {
     expect(toolIconUrl(ref, undefined)).toBeNull()
   })
 
+  it('uses the Composio app logo for connectors app-owned tools', () => {
+    const connectors: ConnectorsStatus = {
+      apps: [{ slug: 'gmail', logo: 'https://cdn.example/gmail.png' }, { slug: 'slack', logo: null }],
+    }
+    const ref = buildIconRef(
+      reference({
+        tools: {
+          composio__gmail__send_email: 'plugin-connectors:app:gmail',
+          composio__slack__send_message: 'plugin-connectors:app:slack',
+          connector_search_apps: 'plugin-connectors',
+        },
+      }),
+      plugins,
+      connectors,
+    )
+    expect(toolIconUrl(ref, 'composio__gmail__send_email')).toBe('https://cdn.example/gmail.png')
+    // app without a CDN logo → the connectors plugin icon
+    expect(toolIconUrl(ref, 'composio__slack__send_message')).toBe('/api/plugins/plugin-connectors/icon')
+    // management tools stay on the plugin icon
+    expect(toolIconUrl(ref, 'connector_search_apps')).toBe('/api/plugins/plugin-connectors/icon')
+  })
+
   it('prefers the real integration logo for connector triggers', () => {
     const connectors: ConnectorsStatus = {
       apps: [{ slug: 'gmail', logo: 'https://cdn.example/gmail.png' }, { slug: 'slack', logo: null }],
