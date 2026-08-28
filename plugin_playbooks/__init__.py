@@ -473,7 +473,11 @@ PROMOTE GATE — a failing spec blocks `playbook_promote` until the code is
 fixed or the spec is updated.
 - After a good real run, prefer `playbook_spec_from_run(name)` — it turns the
 recorded run into a spec proposal (stubs from real outputs); trim it and save
-with `playbook_spec_add(name, spec_name, spec_yaml)`.
+with `playbook_spec_add`.
+- BATCH your specs: write ALL the specs you intend to add in ONE
+`playbook_spec_add(name, specs=...)` call (`specs` = YAML mapping of
+spec-name → spec body). One call per spec wastes the owner's time; the
+single `spec_name`+`spec_yaml` form is for touching up one spec.
 - `playbook_spec_run(name)` runs all specs on demand (candidate by default);
 `playbook_spec_list(name)` shows each spec's last result.
 - A playbook with no specs has no safety net: when you finish meaningful
@@ -528,7 +532,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.16.0",
+        version="0.17.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

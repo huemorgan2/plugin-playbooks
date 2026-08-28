@@ -70,6 +70,40 @@ def parse_spec_yaml(text: str) -> SpecDef:
         raise ValueError("Spec is invalid: " + "; ".join(lines)) from e
 
 
+def parse_spec_batch_yaml(text: str) -> tuple[dict[str, SpecDef], dict[str, str]]:
+    """Parse a batch document — a YAML mapping of spec-name → spec body.
+
+    Per-spec schema violations land in the errors dict under that spec's
+    name and do NOT abort the sibling specs; only a document that isn't a
+    mapping at the top level raises.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Batch is not valid YAML: {e}") from e
+    if not isinstance(data, dict) or not data:
+        raise ValueError(
+            "Batch must be a non-empty YAML mapping of spec-name → spec body "
+            "(each body: inputs, stubs, expect)."
+        )
+    parsed: dict[str, SpecDef] = {}
+    errors: dict[str, str] = {}
+    for spec_name, body in data.items():
+        key = str(spec_name)
+        if not isinstance(body, dict):
+            errors[key] = "Spec body must be a mapping (keys: inputs, stubs, expect)."
+            continue
+        try:
+            parsed[key] = SpecDef.model_validate(body)
+        except ValidationError as e:
+            lines = [
+                f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+                for err in e.errors()
+            ]
+            errors[key] = "Spec is invalid: " + "; ".join(lines)
+    return parsed, errors
+
+
 def _contains(expected: Any, actual: Any) -> bool:
     """Subset/substring match: dicts recurse per key, strings match by
     substring (against the string form of the actual value), everything else

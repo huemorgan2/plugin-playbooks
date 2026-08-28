@@ -492,3 +492,110 @@ async def test_undefined_ref_error_names_real_keys(env):
     assert "steps.fetch.result.rows does not exist" in out["error"]
     assert "_dry" in out["error"]  # the real key present at that level
     assert "schemaless llm_step" not in out["error"]
+
+
+# ---- batch spec_add (plans/012 phase 1) ------------------------------------
+
+BATCH_OK = (
+    "mentions-name:\n"
+    "  description: greeting mentions the name\n"
+    "  inputs: {greeting: 'hi Roy'}\n"
+    "  expect:\n"
+    "    status: done\n"
+    "    tool_calls:\n"
+    "      send_chat_message: {count: 1, args_contain: {message: 'Roy'}}\n"
+    "wrong-name:\n"
+    "  inputs: {greeting: 'hi Roy'}\n"
+    "  expect:\n"
+    "    tool_calls:\n"
+    "      send_chat_message: {args_contain: {message: 'Slartibartfast'}}\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_spec_add_batch_upserts_and_runs_suite_once(env):
+    sf, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    out = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", specs=BATCH_OK,
+    ))
+    assert out["specs"] == {"mentions-name": "created", "wrong-name": "created"}
+    assert out["total"] == 2
+    assert out["passed"] == 1
+    assert out["failed"] == 1
+    assert "warning" in out  # a failing spec was stored → promote gate warning
+    async with sf() as s:
+        rows = (await s.execute(select(PlaybookSpec))).scalars().all()
+    assert len(rows) == 2
+
+    # second batch touching one existing spec → updated, still 2 rows
+    out2 = json.loads(await handlers["playbook_spec_add"](
+        name="greeter",
+        specs=(
+            "wrong-name:\n"
+            "  inputs: {greeting: 'hi Roy'}\n"
+            "  expect:\n"
+            "    tool_calls:\n"
+            "      send_chat_message: {args_contain: {message: 'Roy'}}\n"
+        ),
+    ))
+    assert out2["specs"] == {"wrong-name": "updated"}
+    assert out2["failed"] == 0
+    assert "warning" not in out2
+    async with sf() as s:
+        rows = (await s.execute(select(PlaybookSpec))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_spec_add_batch_partial_parse_failure_keeps_good_specs(env):
+    sf, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    batch = (
+        "good:\n"
+        "  inputs: {greeting: 'hi Roy'}\n"
+        "  expect: {status: done}\n"
+        "bad:\n"
+        "  expect: {status: maybe}\n"
+    )
+    out = json.loads(await handlers["playbook_spec_add"](name="greeter", specs=batch))
+    assert out["specs"] == {"good": "created"}
+    assert "bad" in out["spec_errors"]
+    assert "note" in out
+    async with sf() as s:
+        rows = (await s.execute(select(PlaybookSpec))).scalars().all()
+    assert [r.name for r in rows] == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_spec_add_batch_all_bad_stores_nothing(env):
+    sf, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    out = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", specs="bad: {expect: {status: maybe}}",
+    ))
+    assert "error" in out
+    assert "bad" in out["spec_errors"]
+    async with sf() as s:
+        rows = (await s.execute(select(PlaybookSpec))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_spec_add_form_validation(env):
+    _, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    both = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", spec_name="x", spec_yaml=SPEC_OK, specs=BATCH_OK,
+    ))
+    assert "not both" in both["error"]
+    neither = json.loads(await handlers["playbook_spec_add"](name="greeter"))
+    assert "specs=" in neither["error"]
+    half = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", spec_name="x",
+    ))
+    assert "both spec_name and spec_yaml" in half["error"]
+    not_map = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", specs="- a\n- b\n",
+    ))
+    assert "mapping" in not_map["error"]

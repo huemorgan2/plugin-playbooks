@@ -36,7 +36,7 @@ from .models import (
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
 from .reference import LANGUAGE_CHEATSHEET
-from .specs import parse_spec_yaml, run_all_specs, spec_from_run
+from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 
 
@@ -1847,50 +1847,101 @@ def build_tools(
             return f"No stored content for version {n}."
         return _shim_playbook(playbook, row), n
 
-    async def _spec_add(*, name: str, spec_name: str, spec_yaml: str) -> str:
-        try:
-            spec = parse_spec_yaml(spec_yaml)
-        except ValueError as e:
-            return json.dumps({"error": str(e)})
+    async def _spec_add(
+        *, name: str, spec_name: str = "", spec_yaml: str = "", specs: str = "",
+    ) -> str:
+        # plans/012 phase 1: one call carries the whole suite. Two forms —
+        # single (spec_name + spec_yaml, unchanged) or batch (specs= mapping
+        # of spec-name → spec body). Batch upserts everything, then runs the
+        # suite ONCE.
+        single = bool(spec_name or spec_yaml)
+        if single and specs:
+            return json.dumps({"error": (
+                "Provide either spec_name+spec_yaml (one spec) or specs= "
+                "(batch) — not both."
+            )})
+        if single and not (spec_name and spec_yaml):
+            return json.dumps({"error": "A single spec needs both spec_name and spec_yaml."})
+        parse_errors: dict[str, str] = {}
+        if single:
+            try:
+                parsed = {spec_name: parse_spec_yaml(spec_yaml)}
+            except ValueError as e:
+                return json.dumps({"error": str(e)})
+        else:
+            if not specs:
+                return json.dumps({"error": (
+                    "Provide spec_name+spec_yaml (one spec) or specs= — a "
+                    "YAML mapping of spec-name → spec body. Prefer specs=: "
+                    "write ALL the specs you intend to add in ONE call."
+                )})
+            try:
+                parsed, parse_errors = parse_spec_batch_yaml(specs)
+            except ValueError as e:
+                return json.dumps({"error": str(e)})
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
-            row = (await session.execute(
-                select(PlaybookSpec).where(
-                    PlaybookSpec.playbook_id == playbook.id,
-                    PlaybookSpec.name == spec_name,
-                )
-            )).scalar_one_or_none()
-            action = "updated" if row else "created"
-            if row is None:
-                row = PlaybookSpec(
-                    playbook_id=playbook.id, name=spec_name, created_by="agent",
-                    spec=spec.model_dump(mode="json", exclude_none=True),
-                )
-                session.add(row)
-            else:
-                row.spec = spec.model_dump(mode="json", exclude_none=True)
+            actions: dict[str, str] = {}
+            for s_name, spec in parsed.items():
+                row = (await session.execute(
+                    select(PlaybookSpec).where(
+                        PlaybookSpec.playbook_id == playbook.id,
+                        PlaybookSpec.name == s_name,
+                    )
+                )).scalar_one_or_none()
+                actions[s_name] = "updated" if row else "created"
+                if row is None:
+                    row = PlaybookSpec(
+                        playbook_id=playbook.id, name=s_name, created_by="agent",
+                        spec=spec.model_dump(mode="json", exclude_none=True),
+                    )
+                    session.add(row)
+                else:
+                    row.spec = spec.model_dump(mode="json", exclude_none=True)
+            if not parsed:
+                return json.dumps({
+                    "error": "No spec in the batch parsed — nothing stored.",
+                    "spec_errors": parse_errors,
+                })
             resolved = await _spec_target(session, playbook, "auto")
             if isinstance(resolved, str):
                 return json.dumps({"error": resolved})
             target, version_n = resolved
             summary = await run_all_specs(
                 session, runner, playbook.id, target, version_n,
-                only_name=spec_name,
+                only_name=spec_name if single else None,
             )
             await session.commit()
-        res = summary["results"][0] if summary["results"] else None
-        out: dict[str, Any] = {
-            "playbook": name, "spec": spec_name, "status": action,
-            "ran_against_version": version_n, "result": res,
+        if single:
+            res = summary["results"][0] if summary["results"] else None
+            out: dict[str, Any] = {
+                "playbook": name, "spec": spec_name, "status": actions[spec_name],
+                "ran_against_version": version_n, "result": res,
+            }
+            if res and not res["passed"]:
+                out["warning"] = (
+                    "The spec FAILS against the current content — it was stored "
+                    "anyway. playbook_promote will refuse while it fails."
+                )
+            return json.dumps(out)
+        out = {
+            "playbook": name, "specs": actions,
+            "ran_against_version": version_n, **summary,
         }
-        if res and not res["passed"]:
+        if parse_errors:
+            out["spec_errors"] = parse_errors
+            out["note"] = (
+                f"{len(parse_errors)} spec(s) failed to parse and were NOT "
+                "stored — fix and resend just those in one specs= call."
+            )
+        if summary.get("failed"):
             out["warning"] = (
-                "The spec FAILS against the current content — it was stored "
-                "anyway. playbook_promote will refuse while it fails."
+                "Failing specs were stored anyway — playbook_promote will "
+                "refuse while any spec fails."
             )
         return json.dumps(out)
 
@@ -1898,15 +1949,18 @@ def build_tools(
         ToolDef(
             name="playbook_spec_add",
             description=(
-                "Add or update (upsert by spec_name) a SPEC — a stored test "
-                "for a playbook: fixture inputs, scripted stubs for "
+                "Add or update (upsert by name) SPECS — stored tests for a "
+                "playbook: fixture inputs, scripted stubs for "
                 "tool/agent/llm steps, and assertions over the dry-run "
-                "trace. YAML keys: description, inputs {..}, stubs "
+                "trace. PREFER BATCH: write ALL the specs you intend to add "
+                "in ONE call via specs= (a YAML mapping of spec-name → spec "
+                "body) — never one call per spec. Spec body keys: "
+                "description, inputs {..}, stubs "
                 "{step_id_or_tool_name: scripted_output}, expect {status: "
                 "done|failed, steps_ran: [ids in order], steps_not_ran: "
                 "[ids], tool_calls: {tool: {count, args_contain: {..}}}, "
                 "output_contains: {step_id: substring}, error_contains}. "
-                "The spec runs immediately against the candidate (or live "
+                "Specs run immediately against the candidate (or live "
                 "when none) and on every future candidate save; a failing "
                 "spec blocks playbook_promote."
             ),
@@ -1914,10 +1968,18 @@ def build_tools(
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
-                    "spec_name": {"type": "string", "description": "Spec name (unique per playbook)"},
-                    "spec_yaml": {"type": "string", "description": "The spec document (YAML)"},
+                    "specs": {
+                        "type": "string",
+                        "description": (
+                            "BATCH (preferred): YAML mapping of spec-name → "
+                            "spec body. All are upserted, then the whole "
+                            "suite runs once."
+                        ),
+                    },
+                    "spec_name": {"type": "string", "description": "Single form: spec name (unique per playbook)"},
+                    "spec_yaml": {"type": "string", "description": "Single form: the spec document (YAML)"},
                 },
-                "required": ["name", "spec_name", "spec_yaml"],
+                "required": ["name"],
             },
         ),
         _spec_add,
