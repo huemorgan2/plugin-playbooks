@@ -1,7 +1,19 @@
 # 012 / phase 4 — real shapes first
 
-Status: DRAFT (to be finalized after phase 3's execution summary; update
-this file with earlier learnings before starting).
+Status: READY (updated 2026-08-28 from phase-3 learnings; baseline
+0.21.0 `3d07f8a`, 190 tests green).
+
+## Learnings carried in from phases 2–3
+
+- The skill body is byte-budgeted: `test_payload_diet_budgets` pins it
+  at ≤12,288B and it sits at 12,258B. The new skill prose line (scope
+  item 3) must fit — trim elsewhere in the body, never raise the budget.
+- Re-sync git + the three version stamps immediately before bumping
+  (concurrent session ships in this repo).
+- CDP tenant verify: open a fresh tab (PUT /json/new + Page.navigate
+  over its websocket) if no luna.com.ai tab exists; proxy-login returns
+  `access_token` (not `token`).
+- expire_on_commit: capture ORM attribute values before `commit()`.
 
 ## Scope (from PLAN.md, pre-phase-2 draft)
 
