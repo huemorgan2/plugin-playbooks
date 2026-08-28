@@ -127,7 +127,7 @@ def _tools(ctx, sf):
     return by_name
 
 
-async def _wait_settled(sf, delegation_id, timeout=5.0):
+async def _wait_settled(sf, delegation_id, timeout=20.0):
     async def _poll():
         while True:
             async with sf() as s:

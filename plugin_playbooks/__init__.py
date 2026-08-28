@@ -474,7 +474,7 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
     return "\n".join(lines)
 
 
-# 0.24.0 (plans/013): the delegation tools get their OWN small skill — gating
+# 0.25.0 (plans/013): the delegation tools get their OWN small skill — gating
 # them behind playbook-authoring would drag the ~12KB skill body into the MAIN
 # conversation just to unlock the tool, defeating the context-hygiene point.
 # The delegate itself receives the full authoring skill in ITS context.
@@ -518,7 +518,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.24.0",
+        version="0.25.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -564,7 +564,7 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_language_reference",
                 ],
             ),
-            # 0.24.0 (plans/013): small skill, big tool — see
+            # 0.25.0 (plans/013): small skill, big tool — see
             # _DELEGATION_SKILL_BODY for why this is not in playbook-authoring.
             SkillDef(
                 name="playbook-delegation",
@@ -667,7 +667,7 @@ class PlaybooksPlugin(LunaPlugin):
         ):
             self._register_tool(ctx, tool_def, handler)
 
-        # 0.24.0 (plans/013): delegation tools + restart hygiene for rows a
+        # 0.25.0 (plans/013): delegation tools + restart hygiene for rows a
         # dead process left at "running". Never block the load on the sweep.
         from .delegation import build_delegation_tools, sweep_orphaned_delegations
 
@@ -744,7 +744,7 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_language_reference",
     )
 
-    # 0.24.0 (plans/013): gated by the playbook-delegation skill (its own
+    # 0.25.0 (plans/013): gated by the playbook-delegation skill (its own
     # small SkillDef, NOT playbook-authoring — see _DELEGATION_SKILL_BODY).
     # Both are chat-only surfaces; the degrade-visible rule for muted turns
     # does not apply.

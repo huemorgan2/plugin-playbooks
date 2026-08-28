@@ -237,7 +237,7 @@ class PlaybookProbeResult(Base):
 
 
 class PlaybookDelegation(Base):
-    """0.24.0 (plans/013): a delegated authoring job — one focused background
+    """0.25.0 (plans/013): a delegated authoring job — one focused background
     agent turn working on playbooks with its own context. `events` is the
     live feed the progress card polls (list of {ts, phase, kind, label,
     detail, ms}); `card_token` is the capability secret baked into the card
