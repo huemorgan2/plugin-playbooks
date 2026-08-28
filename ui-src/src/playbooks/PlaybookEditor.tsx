@@ -38,7 +38,8 @@ import { ManifestTab } from './ManifestTab'
 
 import { KIND_LABELS, kindIcon } from './explain/primitives'
 import { headline } from './explain/headline'
-import { STEP_EXPLAINERS } from './explain/registry'
+import { STEP_EXPLAINERS, DataFlow, FooterChips } from './explain/registry'
+import { findStepById } from './explain/dataflow'
 
 const nodeTypes = {
   stepNode: StepNode,
@@ -52,53 +53,6 @@ type ViewMode = 'canvas' | 'code' | 'manifest' | 'tests' | 'runs'
 type Props =
   | { name: string; draftId?: undefined; onBack: () => void }
   | { name?: undefined; draftId: string; onBack: () => void }
-
-function fmtStateOp(o: { op: string; var: string; value?: any; into?: string }): string {
-  const v =
-    o.value === undefined ? ''
-      : typeof o.value === 'string' ? ` = ${o.value}`
-      : ` = ${JSON.stringify(o.value)}`
-  const into = o.into ? ` → ${o.into}` : ''
-  return `${o.op} ${o.var}${v}${into}`
-}
-
-// 007.009.01: surface EVERY relevant StepDef field so a node click is a complete
-// static spec — the half-populated panel was a real debugging gap.
-function stepDetailRows(step: StepDef): { label: string; value: string }[] {
-  const rows: { label: string; value: string }[] = []
-  if (step.tool) rows.push({ label: 'Tool', value: step.tool })
-  if (step.args) rows.push({ label: 'Args', value: JSON.stringify(step.args, null, 2) })
-  if (step.prompt) rows.push({ label: 'Prompt', value: step.prompt })
-  if (step.system) rows.push({ label: 'System', value: step.system })
-  if (step.purpose) rows.push({ label: 'Purpose', value: step.purpose })
-  if (step.model) rows.push({ label: 'Model', value: step.model })
-  if (step.output_schema) rows.push({ label: 'Output schema', value: JSON.stringify(step.output_schema, null, 2) })
-  if (step.tools?.length) rows.push({ label: 'Tools', value: step.tools.join(', ') })
-  if (step.when) rows.push({ label: 'Condition', value: step.when })
-  if (step.event) rows.push({ label: 'Event', value: step.event })
-  if (step.event_filter) rows.push({ label: 'Event filter', value: JSON.stringify(step.event_filter, null, 2) })
-  if (step.playbook) rows.push({ label: 'Subtask', value: step.playbook })
-  if (step.inputs_map) rows.push({ label: 'Inputs map', value: JSON.stringify(step.inputs_map, null, 2) })
-  if (step.returns) rows.push({ label: 'Returns', value: JSON.stringify(step.returns, null, 2) })
-  if (step.over) rows.push({ label: 'Loop over', value: typeof step.over === 'string' ? step.over : JSON.stringify(step.over) })
-  if (step.while) rows.push({ label: 'While', value: step.while })
-  if (step.until) rows.push({ label: 'Until', value: step.until })
-  if (step.break_when) rows.push({ label: 'Break when', value: step.break_when })
-  if (step.concurrency && step.concurrency > 1) rows.push({ label: 'Concurrency', value: String(step.concurrency) })
-  if (step.collect) rows.push({ label: 'Collect', value: step.collect })
-  if (step.item_name) rows.push({ label: 'Item name', value: step.item_name })
-  if (step.max_iterations) rows.push({ label: 'Max iterations', value: String(step.max_iterations) })
-  if (step.state?.length) rows.push({ label: 'State ops', value: step.state.map(fmtStateOp).join('\n') })
-  if (step.kind === 'halt' && step.value !== undefined)
-    rows.push({ label: 'Return value', value: typeof step.value === 'string' ? step.value : JSON.stringify(step.value, null, 2) })
-  if (step.fan_in) rows.push({ label: 'Fan-in', value: step.fan_in })
-  if (step.branches?.length) rows.push({ label: 'Branches', value: `${step.branches.length} parallel paths` })
-  if (step.timeout_seconds) rows.push({ label: 'Timeout', value: `${step.timeout_seconds}s` })
-  if (step.on_error && step.on_error !== 'abort') rows.push({ label: 'On error', value: step.on_error })
-  if (step.retry?.max) rows.push({ label: 'Retry', value: `${step.retry.max}x, ${step.retry.backoff_seconds}s backoff` })
-  if (step.show?.length) rows.push({ label: 'Show', value: step.show.join(', ') })
-  return rows
-}
 
 // All run-detail rows for one step id (a loop body step runs once per iteration).
 function execRowsForStep(run: PlaybookRunDetail | null, stepId: string): StepRunDetail[] {
@@ -810,6 +764,10 @@ export function PlaybookEditor(props: Props) {
             hasRun={!!runDetail}
             onClose={() => setSelectedStep(null)}
             onSelectStep={setSelectedStep}
+            onJumpToStep={(id) => {
+              const hit = findStepById(canvasDef?.steps || [], id)
+              if (hit) setSelectedStep(hit)
+            }}
           />
         )}
 
@@ -1074,21 +1032,20 @@ function fmtDuration(start: string | null, end: string | null): string | null {
 }
 
 function StepDetailPanel({
-  step, execRows, hasRun, onClose, onSelectStep,
+  step, execRows, hasRun, onClose, onSelectStep, onJumpToStep,
 }: {
   step: StepDef
   execRows: StepRunDetail[]
   hasRun: boolean
   onClose: () => void
   onSelectStep: (s: StepDef) => void
+  onJumpToStep: (id: string) => void
 }) {
   const kind = step.kind as StepKind
   const colors = STEP_COLORS[kind] || STEP_COLORS.tool_call
   const Icon = kindIcon(kind)
-  // plans/010: per-kind explain renderer; kinds not yet converted fall back to
-  // the legacy label/value rows (fallback removed in phase 2).
-  const Explainer = STEP_EXPLAINERS[kind]
-  const rows = Explainer ? [] : stepDetailRows(step)
+  // plans/010: per-kind explain renderer, 100% derived from the definition.
+  const Explainer = STEP_EXPLAINERS[kind] || STEP_EXPLAINERS.tool_call
   // Loop bodies run once per iteration → many rows. Show the last execution and
   // note the count.
   const lastExec = execRows[execRows.length - 1] || null
@@ -1142,24 +1099,11 @@ function StepDetailPanel({
           </p>
         )}
 
-        {Explainer && <Explainer step={step} onSelectStep={onSelectStep} />}
+        <Explainer step={step} onSelectStep={onSelectStep} />
 
-        {!Explainer && rows.length > 0 && (
-          <div className="space-y-2">
-            <div className="text-[10px] uppercase tracking-wider text-ink-600">Configuration</div>
-            {rows.map((r) => (
-              <div key={r.label}>
-                <div className="text-[10px] text-ink-500 mb-0.5">{r.label}</div>
-                <div className={cn(
-                  'text-xs text-ink-300',
-                  r.value.includes('\n') ? 'font-mono whitespace-pre-wrap text-[10px] bg-ink-900/60 rounded p-2' : '',
-                )}>
-                  {r.value}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+        <FooterChips step={step} />
+
+        <DataFlow step={step} onJumpToStep={onJumpToStep} />
 
         {/* 007.009.01: execution detail for the selected run */}
         {hasRun && (

@@ -66,6 +66,7 @@ export interface StepDef {
   value?: any
   show?: string[]
   timeout_seconds?: number
+  timeout?: number
   retry?: { max: number; backoff_seconds: number }
   on_error?: string
 }
