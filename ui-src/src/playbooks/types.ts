@@ -48,7 +48,7 @@ export interface StepDef {
   playbook?: string
   inputs_map?: Record<string, string>
   returns?: Record<string, string>
-  over?: string
+  over?: string | any[]
   body?: StepDef[]
   until?: string
   while?: string
@@ -58,6 +58,9 @@ export interface StepDef {
   item_name?: string
   collect?: string
   max_iterations?: number
+  // code (plans/004): jailed python; return value → steps.<id>.result
+  source?: string
+  code_inputs?: Record<string, any>
   // state / halt
   state?: StateOp[]
   value?: any

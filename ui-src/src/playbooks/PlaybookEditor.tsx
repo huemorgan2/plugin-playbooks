@@ -15,10 +15,8 @@ import '@xyflow/react/dist/style.css'
 import {
   ArrowLeft, Play, FileCode, Eye, Loader2, Rocket, Workflow,
   X, ChevronDown, ChevronRight, Settings, History,
-  Bot, Wrench, GitBranch, Layers, Clock, Mail, RotateCcw, ExternalLink, Zap,
-  ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle, Copy, Sparkles,
-  Database, Ban, FileText, FlaskConical,
-  Code2,
+  ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle, Copy,
+  FileText, FlaskConical,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { StepNode } from './nodes/StepNode'
@@ -38,6 +36,10 @@ import { RunsTab } from './RunsTab'
 import { TestsTab } from './TestsTab'
 import { ManifestTab } from './ManifestTab'
 
+import { KIND_LABELS, kindIcon } from './explain/primitives'
+import { headline } from './explain/headline'
+import { STEP_EXPLAINERS } from './explain/registry'
+
 const nodeTypes = {
   stepNode: StepNode,
   triggerNode: TriggerNode,
@@ -50,21 +52,6 @@ type ViewMode = 'canvas' | 'code' | 'manifest' | 'tests' | 'runs'
 type Props =
   | { name: string; draftId?: undefined; onBack: () => void }
   | { name?: undefined; draftId: string; onBack: () => void }
-
-const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> = {
-  agent_step: Bot,
-  llm_step: Sparkles,
-  tool_call: Wrench,
-  condition: GitBranch,
-  parallel: Layers,
-  wait_for_approval: Clock,
-  wait_for_event: Mail,
-  subtask: ExternalLink,
-  loop: RotateCcw,
-  state: Database,
-  halt: Ban,
-  code: Code2,
-}
 
 function fmtStateOp(o: { op: string; var: string; value?: any; into?: string }): string {
   const v =
@@ -93,7 +80,7 @@ function stepDetailRows(step: StepDef): { label: string; value: string }[] {
   if (step.playbook) rows.push({ label: 'Subtask', value: step.playbook })
   if (step.inputs_map) rows.push({ label: 'Inputs map', value: JSON.stringify(step.inputs_map, null, 2) })
   if (step.returns) rows.push({ label: 'Returns', value: JSON.stringify(step.returns, null, 2) })
-  if (step.over) rows.push({ label: 'Loop over', value: step.over })
+  if (step.over) rows.push({ label: 'Loop over', value: typeof step.over === 'string' ? step.over : JSON.stringify(step.over) })
   if (step.while) rows.push({ label: 'While', value: step.while })
   if (step.until) rows.push({ label: 'Until', value: step.until })
   if (step.break_when) rows.push({ label: 'Break when', value: step.break_when })
@@ -822,6 +809,7 @@ export function PlaybookEditor(props: Props) {
             execRows={execRowsForStep(runDetail, selectedStep.id)}
             hasRun={!!runDetail}
             onClose={() => setSelectedStep(null)}
+            onSelectStep={setSelectedStep}
           />
         )}
 
@@ -1086,46 +1074,53 @@ function fmtDuration(start: string | null, end: string | null): string | null {
 }
 
 function StepDetailPanel({
-  step, execRows, hasRun, onClose,
+  step, execRows, hasRun, onClose, onSelectStep,
 }: {
   step: StepDef
   execRows: StepRunDetail[]
   hasRun: boolean
   onClose: () => void
+  onSelectStep: (s: StepDef) => void
 }) {
   const kind = step.kind as StepKind
   const colors = STEP_COLORS[kind] || STEP_COLORS.tool_call
-  const Icon = KIND_ICONS[kind] || Zap
-  const rows = stepDetailRows(step)
+  const Icon = kindIcon(kind)
+  // plans/010: per-kind explain renderer; kinds not yet converted fall back to
+  // the legacy label/value rows (fallback removed in phase 2).
+  const Explainer = STEP_EXPLAINERS[kind]
+  const rows = Explainer ? [] : stepDetailRows(step)
   // Loop bodies run once per iteration → many rows. Show the last execution and
   // note the count.
   const lastExec = execRows[execRows.length - 1] || null
   // 006.714: raw JSON is hidden by default — humans read the one-line summary.
   const [showRaw, setShowRaw] = useState(false)
+  const [showRawDef, setShowRawDef] = useState(false)
 
   return (
-    <div className="w-[320px] shrink-0 border-l border-white/5 bg-ink-950/80 backdrop-blur-sm overflow-y-auto">
+    <div className="w-[420px] shrink-0 border-l border-white/5 bg-ink-950/80 backdrop-blur-sm overflow-y-auto">
+      {/* Eyebrow row: kind + id. The bottom line lives right below as the headline. */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
         <div className="flex items-center gap-2 min-w-0">
           <div className={cn(
             'w-6 h-6 rounded-md flex items-center justify-center shrink-0',
             kind === 'agent_step' ? 'bg-indigo-800/60' :
+            kind === 'llm_step' ? 'bg-fuchsia-800/60' :
             kind === 'tool_call' ? 'bg-teal-800/60' :
             kind === 'condition' ? 'bg-amber-800/60' :
             kind === 'wait_for_approval' || kind === 'wait_for_event' ? 'bg-orange-800/60' :
+            kind === 'subtask' ? 'bg-violet-800/60' :
             kind === 'loop' ? 'bg-purple-800/60' :
             kind === 'state' ? 'bg-emerald-800/60' :
+            kind === 'code' ? 'bg-cyan-800/60' :
             kind === 'halt' ? 'bg-rose-800/60' :
             'bg-ink-800/60'
           )}>
             <Icon className={cn('w-3.5 h-3.5', colors.text)} />
           </div>
-          <div className="min-w-0">
-            <div className={cn('text-xs font-semibold truncate', colors.text)}>
-              {step.id}
-            </div>
-            <div className="text-[10px] text-ink-500 capitalize">{kind.replace(/_/g, ' ')}</div>
-          </div>
+          <span className={cn('text-[10px] uppercase tracking-[0.16em] font-semibold shrink-0', colors.text)}>
+            {KIND_LABELS[kind] || kind}
+          </span>
+          <span className="text-[10px] font-mono text-ink-500 truncate">{step.id}</span>
         </div>
         <button
           onClick={onClose}
@@ -1136,14 +1131,20 @@ function StepDetailPanel({
       </div>
 
       <div className="px-4 py-3 space-y-3">
+        {/* Bottom line first — generated from the definition, never from prose. */}
+        <div className="text-sm font-semibold text-ink-100 leading-snug" data-testid="step-headline">
+          {headline(step)}
+        </div>
+
         {step.explanation && (
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-ink-600 mb-1">Explanation</div>
-            <p className="text-xs text-ink-300 leading-relaxed">{step.explanation}</p>
-          </div>
+          <p className="text-xs text-ink-400 leading-relaxed border-l-2 border-white/10 pl-2.5">
+            {step.explanation}
+          </p>
         )}
 
-        {rows.length > 0 && (
+        {Explainer && <Explainer step={step} onSelectStep={onSelectStep} />}
+
+        {!Explainer && rows.length > 0 && (
           <div className="space-y-2">
             <div className="text-[10px] uppercase tracking-wider text-ink-600">Configuration</div>
             {rows.map((r) => (
@@ -1158,10 +1159,6 @@ function StepDetailPanel({
               </div>
             ))}
           </div>
-        )}
-
-        {!step.explanation && rows.length === 0 && (
-          <p className="text-xs text-ink-600 italic">No static config for this step.</p>
         )}
 
         {/* 007.009.01: execution detail for the selected run */}
@@ -1256,6 +1253,23 @@ function StepDetailPanel({
             )}
           </div>
         )}
+
+        {/* plans/010: the escape hatch — the exact stored definition, collapsed. */}
+        <div className="pt-2 border-t border-white/5">
+          <button
+            onClick={() => setShowRawDef((v) => !v)}
+            className="flex items-center gap-1 text-[10px] text-ink-500 hover:text-ink-300 transition"
+            data-testid="raw-def-toggle"
+          >
+            {showRawDef ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+            Raw definition
+          </button>
+          {showRawDef && (
+            <pre className="mt-2 text-[10px] text-ink-300 font-mono whitespace-pre-wrap bg-ink-900/60 rounded p-2 max-h-64 overflow-auto">
+              {JSON.stringify(step, null, 2)}
+            </pre>
+          )}
+        </div>
       </div>
     </div>
   )
