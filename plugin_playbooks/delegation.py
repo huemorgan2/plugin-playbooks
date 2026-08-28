@@ -423,6 +423,31 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
             await session.commit()
             await session.refresh(row)
 
+        # Phase 2: the live progress card, posted as its own timeline row
+        # (luna 056). Feature-detected — on older cores the tools still work,
+        # the owner just gets no card. Never let card trouble kill the job.
+        post_card = getattr(ctx, "post_chat_card", None)
+        if post_card is not None:
+            try:
+                from . import PlaybooksPlugin
+                from .card import render_delegation_card
+
+                html = render_delegation_card(
+                    str(row.id), row.card_token, playbook,
+                    str(getattr(PlaybooksPlugin.manifest, "version", "0")),
+                )
+                message_id = await post_card(
+                    html, conversation_id=conversation_id,
+                )
+                if message_id:
+                    async with session_factory() as session:
+                        fresh = await session.get(PlaybookDelegation, row.id)
+                        if fresh is not None:
+                            fresh.card_message_id = str(message_id)
+                            await session.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("delegation %s: card post failed", row.id)
+
         tools = await delegate_toolset(session_factory, playbook, authoring_tools)
         prompt = _delegate_prompt(_AUTHORING_SKILL_BODY, task, pb)
 
