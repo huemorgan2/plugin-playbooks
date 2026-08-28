@@ -3,9 +3,13 @@
 The full spec lives in the authoring skill, which is loaded once and can fall
 out of a long session's context — after which agents guess syntax and burn
 edit→validate→dry_run cycles probing. This sheet is the recall surface: it
-rides on the playbook_edit READ stage, on failed validate/propose results,
-and behind the playbook_language_reference tool. Keep it COMPLETE on facts
-(every combinator, every filter) and short on prose.
+rides on failed validate/propose/compile results and behind the
+playbook_language_reference tool. Keep it COMPLETE on facts (every
+combinator, every filter) and short on prose.
+
+The playbook_edit READ stage carries only LANGUAGE_MINIREF (012 phase 3):
+the step kinds, the reference shapes, and the rules agents actually forget,
+plus a pointer to the full sheet — the ~5KB body stops riding on every edit.
 """
 
 LANGUAGE_CHEATSHEET = """\
@@ -68,6 +72,20 @@ STATE OPS (inside state(); vars persist across iterations, read as vars.<n>):
   set_('v', value)  append/extend  merge  push_back  pop_back('v', into='x')
   pop_front('v', into='x')  add_unique  incr('n')/decr('n')  delete
   Stack = push_back+pop_back; queue = push_back+pop_front; set = add_unique.
+  Values are expressions: set_('frontier', '[ inputs.start_url ]').
+
+LOOP CONFIG (exact kwargs — no other fields work):
+  over= (literal list or expression) | until= (loop UNTIL true) |
+  while_= (loop WHILE true — mutate a vars.* each iteration via state() and
+  ALWAYS set max_iterations, or it runs to the cap) |
+  break_when= (checked AFTER each iteration; stopped: 'break') |
+  item_name='x' gives {{ x }} and {{ x_index }} inside the body |
+  collect= evaluated after each iteration → steps.<id>.collected (without it
+  only the last iteration survives) |
+  concurrency=N runs bodies in parallel (default 1); bodies are ISOLATED —
+  never mutate shared state in a concurrent loop, only collect merges back
+  (item order); prefer concurrency=4 when the body is side-effect-free.
+  Empty body=[] does nothing — nest at least one step.
 
 EXPRESSIONS: plain strings pass verbatim — put Jinja {{ ... }} inside them.
 Bare Python over inputs/vars/steps/event works (inputs.n + 1, steps.fetch.result);
@@ -96,4 +114,24 @@ THE LOOP: playbook_propose/playbook_edit (read → ticket → write) →
 playbook_validate → playbook_dry_run (stubs effects; proves paths/branches) →
 playbook_promote (specs gate it) → playbook_run → playbook_status(run_id).
 A save creates a CANDIDATE; live changes only on promote.
+"""
+
+LANGUAGE_MINIREF = """\
+PLAYBOOK CODE mini-reference — full spec: call playbook_language_reference.
+Restricted Python, parsed never executed: no imports, no Python
+for/while/if, no comprehensions; one step per statement, <id> = combinator.
+Combinators: tool('name', **args) | llm(prompt, output={...}) |
+  agent(prompt, output=, tools=) | code('''body''', inputs={...}) |
+  if_(cond, then=[...], else_=[...]) |
+  loop(over=|while_=|until=, item_name=, body=[...], collect=,
+       max_iterations=, concurrency=) |
+  parallel([[...], ...]) | state(op, ...) | approve(show=[...]) |
+  wait_event(...) | subtask(...) | halt(when=, value=) | x = <expr>
+Reference shapes: tool → steps.<id>.result.<field>; llm/agent with output=
+  → steps.<id>.<field>; schemaless → steps.<id>._raw (there is NO .output);
+  loop → steps.<id>.collected; code → steps.<id>.result; vars.<name>.
+Rules agents forget: (1) Jinja filters exist only inside '{{ ... }}'
+  strings; (2) loops need collect= or only the last iteration survives;
+  (3) while_ loops need a state() mutation + max_iterations; (4) copy old=
+  snippets verbatim from the code frame above.
 """

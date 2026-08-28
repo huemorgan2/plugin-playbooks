@@ -35,7 +35,7 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
-from .reference import LANGUAGE_CHEATSHEET
+from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
 from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 
@@ -1123,11 +1123,11 @@ def build_tools(
                 + (manifest_text or "(none)")
                 + f"\n--- code ({code_label}) ---\n"
                 + current
-                # plans/003 phase 4: every edit begins here — the one
-                # reliable recall point for the language spec after it
-                # falls out of a long session's context.
+                # 012 phase 3: the mini-reference rides on every edit; the
+                # full sheet stays one call away (playbook_language_reference)
+                # and still attaches to failed validate/compile results.
                 + "\n--- language reference ---\n"
-                + LANGUAGE_CHEATSHEET
+                + LANGUAGE_MINIREF
                 + "\n--- end ---"
             )
 

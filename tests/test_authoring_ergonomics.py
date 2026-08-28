@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import Base
 from plugin_playbooks.pblang.compiler import PlaybookCompileError, compile_playbook
-from plugin_playbooks.reference import LANGUAGE_CHEATSHEET
+from plugin_playbooks.reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
 from plugin_playbooks.runner import _SANDBOX_ENV
 
 
@@ -166,7 +166,10 @@ async def test_edit_read_stage_carries_reference(tools):
     )
     out = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     assert out["stage"] == "read"
-    assert out["language_reference"] == LANGUAGE_CHEATSHEET
+    # 012 phase 3: the read stage carries the mini-reference, with a pointer
+    # to the full sheet — which stays behind playbook_language_reference.
+    assert out["language_reference"] == LANGUAGE_MINIREF
+    assert "playbook_language_reference" in out["language_reference"]
 
 
 @pytest.mark.asyncio
@@ -225,6 +228,31 @@ async def test_dry_run_end_to_end_assignment_vars_and_paths():
     assert trace["gate"]["output"] == {"branch": "then", "condition": True}
     assert trace["send_chat_message"]["resolved_inputs"]["message"] == "0521234567"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_payload_diet_budgets(tools):
+    """012 phase 3: byte budgets. Reference-grade detail lives behind
+    playbook_language_reference; the skill body and the per-edit read-stage
+    overhead (everything except the playbook's own code + manifest) stay
+    small."""
+    from plugin_playbooks import _AUTHORING_SKILL_BODY
+
+    assert len(_AUTHORING_SKILL_BODY.encode()) <= 12 * 1024
+    assert len(LANGUAGE_MINIREF.encode()) <= 2 * 1024
+    await tools["playbook_propose"](
+        name="diet",
+        code="playbook(name='diet', description='d')\n"
+             "say = tool('send_chat_message', message='hi')\n",
+    )
+    raw = await tools["playbook_edit"](name="diet")
+    read = parse_read_stage(raw)
+    overhead = (
+        len(raw.encode())
+        - len(read["code"].encode())
+        - len(read["manifest"].encode())
+    )
+    assert overhead <= 6 * 1024
 
 
 @pytest.mark.asyncio
