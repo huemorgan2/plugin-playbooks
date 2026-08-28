@@ -1082,38 +1082,54 @@ def build_tools(
                 except Exception:  # noqa: BLE001 — legacy defs must stay editable
                     current = ""
                 t = await _issue_ticket(session, playbook)
-                payload = {
+                header = {
                     "stage": "read",
                     "editing": "candidate" if cand_row else "live",
-                    "manifest": playbook.manifest,
-                    "code": current,
                     "version": playbook.version,
                     "live_version": _live_version_of(playbook),
                     "candidate_version": playbook.candidate_version,
                     "ticket": str(t.id),
                     "expires_in_seconds": _TICKET_TTL_SECONDS,
-                    # plans/003 phase 4: every edit begins here — the one
-                    # reliable recall point for the language spec after it
-                    # falls out of a long session's context.
-                    "language_reference": LANGUAGE_CHEATSHEET,
                     "instructions": (
-                        "Read the manifest and the current code above — your "
-                        "edit must stay within what the manifest states. Then "
-                        "call playbook_edit again with this ticket and exactly "
-                        "one of: code= (full source) or old=/new= (targeted "
-                        "snippet). The ticket "
-                        "is single-use and expires. Saving creates a CANDIDATE "
-                        "— the live playbook keeps running unchanged until "
+                        "Below: the manifest and current code as plain text — "
+                        "your edit must stay within what the manifest states. "
+                        "Copy exact lines from the code block into old= for a "
+                        "targeted edit. Then call playbook_edit again with "
+                        "this ticket and exactly one of: code= (full source) "
+                        "or old=/new= (targeted snippet). The ticket is "
+                        "single-use and expires. Saving creates a CANDIDATE — "
+                        "the live playbook keeps running unchanged until "
                         "playbook_promote."
                     ),
                 }
-                if not playbook.manifest:
-                    payload["manifest_note"] = (
+                manifest_text = playbook.manifest
+                if not manifest_text:
+                    header["manifest_note"] = (
                         "This playbook has no manifest yet. Consider "
                         "proposing one to the owner via playbook_manifest_set."
                     )
                 await session.commit()
-            return json.dumps(payload)
+            # 012 phase 2: code with real newlines, not a JSON-escaped
+            # one-liner — the agent quotes old= snippets straight from it.
+            code_label = (
+                f"candidate v{header['candidate_version']}" if cand_row
+                else f"live v{header['live_version']}"
+            )
+            # Frames round-trip exactly: each marker owns its leading "\n",
+            # so a section ending in "\n" keeps it when parsed back out.
+            return (
+                json.dumps(header)
+                + "\n--- manifest ---\n"
+                + (manifest_text or "(none)")
+                + f"\n--- code ({code_label}) ---\n"
+                + current
+                # plans/003 phase 4: every edit begins here — the one
+                # reliable recall point for the language spec after it
+                # falls out of a long session's context.
+                + "\n--- language reference ---\n"
+                + LANGUAGE_CHEATSHEET
+                + "\n--- end ---"
+            )
 
         if modes != 1:
             return json.dumps({
@@ -1351,7 +1367,8 @@ def build_tools(
             description=(
                 "Change an existing playbook — a two-step flow. STEP 1 (read): "
                 "call with ONLY the name; you get the playbook's manifest (its "
-                "owner-stated intent), the current code, and a single-use edit "
+                "owner-stated intent), the current code as plain readable text "
+                "(copy old= snippets from it verbatim), and a single-use edit "
                 "ticket. STEP 2 (write): call again with that ticket plus "
                 "exactly one of code= (full new source) or old=/new= (targeted "
                 "snippet; 'old' must match exactly one place). "

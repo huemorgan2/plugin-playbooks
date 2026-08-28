@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -58,7 +60,7 @@ async def _get(sf, name: str) -> Playbook:
 
 async def _ticket(tools, name: str) -> str:
     """0.9.0: the write stage of playbook_edit needs a read-stage ticket."""
-    out = json.loads(await tools["playbook_edit"](name=name))
+    out = parse_read_stage(await tools["playbook_edit"](name=name))
     return out["ticket"]
 
 
@@ -207,7 +209,7 @@ async def test_snippet_edit_that_breaks_compile_is_rejected(env):
 async def test_edit_requires_exactly_one_mode(env):
     _, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_edit"](name="greeter"))
+    out = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     assert out["stage"] == "read"  # no payload = the read stage, not an error
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=out["ticket"], code=CODE, old="a", new="b",
@@ -260,3 +262,63 @@ async def test_backfill_fills_missing_code_only(env):
     greeter = await _get(sf, "greeter")
     assert greeter.code == CODE  # untouched
     assert await backfill_code(sf) == 0  # idempotent
+
+
+# ---- 012 phase 2: framed read stage --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_stage_is_framed_plain_text(env):
+    """The read stage returns a JSON header line + plain-text frames with
+    REAL newlines — no JSON-escaped one-liner code."""
+    _, tools = env
+    await tools["playbook_propose"](name="greeter", code=CODE)
+    raw = await tools["playbook_edit"](name="greeter")
+
+    # header is the first line, valid JSON, and carries no code
+    header = json.loads(raw.split("\n", 1)[0])
+    assert header["stage"] == "read"
+    assert "code" not in header and "language_reference" not in header
+
+    # frames present, code carried verbatim with its newlines
+    assert "\n--- manifest ---\n" in raw
+    assert "\n--- code (live v" in raw
+    assert "\n--- language reference ---\n" in raw
+    assert raw.endswith("--- end ---")
+    assert CODE.rstrip("\n") in raw  # the multi-line source, unescaped
+
+    parsed = parse_read_stage(raw)
+    assert parsed["code"] == CODE
+    assert parsed["manifest"] == ""
+    assert "manifest_note" in parsed
+
+
+@pytest.mark.asyncio
+async def test_read_stage_snippet_roundtrip(env):
+    """A snippet copied verbatim from the framed code block works as old=."""
+    _, tools = env
+    await tools["playbook_propose"](name="greeter", code=CODE)
+    read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
+    snippet = read["code"].splitlines()[1]  # the tool(...) line, verbatim
+    out = json.loads(await tools["playbook_edit"](
+        name="greeter", ticket=read["ticket"],
+        old=snippet,
+        new="say = tool('send_chat_message', message=inputs.name)",
+    ))
+    assert out["status"] == "candidate_saved"
+
+
+@pytest.mark.asyncio
+async def test_read_stage_labels_candidate_code(env):
+    _, tools = env
+    await tools["playbook_propose"](name="greeter", code=CODE)
+    read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
+    await tools["playbook_edit"](
+        name="greeter", ticket=read["ticket"],
+        code=CODE.replace("says hi", "says hello"),
+    )
+    raw = await tools["playbook_edit"](name="greeter")
+    assert "\n--- code (candidate v2) ---\n" in raw
+    parsed = parse_read_stage(raw)
+    assert parsed["editing"] == "candidate"
+    assert "says hello" in parsed["code"]

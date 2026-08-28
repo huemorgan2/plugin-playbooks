@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+from readstage import parse_read_stage
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -84,7 +86,7 @@ async def _get(sf, name: str) -> Playbook:
 
 
 async def _read_stage(tools, name: str = "greeter") -> dict:
-    return json.loads(await tools["playbook_edit"](name=name))
+    return parse_read_stage(await tools["playbook_edit"](name=name))
 
 
 # --- read stage ---

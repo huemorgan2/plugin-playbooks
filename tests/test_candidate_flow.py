@@ -12,6 +12,8 @@ import json
 import uuid
 
 import pytest
+
+from readstage import parse_read_stage
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -94,7 +96,7 @@ async def _rows(sf) -> dict[int, PlaybookVersion]:
 
 
 async def _save_candidate(tools, code: str = NEW_CODE) -> dict:
-    read = json.loads(await tools["playbook_edit"](name="greeter"))
+    read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     return json.loads(await tools["playbook_edit"](
         name="greeter", ticket=read["ticket"], code=code,
     ))
@@ -155,7 +157,7 @@ async def test_read_stage_returns_candidate_when_one_exists(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
-    read = json.loads(await tools["playbook_edit"](name="greeter"))
+    read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     assert read["editing"] == "candidate"
     assert read["code"] == NEW_CODE
     assert read["live_version"] == 1
@@ -168,7 +170,7 @@ async def test_second_save_iterates_on_candidate(env):
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
     # snippet edit applies to the CANDIDATE code, not live
-    read = json.loads(await tools["playbook_edit"](name="greeter"))
+    read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=read["ticket"],
         old="inputs.name", new="inputs.nickname",

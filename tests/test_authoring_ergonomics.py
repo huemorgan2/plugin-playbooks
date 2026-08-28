@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from readstage import parse_read_stage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from plugin_playbooks.agent_tools import build_tools
@@ -162,7 +164,7 @@ async def test_edit_read_stage_carries_reference(tools):
         code="playbook(name='greeter', description='d')\n"
              "say = tool('send_chat_message', message=inputs.greeting)\n",
     )
-    out = json.loads(await tools["playbook_edit"](name="greeter"))
+    out = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     assert out["stage"] == "read"
     assert out["language_reference"] == LANGUAGE_CHEATSHEET
 

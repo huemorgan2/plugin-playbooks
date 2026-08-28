@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -105,7 +107,7 @@ async def _get(sf, name: str) -> Playbook:
 
 
 async def _ticket(handlers, name: str) -> str:
-    out = json.loads(await handlers["playbook_edit"](name=name))
+    out = parse_read_stage(await handlers["playbook_edit"](name=name))
     return out["ticket"]
 
 
