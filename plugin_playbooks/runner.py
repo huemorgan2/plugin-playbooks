@@ -17,6 +17,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,7 +33,52 @@ from .models import Playbook, PlaybookRun, PlaybookStepRun
 
 log = logging.getLogger("luna.playbooks.runner")
 
-_SANDBOX_ENV = SandboxedEnvironment(undefined=StrictUndefined)
+class _PlaybookEnvironment(SandboxedEnvironment):
+    """plans/003: Mappings are DATA — `.attr` on a dict always reads the key.
+
+    Jinja's default getattr prefers Python attributes, so a documented path
+    like `steps.fetch.result.items` returned the dict's bound `.items()`
+    method and failed steps later with an opaque error. `_VarsView` fixed
+    this for top-level `inputs`/`vars` only; this fixes every depth. A
+    missing key is undefined (loud under StrictUndefined) — dict methods are
+    never reachable via attribute access (use Jinja filters instead).
+    """
+
+    def getattr(self, obj: Any, attribute: str) -> Any:
+        if isinstance(obj, Mapping):
+            try:
+                return obj[attribute]
+            except KeyError:
+                return self.undefined(obj=obj, name=attribute)
+        return super().getattr(obj, attribute)
+
+
+def _regex_replace(value: Any, pattern: str, replacement: str = "", count: int = 0) -> str:
+    return re.sub(pattern, replacement, str(value), count=count)
+
+
+def _regex_search(value: Any, pattern: str, group: int | str = 0) -> str:
+    m = re.search(pattern, str(value))
+    return m.group(group) if m else ""
+
+
+def _regex_findall(value: Any, pattern: str) -> list[Any]:
+    return re.findall(pattern, str(value))
+
+
+def _split(value: Any, sep: str | None = None, maxsplit: int = -1) -> list[str]:
+    return str(value).split(sep, maxsplit)
+
+
+_SANDBOX_ENV = _PlaybookEnvironment(undefined=StrictUndefined)
+# plans/003 phase 2: the one real gap in the builtin filter set. Everything
+# else agents reached for (selectattr, map, tojson, …) already exists.
+_SANDBOX_ENV.filters.update({
+    "regex_replace": _regex_replace,
+    "regex_search": _regex_search,
+    "regex_findall": _regex_findall,
+    "split": _split,
+})
 
 # 008.006: how often a live run emits `activity.heartbeat`. Clients derive
 # `running = (now - lastBeat) < TTL` with TTL ≈ 8s, so a missed completion

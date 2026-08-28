@@ -104,6 +104,10 @@ class _Compiler:
         self.issues: list[CompileIssue] = []
         self.step_ids: set[str] = set()   # ids defined so far, in source order
         self.item_names: set[str] = set()  # loop item vars currently in scope
+        # plans/003 phase 3: names bound by value assignment (x = <expr>).
+        # They live in the runner's `vars` namespace; bare `x` in a later
+        # expression rewrites to vars.x (checked BEFORE step_ids).
+        self.value_names: set[str] = set()
 
     # ------------------------------------------------------------------ utils
 
@@ -133,6 +137,14 @@ class _Compiler:
         if isinstance(node, ast.Name):
             if node.id in self.item_names or node.id in BUILTIN_ROOTS:
                 return node
+            if node.id in self.value_names:
+                return ast.copy_location(
+                    ast.Attribute(
+                        value=ast.Name(id="vars", ctx=ast.Load()),
+                        attr=node.id, ctx=ast.Load(),
+                    ),
+                    node,
+                )
             if node.id in self.step_ids:
                 return ast.copy_location(
                     ast.Attribute(
@@ -320,7 +332,9 @@ class _Compiler:
         if not isinstance(call.func, ast.Name) or call.func.id not in STEP_FUNCS:
             got = ast.unparse(call.func) if isinstance(call, ast.Call) else "?"
             self.err(call, f"Unknown step function '{got}'",
-                     "allowed: " + ", ".join(sorted(STEP_FUNCS)))
+                     "allowed: " + ", ".join(sorted(STEP_FUNCS)) + "; for a "
+                     "computed value assign a plain expression instead "
+                     "(x = inputs.n + 1) and read it back as vars.x")
             return None
         func = call.func.id
         kind = STEP_FUNCS[func]
@@ -394,6 +408,32 @@ class _Compiler:
         step["id"] = step_id
         return step
 
+    def is_value_rhs(self, node: ast.expr) -> bool:
+        """plans/003 phase 3: an Assign RHS that is a VALUE, not a step.
+        Any non-call expression, plus range(...). Every other call keeps the
+        step-call path so a typo'd combinator still errors loudly."""
+        if not isinstance(node, ast.Call):
+            return True
+        return isinstance(node.func, ast.Name) and node.func.id == "range"
+
+    def compile_value_assign(
+        self, target_node: ast.AST, target: str, value_node: ast.expr,
+    ) -> dict[str, Any]:
+        """plans/003 phase 3: `x = <expr>` → a state step setting vars.x.
+        Compute once, reuse everywhere — bare `x` in later expressions
+        rewrites to vars.x; Jinja strings read {{ vars.x }}."""
+        if isinstance(value_node, ast.JoinedStr):
+            value = self.template_value(value_node)
+        else:
+            value = self.eval_value(value_node)
+        self._register_id(target_node, target)
+        self.value_names.add(target)
+        return {
+            "kind": "state",
+            "id": target,
+            "state": [{"op": "set", "var": target, "value": value}],
+        }
+
     def compile_step_list(self, node: ast.expr, what: str) -> list[dict[str, Any]]:
         """A list of step calls (then/else_/body/branch)."""
         if not isinstance(node, ast.List):
@@ -408,8 +448,17 @@ class _Compiler:
                 if isinstance(el.target, ast.Name):
                     assigned = el.target.id
                 call = el.value
+                # plans/003 phase 3: (x := <expr>) — value assignment in a
+                # nested list (loop body / then / else_ / branch).
+                if assigned is not None and self.is_value_rhs(call):
+                    steps.append(
+                        self.compile_value_assign(el, assigned, call)
+                    )
+                    continue
             if not isinstance(call, ast.Call):
-                self.err(el, f"Each element of {what} must be a step call")
+                self.err(el, f"Each element of {what} must be a step call",
+                         "to bind a computed value here use a walrus: "
+                         "(x := <expression>)")
                 continue
             s = self.compile_step_call(call, assigned_id=assigned)
             if s:
@@ -819,9 +868,13 @@ def compile_playbook(source: str, *, name: str | None = None) -> PlaybookDef:
             if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
                 c.err(stmt, "Assign each step to a single plain variable")
                 continue
-            if not isinstance(stmt.value, ast.Call):
-                c.err(stmt, "Only step calls can be assigned",
-                      "e.g. x = tool('web_fetch', url=inputs.url)")
+            # plans/003 phase 3: `x = <expr>` (non-combinator RHS) is a VALUE
+            # assignment — compiles to a state set op; read back as vars.x
+            # (bare `x` works in later expressions).
+            if c.is_value_rhs(stmt.value):
+                steps.append(c.compile_value_assign(
+                    stmt, stmt.targets[0].id, stmt.value,
+                ))
                 continue
             s = c.compile_step_call(stmt.value, assigned_id=stmt.targets[0].id)
             if s:

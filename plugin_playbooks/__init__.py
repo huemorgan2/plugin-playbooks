@@ -239,6 +239,12 @@ map={...})]`.
 later steps reference it as `steps.<id>....`. Inside nested lists (loop body,
 then/else, parallel branches) use walrus `(x := llm(...))` or pass `id='x'`.
 A bare call with no name gets a generated id.
+- VALUE ASSIGNMENT: `x = <expression>` (any non-combinator right side) computes
+a value ONCE and stores it as a run-scoped var — `x = inputs.count + 1`,
+`phone = '{{ inputs.raw | regex_replace("[^0-9+]") }}'`. Read it back as bare
+`x` in bare expressions or `{{ vars.x }}` inside strings. Inside nested lists
+use walrus: `(x := <expression>)`. NEVER re-inline a derived expression at
+every use site — assign it once.
 - Combinators (the ONLY callables, plus range()):
   - `tool('tool_name', **args)` — call a registered Luna tool; loose kwargs
     are the tool args.
@@ -262,6 +268,11 @@ inside them for templating. Bare Python expressions over `inputs`, `vars`,
 `steps`, `event` also work (`inputs.n + 1`, `steps.fetch.result`), and
 f-strings work in prompts/args. Jinja FILTERS (`| length`, `| selectattr`)
 only exist inside strings: write `'{{ vars.frontier | length > 0 }}'`.
+Dot access on step data ALWAYS reads the dict key — `steps.x.result.items`
+is the `items` field, never a Python method. Regex filters exist
+(`regex_replace`, `regex_search`, `regex_findall`, plus `split`); the
+COMPLETE filter list and exact kwargs for everything are one call away via
+`playbook_language_reference` — call it instead of guessing syntax.
 - BANNED (compile errors with a hint): any other function call, comprehensions,
 lambdas, imports, def/class, Python for/while/if statements (use loop()/if_()),
 `is`/`is not`. Duplicate step ids are rejected.
@@ -474,7 +485,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.14.2",
+        version="0.15.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -517,6 +528,7 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_spec_run",
                     "playbook_spec_from_run",
                     "playbook_preflight",
+                    "playbook_language_reference",
                 ],
             ),
         ],
@@ -665,6 +677,8 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_spec_from_run",
         # 0.12.0: preflight probes
         "playbook_preflight",
+        # 0.15.0 (plans/003): on-demand language recall
+        "playbook_language_reference",
     )
 
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:

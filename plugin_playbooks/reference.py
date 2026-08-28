@@ -1,0 +1,72 @@
+"""plans/003 phase 4: the compact playbook-language reference.
+
+The full spec lives in the authoring skill, which is loaded once and can fall
+out of a long session's context — after which agents guess syntax and burn
+edit→validate→dry_run cycles probing. This sheet is the recall surface: it
+rides on the playbook_edit READ stage, on failed validate/propose results,
+and behind the playbook_language_reference tool. Keep it COMPLETE on facts
+(every combinator, every filter) and short on prose.
+"""
+
+LANGUAGE_CHEATSHEET = """\
+PLAYBOOK CODE — QUICK REFERENCE (authoritative; do not guess syntax)
+
+Restricted Python, parsed never executed. First statement: playbook(name=...,
+description=..., when_to_use=..., inputs={JSON schema}, triggers=[trigger(...)]).
+Each following statement is ONE step: <id> = combinator(...). No imports,
+def/class, Python for/while/if, comprehensions, lambdas, 'is'.
+
+COMBINATORS (the only callables, plus range()):
+  tool('tool_name', **args)                      # args may be Jinja strings
+  llm(prompt, output={'field': 'str', ...}, purpose=, model=, system=)
+  agent(prompt, output={...}, tools=[...])       # only when tools/memory needed
+  if_(cond, then=[...], else_=[...])
+  loop(over=|while_=|until=, item_name=, body=[...], collect=,
+       break_when=, max_iterations=, concurrency=)
+  parallel([[...], [...]], fan_in='all')
+  state(op, ...)   approve(show=[...])   halt(when=, value=)
+  wait_event('event.name', filter={...}, timeout_seconds=)
+  subtask('other-playbook', inputs={...}, returns={...})
+Common kwargs on any step: id=, explanation=, retry=, on_error=, timeout=.
+Inside body/then/else_/branches bind with walrus: (x := llm(...)).
+
+VALUE ASSIGNMENT (compute once, reuse everywhere):
+  x = <expression>            # any non-combinator RHS; also (x := <expr>)
+                              # inside body/then/else_
+  x = inputs.count + 1
+  phone = '{{ inputs.raw | regex_replace("[\\\\s\\\\-()]+") | regex_replace("^\\\\+972", "0") }}'
+Read it back: bare `x` in bare expressions, `{{ vars.x }}` inside strings.
+Sets a run-scoped var — persists across loop iterations.
+
+STATE OPS (inside state(); vars persist across iterations, read as vars.<n>):
+  set_('v', value)  append/extend  merge  push_back  pop_back('v', into='x')
+  pop_front('v', into='x')  add_unique  incr('n')/decr('n')  delete
+  Stack = push_back+pop_back; queue = push_back+pop_front; set = add_unique.
+
+EXPRESSIONS: plain strings pass verbatim — put Jinja {{ ... }} inside them.
+Bare Python over inputs/vars/steps/event works (inputs.n + 1, steps.fetch.result);
+f-strings work in prompts/args. Jinja FILTERS only exist inside strings.
+
+REFERENCE SHAPES (dry_run's `references` shows the real namespace — copy paths):
+  tool() output is wrapped:      steps.<id>.result.<field>
+  llm()/agent() with output=:    steps.<id>.<field>
+  llm()/agent() schemaless:      steps.<id>._raw   (there is NO .output)
+  loop():                        steps.<id>.collected  (+ iterations, stopped)
+  value assignment / state:      vars.<name>
+Dot access on step data ALWAYS reads the dict key — steps.x.result.items is
+the 'items' field, never a Python method. Missing key = loud error.
+
+JINJA FILTERS available (complete list of the useful set):
+  length count first last sum min max sort unique reverse join split replace
+  lower upper title trim truncate default list map select reject selectattr
+  rejectattr groupby batch slice items tojson int float string abs round
+  regex_replace(pattern, replacement='', count=0)
+  regex_search(pattern, group=0)   regex_findall(pattern)
+Tests: is defined, is none, is string, is number, is mapping, is iterable,
+'in', ==/!=; selectattr('id', 'equalto', x) works.
+
+THE LOOP: playbook_propose/playbook_edit (read → ticket → write) →
+playbook_validate → playbook_dry_run (stubs effects; proves paths/branches) →
+playbook_promote (specs gate it) → playbook_run → playbook_status(run_id).
+A save creates a CANDIDATE; live changes only on promote.
+"""

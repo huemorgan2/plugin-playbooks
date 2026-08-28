@@ -35,6 +35,7 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
+from .reference import LANGUAGE_CHEATSHEET
 from .specs import parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 
@@ -47,6 +48,9 @@ def _compile_code(code: str, *, name: str) -> tuple[PlaybookDef | None, str | No
         return None, json.dumps({
             "error": "The playbook code does not compile — fix these and retry.",
             "issues": [i.to_dict() for i in e.issues],
+            # plans/003 phase 4: a compile error is where a syntax-guessing
+            # agent re-enters — hand it the spec instead of another cycle.
+            "language_reference": LANGUAGE_CHEATSHEET,
         })
 
 
@@ -783,6 +787,7 @@ def build_tools(
                     "warnings": [],
                     "saved": False,
                     "note": "Compile errors — nothing was checked further.",
+                    "language_reference": LANGUAGE_CHEATSHEET,
                 })
             defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
             # compiler already rejects unknown kwargs; the dump carries
@@ -825,7 +830,7 @@ def build_tools(
         # ("ok": true) that headless agents repeatedly mistook for a completed
         # save — validate and edit have near-identical schemas, and edit used
         # to be invisible headless. Say explicitly that nothing was persisted.
-        return json.dumps({
+        result: dict[str, Any] = {
             "ok": not errors, "errors": errors, "warnings": warnings,
             "saved": False,
             "note": (
@@ -833,7 +838,12 @@ def build_tools(
                 "call playbook_edit (existing playbook) or playbook_propose "
                 "(new playbook)."
             ),
-        })
+        }
+        # plans/003 phase 4: attach the spec on FAILED validation only — a
+        # green result needs no recall, and the sheet is ~2KB per call.
+        if errors:
+            result["language_reference"] = LANGUAGE_CHEATSHEET
+        return json.dumps(result)
 
     tools.append((
         ToolDef(
@@ -859,6 +869,28 @@ def build_tools(
             risk_level="low",
         ),
         _validate,
+    ))
+
+    # --- playbook_language_reference (plans/003 phase 4: on-demand recall) ---
+    async def _language_reference() -> str:
+        return json.dumps({"language_reference": LANGUAGE_CHEATSHEET})
+
+    tools.append((
+        ToolDef(
+            name="playbook_language_reference",
+            description=(
+                "The complete playbook-language quick reference: every "
+                "combinator with its exact kwargs, value assignment "
+                "(x = expr), state ops, reference shapes "
+                "(steps/vars/inputs paths), and the full Jinja filter list. "
+                "Call this instead of guessing syntax — one wrong guess "
+                "costs a whole edit/validate cycle."
+            ),
+            parameters={"type": "object", "properties": {}},
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _language_reference,
     ))
 
     # --- playbook_dry_run (the test harness) ---
@@ -1060,6 +1092,10 @@ def build_tools(
                     "candidate_version": playbook.candidate_version,
                     "ticket": str(t.id),
                     "expires_in_seconds": _TICKET_TTL_SECONDS,
+                    # plans/003 phase 4: every edit begins here — the one
+                    # reliable recall point for the language spec after it
+                    # falls out of a long session's context.
+                    "language_reference": LANGUAGE_CHEATSHEET,
                     "instructions": (
                         "Read the manifest and the current code above — your "
                         "edit must stay within what the manifest states. Then "
