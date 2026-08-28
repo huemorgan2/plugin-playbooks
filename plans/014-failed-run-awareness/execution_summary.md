@@ -1,6 +1,8 @@
 # Plan 014 — failed-run awareness: master execution summary
 
-Shipped as **plugin-playbooks 0.21.0**. The agent now learns about
+Shipped as **plugin-playbooks 0.22.0** (planned as 0.21.0; another
+session shipped 0.21.0 — plans/012 payload diet — while this was in
+flight, so the stamp moved at ship time). The agent now learns about
 playbook run failures ambiently — through its per-turn prompt sections,
 never through an interrupting message — scoped to runs of the playbook's
 current live version ("since the last change the owner made"), and can
@@ -33,5 +35,5 @@ their request, then fix / disable / dismiss.
   `playbook_ack_failures` when the owner said "ignore it"
   (DB: `failures_acked_version == 1`), and did not re-raise afterward.
   5/5 checks; transcript in phase-2 folder.
-- **Phase 3 — ship**: 0.21.0 in all three stamps, merged to main, pushed,
+- **Phase 3 — ship**: 0.22.0 in all three stamps, merged to main, pushed,
   published to marketplaces.com.ai.
