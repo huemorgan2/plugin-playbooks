@@ -8,7 +8,7 @@ import { memo, useEffect, useState } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import {
   Bot, Wrench, GitBranch, Layers, Clock, Mail,
-  RotateCcw, CircleDot, Zap, ExternalLink, Info, Sparkles, Database, Ban,
+  RotateCcw, CircleDot, Zap, ExternalLink, Info, Sparkles, Database, Ban, Code2,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import { type StepKind, type RunStatus, STEP_COLORS, STATUS_COLORS } from '../types'
@@ -42,6 +42,7 @@ const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> 
   loop: RotateCcw,
   state: Database,
   halt: Ban,
+  code: Code2,
 }
 
 function StepNodeComponent({ data, selected }: NodeProps) {
@@ -99,6 +100,7 @@ function StepNodeComponent({ data, selected }: NodeProps) {
             kind === 'wait_for_approval' || kind === 'wait_for_event' ? 'bg-orange-800/60' :
             kind === 'loop' ? 'bg-purple-800/60' :
             kind === 'state' ? 'bg-emerald-800/60' :
+            kind === 'code' ? 'bg-cyan-800/60' :
             kind === 'halt' ? 'bg-rose-800/60' :
             'bg-ink-800/60'
           )}>

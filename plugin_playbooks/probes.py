@@ -38,6 +38,10 @@ def collect_tools(definition: dict[str, Any]) -> list[str]:
         for step in steps or []:
             if step.get("tool"):
                 found.add(step["tool"])
+            if step.get("kind") == "code":
+                # plans/004: code steps delegate to plugin-inline-code-run —
+                # advertise the dependency so preflight/promote gate on it.
+                found.add("code_run")
             for name in step.get("tools") or []:
                 found.add(name)
             for key in ("then", "else", "body"):

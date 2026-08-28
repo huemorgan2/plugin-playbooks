@@ -18,7 +18,7 @@ from ..definition import PlaybookDef, StepDef, StepKind
 RESERVED_NAMES = {
     "playbook", "trigger",
     "tool", "llm", "agent", "if_", "loop", "parallel", "approve",
-    "wait_event", "subtask", "state", "halt",
+    "wait_event", "subtask", "state", "halt", "code",
     "set_", "append", "extend", "push_back", "push_front", "pop_back",
     "pop_front", "add_unique", "incr", "decr", "merge", "delete",
     "inputs", "vars", "steps", "event", "range", "id", "args", "output",
@@ -247,6 +247,11 @@ class _CodeGen:
             for op in step.state or []:
                 kw.append(("", _state_op_call(op)))
             return "state", kw
+        if k == StepKind.CODE:
+            kw.append(("", _fmt(step.source or "")))
+            if step.code_inputs is not None:
+                kw.append(("inputs", _fmt(step.code_inputs, indent + 1)))
+            return "code", kw
         if k == StepKind.HALT:
             if step.when is not None:
                 kw.append(("when", _fmt(step.when)))

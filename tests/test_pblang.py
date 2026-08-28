@@ -227,8 +227,9 @@ def test_python_control_flow_is_rejected_with_hints():
     assert any("for/while loops are not allowed" in m for m in msgs)
 
 
-def test_imports_and_defs_rejected():
-    msgs = _errors_of("playbook(name='t')\nimport os\ndef f(): pass\n")
+def test_imports_and_class_defs_rejected():
+    # plans/004: `def` is now a playbook function — classes stay banned.
+    msgs = _errors_of("playbook(name='t')\nimport os\nclass F: pass\n")
     assert any("Imports are not allowed" in m for m in msgs)
     assert any("definitions are not allowed" in m for m in msgs)
 

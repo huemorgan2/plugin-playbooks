@@ -14,12 +14,14 @@ PLAYBOOK CODE — QUICK REFERENCE (authoritative; do not guess syntax)
 Restricted Python, parsed never executed. First statement: playbook(name=...,
 description=..., when_to_use=..., inputs={JSON schema}, triggers=[trigger(...)]).
 Each following statement is ONE step: <id> = combinator(...). No imports,
-def/class, Python for/while/if, comprehensions, lambdas, 'is'.
+class, Python for/while/if, comprehensions, lambdas, 'is'. Top-level def IS
+allowed (see FUNCTIONS).
 
-COMBINATORS (the only callables, plus range()):
+COMBINATORS (the only callables, plus range() and your def functions):
   tool('tool_name', **args)                      # args may be Jinja strings
   llm(prompt, output={'field': 'str', ...}, purpose=, model=, system=)
   agent(prompt, output={...}, tools=[...])       # only when tools/memory needed
+  code('''<python body>''', inputs={...})        # jailed Python, see CODE STEPS
   if_(cond, then=[...], else_=[...])
   loop(over=|while_=|until=, item_name=, body=[...], collect=,
        break_when=, max_iterations=, concurrency=)
@@ -29,6 +31,30 @@ COMBINATORS (the only callables, plus range()):
   subtask('other-playbook', inputs={...}, returns={...})
 Common kwargs on any step: id=, explanation=, retry=, on_error=, timeout=.
 Inside body/then/else_/branches bind with walrus: (x := llm(...)).
+
+CODE STEPS (deterministic transforms — parsing, math, formatting; needs the
+plugin-inline-code-run plugin installed; no network, stdlib + pillow/pypdf/
+openpyxl/segno/fpdf2):
+  norm = code('''
+  digits = ''.join(c for c in inputs['raw'] if c.isdigit())
+  return {'phone': digits}
+  ''', inputs={'raw': inputs.raw})
+The body is the inside of a function: read the `inputs` dict, `return` a
+JSON-serializable value. Imports ARE allowed inside the body. Read back:
+steps.norm.result (your return value), steps.norm.stdout (prints, debug only).
+Prefer code() over llm() for anything a regex/loop can do exactly.
+
+FUNCTIONS (reuse a step sequence; expanded inline at compile time):
+  def notify(target, note):
+      msg = f'ALERT for {target}: {note}'
+      sent = tool('send_message', to=target, text=msg)
+  notify(inputs.owner, 'first pass')
+  notify('ops', note='second pass')       # also callable inside then/body lists
+def before first call; plain positional params only (no defaults/*args).
+Functions are procedures — no return value; `return` is an error. Each call
+expands with a unique prefix: call #1's steps are notify__msg, notify__sent
+(read: steps.notify__sent, vars.notify__msg), call #2's notify_2__*. The body
+may read outer steps/vars; names it defines must not collide with outer ones.
 
 VALUE ASSIGNMENT (compute once, reuse everywhere):
   x = <expression>            # any non-combinator RHS; also (x := <expr>)
@@ -52,6 +78,7 @@ REFERENCE SHAPES (dry_run's `references` shows the real namespace — copy paths
   llm()/agent() with output=:    steps.<id>.<field>
   llm()/agent() schemaless:      steps.<id>._raw   (there is NO .output)
   loop():                        steps.<id>.collected  (+ iterations, stopped)
+  code():                        steps.<id>.result  (the returned value)
   value assignment / state:      vars.<name>
 Dot access on step data ALWAYS reads the dict key — steps.x.result.items is
 the 'items' field, never a Python method. Missing key = loud error.

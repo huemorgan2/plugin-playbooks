@@ -18,6 +18,7 @@ import {
   Bot, Wrench, GitBranch, Layers, Clock, Mail, RotateCcw, ExternalLink, Zap,
   ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle, Copy, Sparkles,
   Database, Ban, FileText, FlaskConical,
+  Code2,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { StepNode } from './nodes/StepNode'
@@ -62,6 +63,7 @@ const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> 
   loop: RotateCcw,
   state: Database,
   halt: Ban,
+  code: Code2,
 }
 
 function fmtStateOp(o: { op: string; var: string; value?: any; into?: string }): string {

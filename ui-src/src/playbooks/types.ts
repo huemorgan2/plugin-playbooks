@@ -10,6 +10,7 @@ export type StepKind =
   | 'loop'
   | 'state'
   | 'halt'
+  | 'code'
 
 export type RunStatus =
   | 'pending' | 'running' | 'completed' | 'done' | 'failed' | 'waiting' | 'cancelled'
@@ -181,6 +182,7 @@ export const STEP_COLORS: Record<StepKind, { bg: string; border: string; text: s
   loop:              { bg: 'bg-purple-950/60',  border: 'border-purple-500/40', text: 'text-purple-200', glow: '192 132 252' },
   state:             { bg: 'bg-emerald-950/60', border: 'border-emerald-500/40', text: 'text-emerald-200', glow: '52 211 153' },
   halt:              { bg: 'bg-rose-950/60',    border: 'border-rose-500/40',   text: 'text-rose-200',   glow: '251 113 133' },
+  code:              { bg: 'bg-cyan-950/60',    border: 'border-cyan-500/40',   text: 'text-cyan-200',   glow: '34 211 238' },
 }
 
 export const STATUS_COLORS: Record<RunStatus, string> = {

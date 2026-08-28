@@ -251,6 +251,8 @@ every use site — assign it once.
   - `llm(prompt, output={...}, purpose=..., model=..., system=...)` — raw
     model call, no tools. `purpose='reasoning'` routes to the big model.
   - `agent(prompt, output={...}, tools=[...])` — full agent turn.
+  - `code("""<python body>""", inputs={...})` — jailed Python for
+    deterministic work; see CODE STEPS below.
   - `if_(cond, then=[...], else_=[...])` — branch.
   - `loop(over=... | while_=... | until=..., item_name=..., body=[...],
     collect=..., break_when=..., max_iterations=..., concurrency=...)`.
@@ -274,10 +276,51 @@ is the `items` field, never a Python method. Regex filters exist
 COMPLETE filter list and exact kwargs for everything are one call away via
 `playbook_language_reference` — call it instead of guessing syntax.
 - BANNED (compile errors with a hint): any other function call, comprehensions,
-lambdas, imports, def/class, Python for/while/if statements (use loop()/if_()),
-`is`/`is not`. Duplicate step ids are rejected.
+lambdas, imports, class, Python for/while/if statements (use loop()/if_()),
+`is`/`is not`. Duplicate step ids are rejected. Top-level `def` IS allowed —
+see FUNCTIONS below.
 - The `name` in the header cannot rename an existing playbook — the tool's
 `name` argument always wins.
+
+### CODE STEPS — exact computation without burning model calls
+`code()` runs real Python in a locked-down sandbox (no network, stdlib plus
+pillow/pypdf/openpyxl/segno/fpdf2). Use it for anything DETERMINISTIC that an
+`llm()` step would only approximate: parsing, regex-heavy cleanup, math,
+dedup, date arithmetic, building a CSV/PDF payload. The body is the inside of
+a function — read the `inputs` dict, `return` a JSON-serializable value
+(imports ARE allowed inside the body):
+
+    norm = code("""
+    digits = ''.join(c for c in inputs['raw'] if c.isdigit())
+    return {'phone': digits}
+    """, inputs={'raw': inputs.raw})
+    say = tool('send_chat_message', message=norm.result.phone)
+
+Read back `steps.<id>.result` (the returned value); `steps.<id>.stdout`
+carries prints (debugging only — never parse it). Requires the
+plugin-inline-code-run plugin on this agent; validate warns and promote
+refuses if it is missing. Errors in the body fail the step with the
+traceback in the run status.
+
+### FUNCTIONS — name a step sequence once, call it many times
+Top-level `def` defines a reusable sequence; each CALL expands it inline at
+compile time (a macro — no call stack at runtime):
+
+    def notify(target, note):
+        msg = f'ALERT for {target}: {note}'
+        sent = tool('send_message', to=target, text=msg)
+
+    notify(inputs.owner, 'first pass')
+    notify('ops', note='second pass')
+
+Rules: define before the first call; plain positional parameters only (no
+defaults, *args, **kwargs); functions are PROCEDURES — no return value, and
+`return` is a compile error (set a value with `x = ...` instead). Calls work
+at top level and inside then/else_/body lists. Each call gets a unique
+prefix: the first call's steps become `notify__msg`, `notify__sent`
+(readable as `vars.notify__msg`, `steps.notify__sent`), the second call's
+`notify_2__*`. Bodies may read outer steps/vars; names defined inside must
+not collide with outer names. Recursion is banned — use loop().
 
 ### CONTEXT ECONOMY — iterate, never dump (critical)
 Keep the AGENTIC CONTEXT small. The #1 way a playbook fails is dumping a big
@@ -485,7 +528,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.15.1",
+        version="0.16.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

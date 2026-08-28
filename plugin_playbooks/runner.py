@@ -604,6 +604,7 @@ class PlaybookRunner:
             StepKind.LOOP: self._run_loop,
             StepKind.STATE: self._run_state,
             StepKind.HALT: self._run_halt,
+            StepKind.CODE: self._run_code,
         }
         handler = handlers.get(step.kind)
         if not handler:
@@ -637,6 +638,59 @@ class PlaybookRunner:
             ) from None
         result = await rt.handler(**args)
         return {"tool": step.tool, "result": _normalize_tool_result(result)}
+
+    async def _run_code(self, step: StepDef, ctx: _RunContext) -> Any:
+        """plans/004: jailed Python via plugin-inline-code-run's code_run.
+
+        The rendered code_inputs reach the body as the `inputs` dict; the
+        body's return value becomes steps.<id>.result.
+        """
+        if not step.source:
+            raise ValueError(f"Step '{step.id}': code step requires 'source'")
+        rendered = _render_template_dict(step.code_inputs or {}, ctx,
+                                         step_id=step.id)
+        ctx.step_inputs[step.id] = {"inputs": rendered}
+        if ctx.dry:
+            if step.id in ctx.stubs:
+                return {"result": ctx.stubs[step.id],
+                        "resolved_inputs": rendered,
+                        "stubbed": True, "_dry": True}
+            return {"result": {"_dry": True}, "resolved_inputs": rendered,
+                    "_dry": True}
+        try:
+            rt = self._tools.get("code_run")
+        except KeyError:
+            raise ValueError(
+                f"Step '{step.id}': code steps need plugin-inline-code-run "
+                "(tool 'code_run') installed on this agent — it is not in "
+                "the tool registry."
+            ) from None
+        raw = await rt.handler(
+            code=step.source,
+            input_json=rendered,
+            timeout_sec=step.timeout,
+            title=f"playbook code step '{step.id}'",
+        )
+        payload = _normalize_tool_result(raw)
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Step '{step.id}': code_run returned an unexpected result")
+        if not payload.get("ok"):
+            if payload.get("timed_out"):
+                raise ValueError(
+                    f"Step '{step.id}': code timed out "
+                    f"(timeout={step.timeout or 60}s)")
+            detail = str(payload.get("error") or payload.get("stderr")
+                         or "").strip()[-2000:]
+            raise ValueError(
+                f"Step '{step.id}': code failed "
+                f"(exit {payload.get('exit_code')}): {detail}")
+        if "result_error" in payload:
+            raise ValueError(f"Step '{step.id}': {payload['result_error']}")
+        out: dict[str, Any] = {"result": payload.get("result")}
+        if payload.get("stdout"):
+            out["stdout"] = payload["stdout"]
+        return out
 
     async def _run_agent_step(self, step: StepDef, ctx: _RunContext) -> Any:
         """Execute an agent_step — full LLM turn via run_turn()."""

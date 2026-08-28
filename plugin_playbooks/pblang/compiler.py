@@ -12,8 +12,10 @@ Errors are collected all-at-once (like validation.py) and raised as one
 from __future__ import annotations
 
 import ast
+import copy
 import keyword
 import re
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +67,8 @@ STEP_FUNCS = {
     "subtask": "subtask",
     "state": "state",
     "halt": "halt",
+    # plans/004: jailed Python via plugin-inline-code-run.
+    "code": "code",
 }
 
 # state() op helpers → StateOp.op names.
@@ -99,6 +103,44 @@ def _sanitize_id(base: str) -> str:
     return s
 
 
+def _rename_expanded(
+    steps: list[dict[str, Any]], mapping: dict[str, str],
+) -> list[dict[str, Any]]:
+    """plans/004: apply a function-expansion rename to compiled step dicts.
+
+    Renames the names themselves (``id``/``var``/``into``/``collect``
+    values) and every ``steps.<name>`` / ``vars.<name>`` reference inside
+    string values — compiled Jinja and hand-written Jinja look identical
+    at this point, so one string pass covers both. ``source`` (code-step
+    Python) is left untouched: its data arrives via the `inputs` dict, and
+    rewriting jail code would corrupt it.
+    """
+    if not mapping:
+        return steps
+    names = sorted(mapping, key=len, reverse=True)
+    ref_re = re.compile(
+        r"\b(steps|vars)\.(" + "|".join(re.escape(n) for n in names) + r")\b"
+    )
+
+    def fix_str(s: str) -> str:
+        return ref_re.sub(lambda m: f"{m.group(1)}.{mapping[m.group(2)]}", s)
+
+    def walk(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, str):
+            if key in ("id", "var", "into", "collect") and value in mapping:
+                return mapping[value]
+            if key == "source":
+                return value
+            return fix_str(value)
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        return value
+
+    return [walk(s) for s in steps]
+
+
 class _Compiler:
     def __init__(self) -> None:
         self.issues: list[CompileIssue] = []
@@ -108,6 +150,10 @@ class _Compiler:
         # They live in the runner's `vars` namespace; bare `x` in a later
         # expression rewrites to vars.x (checked BEFORE step_ids).
         self.value_names: set[str] = set()
+        # plans/004: def functions (macro expansion) + the active call chain
+        # (recursion guard).
+        self.functions: dict[str, ast.FunctionDef] = {}
+        self.expansion_stack: list[str] = []
 
     # ------------------------------------------------------------------ utils
 
@@ -120,6 +166,8 @@ class _Compiler:
         if step_id in self.step_ids:
             self.err(node, f"Duplicate step id '{step_id}'",
                      "every step id / variable name must be unique")
+        if step_id in self.functions:
+            self.err(node, f"Step id '{step_id}' collides with a function name")
         self.step_ids.add(step_id)
 
     def _gen_id(self, base: str) -> str:
@@ -331,10 +379,14 @@ class _Compiler:
         """Compile one combinator call into a StepDef dict. Registers the id."""
         if not isinstance(call.func, ast.Name) or call.func.id not in STEP_FUNCS:
             got = ast.unparse(call.func) if isinstance(call, ast.Call) else "?"
-            self.err(call, f"Unknown step function '{got}'",
-                     "allowed: " + ", ".join(sorted(STEP_FUNCS)) + "; for a "
-                     "computed value assign a plain expression instead "
-                     "(x = inputs.n + 1) and read it back as vars.x")
+            hint = ("allowed: " + ", ".join(sorted(STEP_FUNCS)) + "; for a "
+                    "computed value assign a plain expression instead "
+                    "(x = inputs.n + 1) and read it back as vars.x")
+            if self.functions:
+                hint += ("; your functions: "
+                         + ", ".join(sorted(self.functions))
+                         + " (def before first call)")
+            self.err(call, f"Unknown step function '{got}'", hint)
             return None
         func = call.func.id
         kind = STEP_FUNCS[func]
@@ -434,6 +486,197 @@ class _Compiler:
             "state": [{"op": "set", "var": target, "value": value}],
         }
 
+    # ------------------------------------------------- functions (plans/004)
+
+    def register_function(self, fn: ast.FunctionDef) -> None:
+        """Collect a top-level `def` for macro expansion at its call sites."""
+        reserved = (set(STEP_FUNCS) | set(STATE_OP_FUNCS) | BUILTIN_ROOTS
+                    | {"playbook", "trigger", "range", "code"})
+        if fn.name in reserved:
+            self.err(fn, f"Function name '{fn.name}' shadows a built-in")
+            return
+        if fn.name in self.functions:
+            self.err(fn, f"Duplicate function '{fn.name}'")
+            return
+        if fn.name in self.step_ids:
+            self.err(fn, f"Function name '{fn.name}' collides with a step id")
+            return
+        if fn.decorator_list:
+            self.err(fn, "Decorators are not allowed on playbook functions")
+        a = fn.args
+        if a.defaults or a.kw_defaults or a.vararg or a.kwarg or a.kwonlyargs:
+            self.err(fn, "Function parameters must be plain positional names "
+                         "(no defaults, *args, **kwargs, or keyword-only)")
+            return
+        params = [x.arg for x in a.posonlyargs + a.args]
+        if len(set(params)) != len(params):
+            self.err(fn, "Duplicate parameter name")
+            return
+        for p in params:
+            if p in BUILTIN_ROOTS:
+                self.err(fn, f"Parameter '{p}' shadows a built-in name")
+                return
+        self.functions[fn.name] = fn
+
+    def expand_call(self, call: ast.Call) -> list[dict[str, Any]]:
+        """Expand a function call into its steps (inline macro expansion).
+
+        Each call gets a unique prefix (`notify`, `notify_2`, …); every step
+        id and value name the body defines becomes `<prefix>__<name>`, and
+        references to them — bare Python names AND raw-Jinja `steps.x` /
+        `vars.x` strings — are rewritten to match.
+        """
+        fname = call.func.id  # type: ignore[union-attr]
+        fn = self.functions[fname]
+        if fname in self.expansion_stack:
+            chain = " -> ".join(self.expansion_stack + [fname])
+            self.err(call, f"Recursive function call ({chain})",
+                     "playbook functions cannot recurse — use loop(...)")
+            return []
+        if len(self.expansion_stack) >= 8:
+            self.err(call, "Function calls nested too deeply (max 8)")
+            return []
+
+        # --- bind arguments (compiled in the CALLER's scope, before any
+        # local names exist) ------------------------------------------------
+        params = [x.arg for x in fn.args.posonlyargs + fn.args.args]
+        bound: dict[str, ast.expr] = {}
+        if len(call.args) > len(params):
+            self.err(call, f"{fname}() takes {len(params)} argument(s), "
+                           f"got {len(call.args)}")
+        for p, arg in zip(params, call.args):
+            bound[p] = arg
+        for kw in call.keywords:
+            if kw.arg is None:
+                self.err(call, "**kwargs unpacking is not allowed")
+            elif kw.arg not in params:
+                self.err(call, f"{fname}() has no parameter '{kw.arg}'")
+            elif kw.arg in bound:
+                self.err(call, f"{fname}() got multiple values for '{kw.arg}'")
+            else:
+                bound[kw.arg] = kw.value
+        missing = [p for p in params if p not in bound]
+        if missing:
+            self.err(call, f"{fname}() missing argument(s): "
+                           + ", ".join(missing))
+            return []
+        param_steps: list[dict[str, Any]] = []
+        for p in params:
+            node = bound[p]
+            value = self.template_value(node) if isinstance(node, ast.JoinedStr) \
+                else self.eval_value(node)
+            param_steps.append({
+                "kind": "state", "id": p,
+                "state": [{"op": "set", "var": p, "value": value}],
+            })
+
+        # --- compile the body in a sub-compiler seeded with the outer scope
+        # (so refs to earlier global steps/vars still resolve). Local names
+        # may not shadow existing globals — that errors loudly. -------------
+        prefix = self._gen_id(fname)
+        self.step_ids.add(prefix)
+        sub = _Compiler()
+        sub.functions = self.functions
+        sub.expansion_stack = self.expansion_stack + [fname]
+        sub.item_names = set(self.item_names)
+        sub.step_ids = set(self.step_ids)
+        sub.value_names = set(self.value_names)
+        outer_ids = set(sub.step_ids)
+        for p in params:
+            sub._register_id(call, p)
+            sub.value_names.add(p)
+        body_steps = sub.compile_stmt_list(
+            copy.deepcopy(fn.body), top_level=False)
+        for iss in sub.issues:
+            self.issues.append(CompileIssue(
+                iss.line, f"in {fname}(): {iss.message}", iss.hint))
+
+        new_ids = sub.step_ids - outer_ids
+        mapping = {n: f"{prefix}__{n}" for n in new_ids}
+        renamed = _rename_expanded(param_steps + body_steps, mapping)
+        for n in sorted(new_ids):
+            self._register_id(call, mapping[n])
+        return renamed
+
+    def compile_stmt_list(
+        self, body: list[ast.stmt], *, top_level: bool,
+    ) -> list[dict[str, Any]]:
+        """Compile a statement sequence — the module body or a def body."""
+        steps: list[dict[str, Any]] = []
+        for stmt in body:
+            if isinstance(stmt, ast.FunctionDef):
+                if top_level:
+                    self.register_function(stmt)
+                else:
+                    self.err(stmt, "Nested function definitions are not "
+                                   "allowed")
+                continue
+            if isinstance(stmt, ast.Assign):
+                if len(stmt.targets) != 1 \
+                        or not isinstance(stmt.targets[0], ast.Name):
+                    self.err(stmt, "Assign each step to a single plain "
+                                   "variable")
+                    continue
+                if isinstance(stmt.value, ast.Call) \
+                        and isinstance(stmt.value.func, ast.Name) \
+                        and stmt.value.func.id in self.functions:
+                    self.err(stmt, f"'{stmt.value.func.id}' is a function — "
+                                   "functions have no return value",
+                             "call it as its own statement; to pass data out "
+                             "set a value inside the function (x = ...) ")
+                    continue
+                # plans/003 phase 3: `x = <expr>` (non-combinator RHS) is a
+                # VALUE assignment — compiles to a state set op; read back as
+                # vars.x (bare `x` works in later expressions).
+                if self.is_value_rhs(stmt.value):
+                    steps.append(self.compile_value_assign(
+                        stmt, stmt.targets[0].id, stmt.value,
+                    ))
+                    continue
+                s = self.compile_step_call(
+                    stmt.value, assigned_id=stmt.targets[0].id)
+                if s:
+                    steps.append(s)
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                fn_node = stmt.value.func
+                if isinstance(fn_node, ast.Name) and fn_node.id == "playbook":
+                    self.err(stmt, "playbook() must be the first statement "
+                                   "(once)")
+                    continue
+                if isinstance(fn_node, ast.Name) \
+                        and fn_node.id in self.functions:
+                    steps.extend(self.expand_call(stmt.value))
+                    continue
+                s = self.compile_step_call(stmt.value)
+                if s:
+                    steps.append(s)
+            elif isinstance(stmt, (ast.For, ast.While)):
+                self.err(stmt, "Python for/while loops are not allowed",
+                         "use loop(over=..., body=[...]) — it runs "
+                         "server-side with retries and visibility")
+            elif isinstance(stmt, ast.If):
+                self.err(stmt, "Python if statements are not allowed",
+                         "use if_(cond, then=[...], else_=[...])")
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                self.err(stmt, "Imports are not allowed",
+                         "the combinators (tool, llm, agent, if_, loop, ...) "
+                         "are built in; inside code('''...''') bodies imports "
+                         "ARE allowed")
+            elif isinstance(stmt, ast.Return):
+                self.err(stmt, "return is not allowed — functions are "
+                               "procedures",
+                         "set a value instead (x = <expr>); after the call "
+                         "the caller reads vars.<call_id>__x")
+            elif isinstance(stmt, (ast.AsyncFunctionDef, ast.ClassDef)):
+                self.err(stmt, "Class / async function definitions are not "
+                               "allowed")
+            else:
+                self.err(stmt, f"Unsupported statement "
+                               f"({type(stmt).__name__})",
+                         "a playbook is a sequence of step calls, value "
+                         "assignments, def functions, and function calls")
+        return steps
+
     def compile_step_list(self, node: ast.expr, what: str) -> list[dict[str, Any]]:
         """A list of step calls (then/else_/body/branch)."""
         if not isinstance(node, ast.List):
@@ -459,6 +702,16 @@ class _Compiler:
                 self.err(el, f"Each element of {what} must be a step call",
                          "to bind a computed value here use a walrus: "
                          "(x := <expression>)")
+                continue
+            # plans/004: function calls expand inline inside nested lists too.
+            if isinstance(call.func, ast.Name) and call.func.id in self.functions:
+                if assigned is not None:
+                    self.err(el, f"'{call.func.id}' is a function — functions "
+                                 "have no return value",
+                             "call it as its own element; to pass data out "
+                             "set a value inside the function (x = ...)")
+                    continue
+                steps.extend(self.expand_call(call))
                 continue
             s = self.compile_step_call(call, assigned_id=assigned)
             if s:
@@ -498,6 +751,43 @@ class _Compiler:
             step["args"] = tool_args
         # default id from the tool's last name segment
         return tool_name.split("__")[-1] if tool_name else "tool"
+
+    def _build_code(self, call, args, kwargs, step) -> str:
+        """plans/004: code('...', inputs={...}) — jailed Python, JSON in/out."""
+        source = ""
+        if args:
+            node = args[0]
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                source = node.value
+            else:
+                self.err(node, "code() first argument must be the Python "
+                               "source as a string literal",
+                         "use a triple-quoted string; the body runs jailed, "
+                         "sees `inputs` as a dict, and must return a "
+                         "JSON-serializable value")
+            for extra in args[1:]:
+                self.err(extra, "code() takes one positional argument "
+                                "(the source); pass data via inputs={...}")
+        else:
+            self.err(call, "code() requires the Python source as first "
+                           "argument")
+        step["source"] = source
+        if source:
+            body = textwrap.indent(
+                textwrap.dedent(source).strip("\n") or "pass", "    ")
+            try:
+                ast.parse("def __pb_main__(inputs):\n" + body)
+            except SyntaxError as e:
+                self.err(call, "code() source has a Python syntax error: "
+                               f"{e.msg} (source line {max((e.lineno or 1) - 1, 1)})")
+        if "inputs" in kwargs:
+            node = kwargs.pop("inputs")
+            if isinstance(node, ast.Dict):
+                step["code_inputs"] = self.template_value(node)
+            else:
+                self.err(node, "inputs= must be a dict literal, e.g. "
+                               "inputs={'raw': inputs.phone}")
+        return "code"
 
     def _prompt_common(self, call, args, kwargs, step) -> None:
         if args:
@@ -862,47 +1152,9 @@ def compile_playbook(source: str, *, name: str | None = None) -> PlaybookDef:
               "start with playbook(name=..., description=..., inputs=..., "
               "triggers=[...])")
 
-    steps: list[dict[str, Any]] = []
-    for stmt in body:
-        if isinstance(stmt, ast.Assign):
-            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
-                c.err(stmt, "Assign each step to a single plain variable")
-                continue
-            # plans/003 phase 3: `x = <expr>` (non-combinator RHS) is a VALUE
-            # assignment — compiles to a state set op; read back as vars.x
-            # (bare `x` works in later expressions).
-            if c.is_value_rhs(stmt.value):
-                steps.append(c.compile_value_assign(
-                    stmt, stmt.targets[0].id, stmt.value,
-                ))
-                continue
-            s = c.compile_step_call(stmt.value, assigned_id=stmt.targets[0].id)
-            if s:
-                steps.append(s)
-        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            fn = stmt.value.func
-            if isinstance(fn, ast.Name) and fn.id == "playbook":
-                c.err(stmt, "playbook() must be the first statement (once)")
-                continue
-            s = c.compile_step_call(stmt.value)
-            if s:
-                steps.append(s)
-        elif isinstance(stmt, (ast.For, ast.While)):
-            c.err(stmt, "Python for/while loops are not allowed",
-                  "use loop(over=..., body=[...]) — it runs server-side "
-                  "with retries and visibility")
-        elif isinstance(stmt, ast.If):
-            c.err(stmt, "Python if statements are not allowed",
-                  "use if_(cond, then=[...], else_=[...])")
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            c.err(stmt, "Imports are not allowed",
-                  "the combinators (tool, llm, agent, if_, loop, ...) are "
-                  "built in")
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            c.err(stmt, "Function/class definitions are not allowed")
-        else:
-            c.err(stmt, f"Unsupported statement ({type(stmt).__name__})",
-                  "a playbook is a flat sequence of step calls")
+    # plans/004: the statement walk lives on the compiler so def bodies
+    # reuse it. def must appear before its first call (single pass).
+    steps = c.compile_stmt_list(body, top_level=True)
 
     if name:
         header["name"] = name

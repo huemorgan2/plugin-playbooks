@@ -26,6 +26,8 @@ class StepKind(str, Enum):
     # 007.009.01: run-scoped state + early return.
     STATE = "state"
     HALT = "halt"
+    # plans/004: jailed Python via plugin-inline-code-run's code_run tool.
+    CODE = "code"
 
 
 # 007.009.01: ops a `state` step can apply to a run-scoped variable. One `state`
@@ -157,6 +159,13 @@ class StepDef(BaseModel):
 
     # state (007.009.01)
     state: list[StateOp] | None = None
+
+    # code (plans/004): `source` (not `code` — that name is the authoritative
+    # source column on Playbook) is the Python body run jailed by the
+    # code_run tool; `code_inputs` values are templated and reach the body as
+    # the `inputs` dict; the body's return value becomes steps.<id>.result.
+    source: str | None = None
+    code_inputs: dict[str, Any] | None = None
 
     # halt (007.009.01): optional guard + final value (the run's result).
     value: Any | None = None
