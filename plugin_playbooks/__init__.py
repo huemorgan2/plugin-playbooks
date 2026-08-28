@@ -474,6 +474,45 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
     return "\n".join(lines)
 
 
+# 0.24.0 (plans/013): the delegation tools get their OWN small skill — gating
+# them behind playbook-authoring would drag the ~12KB skill body into the MAIN
+# conversation just to unlock the tool, defeating the context-hygiene point.
+# The delegate itself receives the full authoring skill in ITS context.
+_DELEGATION_SKILL_BODY = '''\
+# Delegating playbook work
+
+`playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
+authoring job (create, fix, edit, add specs) to a focused background agent.
+It runs the full loop — read, edit, validate, dry-run, specs, promote — in
+its own context; your conversation keeps one tool call and one short result.
+
+## When to delegate vs. do it yourself
+
+Delegate the moment a job needs the authoring loop: creating a playbook,
+fixing a failing one, changing steps, adding or repairing specs. Load
+`playbook-authoring` and work inline only when the owner explicitly wants
+to build it together step by step, or the change is trivial and you already
+have the skill loaded this conversation.
+
+## Phrasing the task
+
+Write the task like a work order: goal + constraints + acceptance. Name the
+playbook for edit/fix jobs. Include what the owner told you (desired
+behavior, examples, the failing run's symptom). Good:
+"Fix the phone format in candidate-intake: numbers must normalize to
+E.164; all specs must pass; promote when green."
+
+## After calling
+
+A live progress card appears in the chat. If the result says `running`,
+tell the owner the card below tracks the work, then END YOUR TURN. Do not
+poll `playbook_agent_status` — use it only if the owner asks later. When
+the result carries a report (done / failed / needs_owner), relay it in
+owner words. Approval cards (e.g. promote) may appear mid-delegation —
+they are the delegate asking; the owner just approves or declines.
+'''
+
+
 class PlaybooksPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-playbooks",
@@ -523,6 +562,22 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_spec_from_run",
                     "playbook_preflight",
                     "playbook_language_reference",
+                ],
+            ),
+            # 0.24.0 (plans/013): small skill, big tool — see
+            # _DELEGATION_SKILL_BODY for why this is not in playbook-authoring.
+            SkillDef(
+                name="playbook-delegation",
+                description=(
+                    "delegate playbook building/fixing to a focused background "
+                    "agent with a live progress card — load when the owner wants "
+                    "a playbook created, fixed, or changed and you are not "
+                    "authoring it inline; playbook_agent unlocks on your next turn"
+                ),
+                body=_DELEGATION_SKILL_BODY,
+                tools=[
+                    "playbook_agent",
+                    "playbook_agent_status",
                 ],
             ),
         ],
@@ -612,6 +667,19 @@ class PlaybooksPlugin(LunaPlugin):
         ):
             self._register_tool(ctx, tool_def, handler)
 
+        # 0.24.0 (plans/013): delegation tools + restart hygiene for rows a
+        # dead process left at "running". Never block the load on the sweep.
+        from .delegation import build_delegation_tools, sweep_orphaned_delegations
+
+        for tool_def, handler in build_delegation_tools(
+            ctx, ctx.db_session_factory, self.AUTHORING_TOOLS,
+        ):
+            self._register_tool(ctx, tool_def, handler)
+        try:
+            await sweep_orphaned_delegations(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: orphan-delegation sweep failed: %s", e)
+
         self._register_trigger_tools(ctx)
 
         self._trigger_service = PlaybookTriggerService(
@@ -676,9 +744,21 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_language_reference",
     )
 
+    # 0.24.0 (plans/013): gated by the playbook-delegation skill (its own
+    # small SkillDef, NOT playbook-authoring — see _DELEGATION_SKILL_BODY).
+    # Both are chat-only surfaces; the degrade-visible rule for muted turns
+    # does not apply.
+    DELEGATION_TOOLS = (
+        "playbook_agent",
+        "playbook_agent_status",
+    )
+
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:
         if (
-            tool_def.name in self.AUTHORING_TOOLS
+            (
+                tool_def.name in self.AUTHORING_TOOLS
+                or tool_def.name in self.DELEGATION_TOOLS
+            )
             and getattr(ctx, "skill_registry", None) is not None
         ):
             try:

@@ -23,10 +23,10 @@ def test_identity():
 
 
 def test_tool_and_table_counts():
-    assert MANIFEST["requires"]["tools"] == 10
-    assert len(MANIFEST["tools"]) == 10
-    assert MANIFEST["requires"]["tables"] == 8
-    assert len(MANIFEST["db_tables"]) == 8
+    assert MANIFEST["requires"]["tools"] == 12
+    assert len(MANIFEST["tools"]) == 12
+    assert MANIFEST["requires"]["tables"] == 9
+    assert len(MANIFEST["db_tables"]) == 9
 
 
 def test_db_table_names():
@@ -39,6 +39,7 @@ def test_db_table_names():
         "playbook_specs",
         "playbook_probe_results",
         "playbook_drafts",
+        "playbook_delegations",
     }
 
 
@@ -46,8 +47,9 @@ def test_tool_policies():
     tools = {t["name"]: t for t in MANIFEST["tools"]}
     assert tools["playbook_run"]["risk_level"] == "medium"
     assert tools["playbook_set_autonomy"]["policy"] == "ask"
+    assert tools["playbook_agent"]["risk_level"] == "medium"
     low_auto = {n for n, t in tools.items() if t["policy"] == "auto_approve" and t["risk_level"] == "low"}
-    assert len(low_auto) == 8
+    assert len(low_auto) == 9
 
 
 def test_no_core_imports():

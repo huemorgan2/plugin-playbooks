@@ -1,7 +1,50 @@
 # 013 — playbook sub-agent: focused delegate with a live progress card in chat
 
-Status: PLANNED 2026-08-28. Depends on plans/012 (no point delegating the
-same slow loop — fix the round trips first, then isolate).
+Status: IN EXECUTION 2026-08-28 (phased; see phase folders). Depends on
+plans/012 — satisfied (012 EXECUTED 2026-08-28, shipped through 0.23.0).
+
+## Amendments (2026-08-28, pre-execution — verified against luna 0.85.006)
+
+Reconnaissance against the current core changed the mechanism; the goals
+stand. What the plan text below gets wrong, corrected here:
+
+1. **No luna core change is needed.** Everything the delegate loop needs
+   already shipped in core:
+   - luna 046/phase03: an explicit `tools=` allowlist to `run_turn`
+     BYPASSES skill-gating — the delegate can be handed the gated
+     authoring tools directly.
+   - luna 049 ("supervised subagent runs"): `ctx.agent.run_turn` grew
+     `max_turns` (the hard step budget — a breach returns `{"_aborted":
+     ...}`, never raises), `token_budget`, `timeout_s`, and
+     `event_stream_handler` (live per-event stream: tool calls AND
+     assistant text — the plan's event feed, incl. `thought` events).
+   - luna 0.40.003: headless tools run through the same dispatch gate as
+     chat — `prompt_always` tools raise real approval cards from
+     delegate turns (phase 3 builds on this, not on new machinery).
+2. **Card delivery is `ctx.post_chat_card(html)` (luna 056), not
+   "`embed_iframe` → URL".** The chat UI renders embeds via `srcDoc`
+   into a sandboxed iframe — a URL string would not render at all, and a
+   hosted-route iframe would hit the known widget cookie-auth pitfalls.
+   `post_chat_card` posts the card as its own timeline row, live over
+   SSE (`kind:"card"` carries the embed), excluded from model history.
+   The card is a self-contained srcdoc document, same pattern as
+   plugin-inline-code-run's execution card.
+3. **Card polling auth: a per-delegation capability token.** The
+   sandboxed iframe is opaque-origin — it can send neither the session
+   cookie nor a bearer header. The card polls an UNAUTHED status route
+   `GET /api/p/plugin-playbooks/delegations/{id}/card?token=...`; the
+   token is a random secret stored on the delegation row and baked into
+   the card HTML. Scope: read-only status of that one delegation.
+4. **Gating: own lightweight skill, not the authoring skill.** The plan
+   said "skill-gated alongside the other authoring tools", but that
+   would force the ~12KB authoring skill into the MAIN conversation to
+   unlock the tool — defeating the context-hygiene goal. Instead:
+   a separate small SkillDef `playbook-delegation` (~1KB body) gates
+   `playbook_agent` + `playbook_agent_status`. The delegate itself gets
+   the full authoring skill in ITS context, not the owner's.
+5. **Phases renumbered** (plan had 4): 1 delegation core, 2 progress
+   card, 3 approval parking, 4 dojo end-to-end. Executed in a worktree,
+   merged to main + pushed + published when green.
 
 ## Why a sub-agent (and why in-Luna, not external)
 
