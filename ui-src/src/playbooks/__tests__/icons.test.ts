@@ -96,6 +96,23 @@ describe('buildIconRef', () => {
   })
 })
 
+describe('hosted base-path prefix', () => {
+  it('prefixes plugin icon URLs with window.__LUNA_BASE (img src bypasses the fetch shim)', () => {
+    ;(globalThis as any).window = { __LUNA_BASE: '/a/vaselin-scanny-2' }
+    try {
+      const ref = buildIconRef(
+        reference({ tools: { monday_boards_list: 'plugin-monday' } }),
+        plugins,
+        null,
+      )
+      expect(toolIconUrl(ref, 'monday_boards_list'))
+        .toBe('/a/vaselin-scanny-2/api/plugins/plugin-monday/icon')
+    } finally {
+      delete (globalThis as any).window
+    }
+  })
+})
+
 describe('triggerIconUrl pattern matching', () => {
   const ref = buildIconRef(
     reference({

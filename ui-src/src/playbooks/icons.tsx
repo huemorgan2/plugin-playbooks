@@ -25,8 +25,11 @@ export function buildIconRef(
   connectors: ConnectorsStatus | null,
 ): IconRef {
   const hasImage = new Set(plugins.filter((p) => p.has_image).map((p) => p.name))
+  // Hosted tenants mount Luna under /a/<slug>; the serving shim rewrites
+  // fetch/XHR but not <img src>, so bake the prefix into the URL ourselves.
+  const base = (typeof window !== 'undefined' && (window as any).__LUNA_BASE) || ''
   const pluginIcon = (plugin: string | null | undefined): string | null =>
-    plugin && hasImage.has(plugin) ? `/api/plugins/${encodeURIComponent(plugin)}/icon` : null
+    plugin && hasImage.has(plugin) ? `${base}/api/plugins/${encodeURIComponent(plugin)}/icon` : null
 
   const toolIcons: Record<string, string> = {}
   for (const [tool, plugin] of Object.entries(reference.tools || {})) {
