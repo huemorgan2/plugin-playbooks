@@ -55,6 +55,11 @@ class Playbook(Base):
     # NULL = no candidate. A new save overwrites the pointer, not the history.
     candidate_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="enabled", nullable=False)
+    # 0.21.0 (plans/014): failure-digest ack, scoped per version. When it
+    # equals the effective live version the owner has decided about that
+    # version's failures and the prompt digest stays silent; any promote
+    # (new live version) re-arms it with no write here. NULL = never acked.
+    failures_acked_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)

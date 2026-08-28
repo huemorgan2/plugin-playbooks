@@ -6,6 +6,7 @@ on triggers or on demand.
 """
 
 import logging
+from datetime import datetime, timezone
 
 from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, SkillDef
 
@@ -23,6 +24,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_versions", "manifest", "TEXT NOT NULL DEFAULT ''"),  # 0.9.0
     ("playbooks", "live_version", "INTEGER NOT NULL DEFAULT 0"),    # 0.10.0
     ("playbooks", "candidate_version", "INTEGER"),                  # 0.10.0
+    ("playbooks", "failures_acked_version", "INTEGER"),             # 0.21.0
 ]
 
 
@@ -344,6 +346,134 @@ are rejected at authoring time.
 '''
 
 
+# ---- plans/014: failed-run awareness ---------------------------------------
+# The agent learns about failing playbooks AMBIENTLY: prompt_sections() is
+# re-read by core on every agent turn, so a conditional digest section below
+# reaches the agent at the start of its next natural turn. No muted message,
+# no spawned turn — the "no interrupting messages" constraint is structural.
+
+
+def _rel_age(dt: datetime | None, now: datetime) -> str:
+    # Server-computed relative age — the agent has no clock; never hand it
+    # raw timestamps to do math on.
+    if dt is None:
+        return "at an unknown time"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    secs = max(0.0, (now - dt).total_seconds())
+    if secs < 90:
+        return "just now"
+    if secs < 90 * 60:
+        return f"{int(secs // 60)} minutes ago"
+    if secs < 36 * 3600:
+        return f"{int(secs // 3600)} hours ago"
+    return f"{int(secs // 86400)} days ago"
+
+
+async def failure_digest(session) -> list[dict]:
+    """Failed-run summary per enabled playbook.
+
+    Scope: runs of the CURRENT live version only (an edit+promote resets the
+    count — "since the last change"), status 'failed', gated on the
+    version-scoped ack. Candidate runs are excluded by construction (their
+    playbook_version is the candidate number); dry runs and spec evaluations
+    never write playbook_runs rows. One grouped query over the
+    (playbook_id, started_at) index; the per-playbook detail queries run only
+    for playbooks that are actually failing.
+    """
+    from sqlalchemy import case, func, select
+
+    from .models import Playbook, PlaybookRun, PlaybookVersion
+
+    eff_live = func.coalesce(func.nullif(Playbook.live_version, 0), Playbook.version)
+    failed = func.sum(case((PlaybookRun.status == "failed", 1), else_=0))
+    finished = func.sum(
+        case((PlaybookRun.status.in_(("failed", "done")), 1), else_=0)
+    )
+    rows = (await session.execute(
+        select(
+            Playbook.id,
+            Playbook.name,
+            eff_live.label("live"),
+            failed.label("failed"),
+            finished.label("finished"),
+        )
+        .join(
+            PlaybookRun,
+            (PlaybookRun.playbook_id == Playbook.id)
+            & (PlaybookRun.playbook_version == eff_live),
+        )
+        .where(Playbook.status == "enabled")
+        .where(
+            (Playbook.failures_acked_version.is_(None))
+            | (Playbook.failures_acked_version != eff_live)
+        )
+        .group_by(Playbook.id, Playbook.name, Playbook.live_version, Playbook.version)
+        .having(failed > 0)
+    )).all()
+
+    out: list[dict] = []
+    for pid, name, live, n_failed, n_finished in rows:
+        last = (await session.execute(
+            select(PlaybookRun)
+            .where(
+                PlaybookRun.playbook_id == pid,
+                PlaybookRun.playbook_version == live,
+                PlaybookRun.status == "failed",
+            )
+            .order_by(PlaybookRun.started_at.desc())
+            .limit(1)
+        )).scalars().first()
+        promoted_at = (await session.execute(
+            select(PlaybookVersion.created_at)
+            .where(
+                PlaybookVersion.playbook_id == pid,
+                PlaybookVersion.version == live,
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+        out.append({
+            "name": name,
+            "live_version": int(live),
+            "failed": int(n_failed),
+            "finished": int(n_finished),
+            "last_failed_run_id": str(last.id) if last else None,
+            "last_failed_at": last.started_at if last else None,
+            "promoted_at": promoted_at,
+        })
+    return out
+
+
+def render_failure_section(digest: list[dict], now: datetime | None = None) -> str:
+    if not digest:
+        return ""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    lines = ["## Playbook failures needing your attention"]
+    for d in digest:
+        promoted = (
+            f", promoted {_rel_age(d['promoted_at'], now)}" if d["promoted_at"] else ""
+        )
+        lines.append(
+            f"- `{d['name']}`: {d['failed']} of {d['finished']} runs FAILED "
+            f"since its last change (v{d['live_version']}{promoted}). "
+            f"Last failure {_rel_age(d['last_failed_at'], now)} "
+            f"(run_id {d['last_failed_run_id']}, inspect with playbook_status)."
+        )
+    lines += [
+        "",
+        "You OWN these failures. First call playbook_status(run_id) to see "
+        "what broke, then tell the owner in the next normal conversation "
+        "turn — after finishing whatever they asked for, not instead of it. "
+        "Ask what they want to do and offer: fix it (playbook_edit → "
+        "promote), disable the playbook, or dismiss this notice "
+        "(playbook_ack_failures). Never derail a muted or trigger turn for "
+        "this. The ages above are server-computed — repeat them as given; "
+        "do not do timestamp math.",
+    ]
+    return "\n".join(lines)
+
+
 class PlaybooksPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-playbooks",
@@ -635,6 +765,14 @@ class PlaybooksPlugin(LunaPlugin):
                     Playbook.when_to_use,
                 ).where(Playbook.status == "enabled")
             )).all()
+            # plans/014: failing-playbooks digest — same session, rendered
+            # as its own section below only when non-empty.
+            # A digest failure must not take down the playbook list section.
+            try:
+                digest = await failure_digest(session)
+            except Exception:  # noqa: BLE001
+                logger.exception("playbooks: failure digest query failed")
+                digest = []
 
         if not rows:
             return []
@@ -664,7 +802,10 @@ class PlaybooksPlugin(LunaPlugin):
             "run was started from, live.",
         ]
 
-        return ["\n".join(lines)]
+        sections = ["\n".join(lines)]
+        if failure_section := render_failure_section(digest):
+            sections.append(failure_section)
+        return sections
 
     async def on_unload(self) -> None:
         if self._trigger_service:

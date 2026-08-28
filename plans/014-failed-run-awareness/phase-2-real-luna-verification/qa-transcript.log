@@ -1,0 +1,53 @@
+owner ready
+PASS  create failing playbook — {"detail":"Playbook 'qa-014-failing' already exists"}
+PASS  both runs FAILED — {"3de2069f-c7da-42e4-9818-243af23c29aa": "failed", "58f7ea32-95a9-4776-b8eb-7cf50aea6b0e": "failed"}
+
+--- turn 1 prose ---
+ Let me check on that playbook failure and see what's going on.Hey! One thing to flag: there's a playbook called **qa-014-failing** that's been failing on every run (4 out of 4). It's a QA test playbook with a deliberate division-by-zero error (`{{ 1 / 0 }}`), so it's designed to break.
+
+Since the description says "safe to delete," would you like me to:
+- **Delete/disable it** to clear the noise, or
+- **Dismiss the failure notice** if you just want it quiet for now?
+
+---
+
+Beyond that — I don't have a mission from you yet, so my research engine, wiki, and proactive work loop are all dormant. If there's a piece of work you'd love to hand off — something you want owned and tracked, not just answered once — I'd be the right place for it. You tell me what the job is, I make myself qualified for it first (you'll see exactly what I'm missing and how close I am), then I run it as my standing job: researching, building knowledge, watching over it while you sleep. What's the work you most want off your plate?Hey! One thing to flag: there's a playbook called **qa-014-failing** that's been failing on every run (4 out of 4). It's a QA test playbook with a deliberate division-by-zero error (`{{ 1 / 0 }}`), so it's designed to break.
+
+Since the description says "safe to delete," would you like me to:
+- **Delete/disable it** to clear the noise, or
+- **Dismiss the failure notice** if you just want it quiet for now?
+
+---
+
+Beyond that — I don't have a mission from you yet, so my research engine, wiki, and proactive work loop are all dormant. If there's a piece of work you'd love to hand off — something you want owned and tracked, not just answered once — I'd be the right place for it. You tell me what the job is, I make myself qualified for it first (you'll see exactly what I'm missing and how close I am), then I run it as my standing job: researching, building knowledge, watching over it while you sleep. What's the work you most want off your plate?
+[tools called: playbook_status] 
+
+PASS  turn 1 surfaces the failing playbook — Let me check on that playbook failure and see what's going on.Hey! One thing to flag: there's a playbook called **qa-014-failing** that's been failing on every run (4 out of 4). It's a QA test playboo
+
+--- turn 2 prose ---
+ Done — dismissed. It'll only pop back up if the playbook itself changes and fails again.
+
+Let me know if there's anything else, or if you've got a job you'd like to hand off!Done — dismissed. It'll only pop back up if the playbook itself changes and fails again.
+
+Let me know if there's anything else, or if you've got a job you'd like to hand off!
+[tools called: playbook_ack_failures] 
+
+PASS  ack recorded in DB (failures_acked_version == 1) — 1
+
+--- turn 3 prose ---
+ Let me check on your playbooks right now.You've got one playbook: **QA 014 failing** — it's enabled but marked as QA-only (description says "safe to delete"). It's not meant for real work.
+
+In short: no production playbooks yet. Once you give me a mission — the work you want me to own — I'll build playbooks tailored to it. That's where things get powerful: recurring workflows that run on a schedule, handle multi-step jobs, and deliver results without you lifting a finger.
+
+What's the piece of work you'd most like off your plate? 🌙You've got one playbook: **QA 014 failing** — it's enabled but marked as QA-only (description says "safe to delete"). It's not meant for real work.
+
+In short: no production playbooks yet. Once you give me a mission — the work you want me to own — I'll build playbooks tailored to it. That's where things get powerful: recurring workflows that run on a schedule, handle multi-step jobs, and deliver results without you lifting a finger.
+
+What's the piece of work you'd most like off your plate? 🌙
+[tools called: playbook_list] 
+
+PASS  turn 3 does not re-raise the dismissed failure — Let me check on your playbooks right now.You've got one playbook: **QA 014 failing** — it's enabled but marked as QA-only (description says "safe to delete"). It's not meant for real work.
+
+In short: 
+
+5/5 checks passed
