@@ -140,7 +140,7 @@ async def test_get_definition_derives_code_for_yaml_playbooks(env):
 @pytest.mark.asyncio
 async def test_edit_with_code_saves_a_candidate(env):
     # 0.10.0: a save creates a CANDIDATE version row — live is untouched
-    # until playbook_promote.
+    # until playbook_publish.
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     new_code = CODE.replace("inputs.greeting", "inputs.name")

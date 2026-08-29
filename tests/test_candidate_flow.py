@@ -1,7 +1,7 @@
 """0.10.0 (plans/002 phase 3) — candidate versions, promote, rollback.
 
 A save creates a CANDIDATE version row; live content on the playbook row is
-untouched until playbook_promote passes the gate. playbook_rollback restores
+untouched until playbook_publish passes the gate. playbook_rollback restores
 the previous live version. dry_run targets the candidate by default;
 playbook_run_candidate is a supervised real run of the candidate.
 """
@@ -51,8 +51,11 @@ class _Runner:
         self.dry_ran.append(playbook)
         return {"ok": True, "playbook": playbook.name}
 
-    async def start_run_background(self, playbook, inputs=None, trigger=None):
+    async def start_run_background(
+        self, playbook, inputs=None, trigger=None, is_test=False,
+    ):
         self.started.append((playbook, trigger))
+        self.last_is_test = is_test
         return _FakeRun()
 
     async def wait_for_run(self, run_id, timeout=None):
@@ -93,6 +96,25 @@ async def _rows(sf) -> dict[int, PlaybookVersion]:
             v.version: v
             for v in (await s.execute(select(PlaybookVersion))).scalars().all()
         }
+
+
+async def _green_run(sf, version: int, *, is_test: bool = True) -> None:
+    """0.26.0: satisfy the publish test-run gate — a completed green run of
+    exactly `version`, recorded after the version row was created."""
+    from datetime import datetime, timedelta, timezone
+
+    from plugin_playbooks.models import PlaybookRun
+
+    later = datetime.now(timezone.utc) + timedelta(seconds=5)
+    async with sf() as s:
+        pb = (await s.execute(select(Playbook))).scalars().first()
+        s.add(PlaybookRun(
+            playbook_id=pb.id, playbook_version=version, status="done",
+            trigger="agent-candidate" if is_test else "schedule",
+            is_test=is_test, started_at=later,
+            completed_at=later + timedelta(seconds=1),
+        ))
+        await s.commit()
 
 
 async def _save_candidate(tools, code: str = NEW_CODE) -> dict:
@@ -138,7 +160,7 @@ async def test_save_creates_candidate_and_leaves_live_untouched(env):
     assert out["status"] == "candidate_saved"
     assert out["candidate_version"] == 2
     assert out["live_version"] == 1
-    assert "playbook_promote" in out["next"]
+    assert "playbook_publish" in out["next"]
     pb = await _get(sf)
     assert pb.code == CODE                      # live untouched
     assert pb.definition["steps"][0]["args"] == {"message": "{{ inputs.greeting }}"}
@@ -222,13 +244,14 @@ async def test_promote_swaps_live_and_records_lineage(env):
     sf, tools, _, bus = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
+    await _green_run(sf, 2)
     bus.events.clear()
-    out = json.loads(await tools["playbook_promote"](name="greeter"))
-    assert out["status"] == "promoted"
+    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    assert out["status"] == "published"
     assert out["live_version"] == 2
     assert out["previous_live_version"] == 1
     assert [g["gate"] for g in out["gates"]] == [
-        "static_validation", "specs", "manifest_drift", "probes",
+        "static_validation", "specs", "test_run", "manifest_drift", "probes",
     ]
     assert all(g["ok"] for g in out["gates"])
     pb = await _get(sf)
@@ -244,7 +267,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
 async def test_promote_without_candidate_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_promote"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](name="greeter"))
     assert "no candidate" in out["error"]
 
 
@@ -265,7 +288,7 @@ async def test_promote_gate_names_static_validation_failure(env):
         }]
         row.definition = bad
         await s.commit()
-    out = json.loads(await tools["playbook_promote"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](name="greeter"))
     assert "static_validation" in out["error"]
     assert out["gate"] == "static_validation"
     assert out["issues"]
@@ -281,8 +304,9 @@ async def test_promote_keeps_live_manifest(env):
         name="greeter", code=CODE, manifest="## Purpose\nGreets.\n",
     )
     await _save_candidate(tools)
-    out = json.loads(await tools["playbook_promote"](name="greeter"))
-    assert out["status"] == "promoted"
+    await _green_run(sf, 2)
+    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    assert out["status"] == "published"
     pb = await _get(sf)
     assert pb.manifest == "## Purpose\nGreets.\n"
 
@@ -294,7 +318,11 @@ async def test_rollback_restores_previous_live(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
-    await tools["playbook_promote"](name="greeter")
+    await _green_run(sf, 2)
+    await tools["playbook_publish"](name="greeter")
+    # rollback publishes v1 through the same gate — its live history is
+    # the evidence.
+    await _green_run(sf, 1, is_test=False)
     out = json.loads(await tools["playbook_rollback"](name="greeter"))
     assert out["status"] == "rolled_back"
     assert out["live_version"] == 1
@@ -349,7 +377,7 @@ async def test_live_run_notes_pending_candidate(env):
     await _save_candidate(tools)
     out = json.loads(await tools["playbook_run"](name="greeter"))
     assert "LIVE version (1)" in out["note"]
-    assert "playbook_promote" in out["note"]
+    assert "playbook_publish" in out["note"]
     live, trigger = runner.started[-1]
     assert live.definition["steps"][0]["args"] == {"message": "{{ inputs.greeting }}"}
 
@@ -377,7 +405,7 @@ async def test_manifest_set_with_pending_candidate_keeps_versions_unique(env):
 
 def test_new_tool_policies():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _Runner())}
-    for name in ("playbook_promote", "playbook_rollback", "playbook_run_candidate"):
+    for name in ("playbook_publish", "playbook_rollback", "playbook_run_candidate"):
         assert tds[name].policy == "prompt_always", name
         assert tds[name].risk_level == "medium", name
     assert "version" in tds["playbook_dry_run"].parameters["properties"]

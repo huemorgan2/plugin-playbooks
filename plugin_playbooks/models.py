@@ -11,7 +11,7 @@ pre-split schema (existing rows must keep loading); creation happens in
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from luna_sdk import JSONB, UUID, declarative_base
@@ -57,10 +57,15 @@ class Playbook(Base):
     status: Mapped[str] = mapped_column(String(32), default="enabled", nullable=False)
     # 0.21.0 (plans/014): failure-digest ack, scoped per version. When it
     # equals the effective live version the owner has decided about that
-    # version's failures and the prompt digest stays silent; any promote
+    # version's failures and the prompt digest stays silent; any publish
     # (new live version) re-arms it with no write here. NULL = never acked.
     failures_acked_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
+    # 0.26.0 (plans/015, 089 §3): may the agent PUBLISH fixes to this playbook
+    # without asking? 'ask' (default) | 'auto'. Distinct from agent_autonomy,
+    # which governs who may RUN it. 'auto' is only honored in the ops chat's
+    # fix_publish state — chat state gates broadly, this refines.
+    publish_autonomy: Mapped[str] = mapped_column(String(16), default="ask", nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
     cost_estimate_cents: Mapped[float | None] = mapped_column(nullable=True)
@@ -145,6 +150,15 @@ class PlaybookRun(Base):
     # trigger/cron runs). agent_steps pin it so send_chat_message lands
     # in the right chat.
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
+    # 0.26.0 (plans/015, 089 §1): the conversation this run's chat output
+    # DELIVERS to, stamped at creation — live runs → the ops chat, test runs →
+    # their originating chat. NULL = unroutable (no ops chat on this core);
+    # delivery then behaves as before 0.26. Never resolved at delivery time.
+    report_to: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
+    # 0.26.0 (plans/015, 089 §1): True for test runs of a draft/candidate
+    # version. Test runs are excluded from the failure digest and production
+    # stats, and are the evidence playbook_publish's test gate looks for.
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -181,8 +195,8 @@ class PlaybookSpec(Base):
 
     A spec is fixture inputs + scripted stubs + assertions over the dry-run
     trace (see specs.SpecDef). Specs auto-run on every candidate save and
-    gate playbook_promote. `last_*` cache the most recent evaluation for the
-    list tool, the promote gate report, and UI badges.
+    gate playbook_publish. `last_*` cache the most recent evaluation for the
+    list tool, the publish gate report, and UI badges.
     """
     __tablename__ = "playbook_specs"
 
@@ -214,7 +228,7 @@ class PlaybookSpec(Base):
 class PlaybookProbeResult(Base):
     """0.12.0 (plans/002 phase 5): cached preflight probe results, one row
     per (playbook, tool). status: ok | unprobeable | failed. Feeds the
-    promote gate note, UI badges, and the daily re-probe's transition
+    publish gate note, UI badges, and the daily re-probe's transition
     detection (a row flipping into `failed` triggers a chat alert)."""
     __tablename__ = "playbook_probe_results"
 
@@ -262,6 +276,41 @@ class PlaybookDelegation(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class PlaybookFixProposal(Base):
+    """0.26.0 (plans/015, 089 §4): dedupe ledger for production-failure fix
+    proposals. One OPEN row per (playbook, failure signature); a repeated
+    failure updates the row (count/last_run_id) instead of filing a second
+    proposal. Card/approval plumbing keys off this row; on cores without an
+    ops chat the rows still record failures for when one appears.
+    """
+    __tablename__ = "playbook_fix_proposals"
+
+    __table_args__ = (
+        Index("ix_playbook_fix_proposals_pb_sig", "playbook_id", "signature"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    # sha1 over (playbook, failed step, normalized error head) — the failure's
+    # identity across repeats.
+    signature: Mapped[str] = mapped_column(String(40), nullable=False)
+    # open | approved | dismissed | resolved
+    status: Mapped[str] = mapped_column(String(16), default="open", nullable=False)
+    title: Mapped[str] = mapped_column(String(256), default="", nullable=False)
+    diagnosis: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
+    approval_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
 

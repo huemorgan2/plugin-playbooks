@@ -143,7 +143,7 @@ var card=document.getElementById('card'),headline=document.getElementById('headl
     elapsedEl=document.getElementById('elapsed'),waitingEl=document.getElementById('waiting');
 var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='',
     everPolled=false;
-var WAIT_WORDS={{playbook_promote:'make the change live',
+var WAIT_WORDS={{playbook_publish:'make the change live',
   playbook_rollback:'roll back the live version',
   playbook_edit_force:'force past failing specs',
   playbook_manifest_set:"change the playbook's contract",

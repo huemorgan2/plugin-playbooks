@@ -13,7 +13,7 @@ Core seams used (all shipped, no core changes):
 - luna 049: ``max_turns`` (hard step budget — breach returns ``{"_aborted"}``),
   ``timeout_s``, and ``event_stream_handler`` (the live event feed).
 - luna 0.40.003: headless tools run the same dispatch gate as chat, so
-  ``prompt_always`` tools (promote, spec_delete) still raise approval cards.
+  ``prompt_always`` tools (publish, spec_delete) still raise approval cards.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ _PHASE_BY_TOOL = {
     "playbook_spec_delete": "Prove",
     "playbook_preflight": "Prove",
     "playbook_run_candidate": "Prove",
-    "playbook_promote": "Ship",
+    "playbook_publish": "Ship",
     "playbook_rollback": "Ship",
 }
 
@@ -86,7 +86,7 @@ _GATED_TOOLS = frozenset({
     "playbook_set_autonomy",
     "playbook_edit_force",
     "playbook_manifest_set",
-    "playbook_promote",
+    "playbook_publish",
     "playbook_rollback",
     "playbook_run_candidate",
     "playbook_spec_delete",
@@ -100,7 +100,7 @@ _WAITING_THRESHOLD_S = 8.0
 # has to approve it. The tool code itself must never reach the owner's eyes
 # (vocabulary rule): the status message hands the model these words instead.
 _GATED_TOOL_OWNER_WORDS = {
-    "playbook_promote": "make the change live",
+    "playbook_publish": "make the change live",
     "playbook_rollback": "roll back the live version",
     "playbook_edit_force": "force past failing specs",
     "playbook_manifest_set": "change the playbook's contract",
@@ -197,8 +197,8 @@ def _delegate_prompt(skill_body: str, task: str, pb: Playbook | None) -> str:
         "what changed, what is proven (specs/dry-runs), what (if anything) "
         "needs the owner.",
         "- Follow the authoring loop: read → edit → validate → dry_run → "
-        "specs → promote. A candidate is NOT done until promoted.",
-        "- Approval-gated tools (promote, spec_delete) show the owner a "
+        "specs → publish. A candidate is NOT done until published.",
+        "- Approval-gated tools (publish, spec_delete) show the owner a "
         "card and may take a while — call them and wait; never work around "
         "a refusal.",
         "- You have a hard budget of about 40 tool calls. If the job is "
@@ -563,7 +563,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                     "Delegate a playbook authoring job (create, fix, edit, "
                     "add specs) to a focused background agent. It works "
                     "through the full loop (read, edit, validate, dry-run, "
-                    "specs, promote) in its own context; a live progress "
+                    "specs, publish) in its own context; a live progress "
                     "card appears in the chat. Returns within wait_seconds "
                     "(default 25): either the finished report or status "
                     "'running' — then tell the owner the card tracks the "
@@ -578,7 +578,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                                 "The job, phrased with goal + acceptance, "
                                 "e.g. 'Fix the phone format in "
                                 "candidate-intake: normalize to E.164; all "
-                                "specs must pass; promote when green.'"
+                                "specs must pass; publish when green.'"
                             ),
                         },
                         "playbook": {

@@ -25,6 +25,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "live_version", "INTEGER NOT NULL DEFAULT 0"),    # 0.10.0
     ("playbooks", "candidate_version", "INTEGER"),                  # 0.10.0
     ("playbooks", "failures_acked_version", "INTEGER"),             # 0.21.0
+    # 0.26.0 (plans/015, 089): build/operate split
+    ("playbooks", "publish_autonomy", "VARCHAR(16) NOT NULL DEFAULT 'ask'"),
+    ("playbook_runs", "report_to", "UUID"),
+    ("playbook_runs", "is_test", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 
@@ -293,22 +297,22 @@ refusal does not burn it); or `playbook_manifest_set` (asks the owner); or
 asks). NEVER work around a refusal any other way. Pass `manifest=` to
 `playbook_propose` on create; if a playbook has none, propose one.
 
-### CANDIDATE → PROMOTE (a save never changes the running playbook)
+### CANDIDATE → PUBLISH (a save never changes the running playbook)
 Saving an edit creates a CANDIDATE — the LIVE playbook keeps running
-unchanged until you promote. Loop: edit → `candidate_saved` (one candidate
+unchanged until you publish. Loop: edit → `candidate_saved` (one candidate
 max; history keeps every version) → `playbook_dry_run` (candidate by
-default) → optional REAL supervised proof `playbook_run_candidate` (asks the
-owner) → `playbook_promote(name)` — the gate (static
-validation + SPECS) makes it live; a refusal names the failing gate — fix
-the candidate, never bypass. `playbook_rollback(name)` restores the
-previous live version. NEVER report an edit as done after
-`candidate_saved` — the old version runs until promote succeeds.
+default) → REAL supervised proof `playbook_run_candidate` (asks the owner)
+→ `playbook_publish(name)` — gates: static validation, SPECS, a green test
+run since the last edit; a refusal names the failing gate — fix the
+candidate, never bypass. `playbook_rollback(name)` restores the previous
+live version. NEVER report an edit as done after `candidate_saved` — the
+old version runs until publish succeeds.
 
 ### SPECS (playbook tests)
 A spec is a stored test: fixture `inputs`, scripted `stubs` (step-id or
 tool-name → pretended output), and `expect` assertions over the dry-run
-trace. Specs run automatically on every candidate save and are a PROMOTE
-GATE — a failing spec blocks `playbook_promote` until the code is fixed or
+trace. Specs run automatically on every candidate save and are a PUBLISH
+GATE — a failing spec blocks `playbook_publish` until the code is fixed or
 the spec updated.
 - Write stubs from recorded reality, not memory: after ANY real run — even
 a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
@@ -325,7 +329,7 @@ fail on harmless changes.
 Specs stub the outside world; `playbook_preflight(name)` probes every tool
 the playbook touches: `ok`, `unprobeable` (no probe declared — common, NOT
 an error), `failed` (missing tool, dead credential, gone resource — blocks
-promote). Run it when a playbook misbehaves despite passing specs, or before promoting external-service
+publish). Run it when a playbook misbehaves despite passing specs, or before publishing external-service
 playbooks.
 
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
@@ -334,7 +338,7 @@ always an INSERTION mid-graph, NOT a step bolted on the end, NEVER a second
 monolith. Recipe: read stage → find the SEAM ('for each role' means inside
 the per-role loop() body) → splice the new steps there, decomposed →
 RE-POINT downstream refs to the NEW step's output (this rewiring is the real
-work) → validate → dry_run → fix any failed specs → promote. Never create a
+work) → validate → dry_run → fix any failed specs → publish. Never create a
 '-v2' copy — edit IN PLACE by name.
 
 ### Posting to the chat from a playbook:
@@ -373,7 +377,7 @@ def _rel_age(dt: datetime | None, now: datetime) -> str:
 async def failure_digest(session) -> list[dict]:
     """Failed-run summary per enabled playbook.
 
-    Scope: runs of the CURRENT live version only (an edit+promote resets the
+    Scope: runs of the CURRENT live version only (an edit+publish resets the
     count — "since the last change"), status 'failed', gated on the
     version-scoped ack. Candidate runs are excluded by construction (their
     playbook_version is the candidate number); dry runs and spec evaluations
@@ -401,7 +405,10 @@ async def failure_digest(session) -> list[dict]:
         .join(
             PlaybookRun,
             (PlaybookRun.playbook_id == Playbook.id)
-            & (PlaybookRun.playbook_version == eff_live),
+            & (PlaybookRun.playbook_version == eff_live)
+            # 0.26.0 (plans/015, 089 §1): test runs never count as
+            # production failures.
+            & (PlaybookRun.is_test.is_(False)),
         )
         .where(Playbook.status == "enabled")
         .where(
@@ -420,6 +427,7 @@ async def failure_digest(session) -> list[dict]:
                 PlaybookRun.playbook_id == pid,
                 PlaybookRun.playbook_version == live,
                 PlaybookRun.status == "failed",
+                PlaybookRun.is_test.is_(False),
             )
             .order_by(PlaybookRun.started_at.desc())
             .limit(1)
@@ -466,7 +474,7 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
         "what broke, then tell the owner in the next normal conversation "
         "turn — after finishing whatever they asked for, not instead of it. "
         "Ask what they want to do and offer: fix it (playbook_edit → "
-        "promote), disable the playbook, or dismiss this notice "
+        "publish), disable the playbook, or dismiss this notice "
         "(playbook_ack_failures). Never derail a muted or trigger turn for "
         "this. The ages above are server-computed — repeat them as given; "
         "do not do timestamp math.",
@@ -483,7 +491,7 @@ _DELEGATION_SKILL_BODY = '''\
 
 `playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
 authoring job (create, fix, edit, add specs) to a focused background agent.
-It runs the full loop — read, edit, validate, dry-run, specs, promote — in
+It runs the full loop — read, edit, validate, dry-run, specs, publish — in
 its own context; your conversation keeps one tool call and one short result.
 
 ## When to delegate vs. do it yourself
@@ -500,7 +508,7 @@ Write the task like a work order: goal + constraints + acceptance. Name the
 playbook for edit/fix jobs. Include what the owner told you (desired
 behavior, examples, the failing run's symptom). Good:
 "Fix the phone format in candidate-intake: numbers must normalize to
-E.164; all specs must pass; promote when green."
+E.164; all specs must pass; publish when green."
 
 ## After calling
 
@@ -508,7 +516,7 @@ A live progress card appears in the chat. If the result says `running`,
 tell the owner the card below tracks the work, then END YOUR TURN. Do not
 poll `playbook_agent_status` — use it only if the owner asks later. When
 the result carries a report (done / failed / needs_owner), relay it in
-owner words. Approval cards (e.g. promote) may appear mid-delegation —
+owner words. Approval cards (e.g. publish) may appear mid-delegation —
 they are the delegate asking; the owner just approves or declines.
 '''
 
@@ -518,7 +526,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.25.3",
+        version="0.26.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -551,7 +559,7 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_edit",
                     "playbook_edit_force",
                     "playbook_manifest_set",
-                    "playbook_promote",
+                    "playbook_publish",
                     "playbook_rollback",
                     "playbook_run_candidate",
                     "playbook_get_definition",
@@ -594,6 +602,7 @@ class PlaybooksPlugin(LunaPlugin):
         self._trigger_service = None
         self._binding_service = None
         self._session_factory = None
+        self._fix_proposals = None
 
     async def on_load(self, ctx: PluginContext) -> None:
         self._session_factory = ctx.db_session_factory
@@ -666,12 +675,24 @@ class PlaybooksPlugin(LunaPlugin):
             ctx.db_session_factory, self._runner, ctx.events,
             sync_bindings=self.sync_trigger_bindings,
             trigger_sources=ctx.trigger_sources,
+            ctx=ctx,
         )
 
         for tool_def, handler in build_tools(
-            ctx.db_session_factory, ctx.events, self._runner,
+            ctx.db_session_factory, ctx.events, self._runner, ctx,
         ):
             self._register_tool(ctx, tool_def, handler)
+
+        # 0.26.0 (plans/015, 089 §4): file fix proposals for live failures.
+        from .fix_proposals import FixProposalService
+
+        self._fix_proposals = FixProposalService(
+            ctx.db_session_factory, ctx.events, ctx,
+        )
+        try:
+            self._fix_proposals.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: fix-proposal service failed to start: %s", e)
 
         # 0.25.0 (plans/013): delegation tools + restart hygiene for rows a
         # dead process left at "running". Never block the load on the sweep.
@@ -730,7 +751,7 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_edit",
         "playbook_edit_force",       # 0.10.0: gate the whole edit flow
         "playbook_manifest_set",
-        "playbook_promote",
+        "playbook_publish",
         "playbook_rollback",
         "playbook_run_candidate",
         "playbook_get_definition",
@@ -836,7 +857,44 @@ class PlaybooksPlugin(LunaPlugin):
             _list_available_triggers,
         )
 
-    async def prompt_sections(self) -> list[str]:
+    # 089 §5: the ops chat's mode, in plain words. Keys are the contract's
+    # state names; the text is what the agent reads.
+    _OPS_MODE_SECTIONS = {
+        "identify": (
+            "## Ops chat — mode: Identify\n"
+            "You are operating, not building. Monitor production playbook "
+            "activity, diagnose failures, and LIST the fixes to be made as "
+            "proposals for the owner to approve — a triage inbox, not a "
+            "passive log. Editing, running, and publishing tools are off in "
+            "this mode; suggest the owner switch the chat to a fix mode "
+            "when they want changes made."
+        ),
+        "fix_approve": (
+            "## Ops chat — mode: Fix & wait for approval\n"
+            "You may edit and test fixes in a playbook's DRAFT (candidate) "
+            "— production is never touched here. When a fix's test run is "
+            "green, post 'fix ready — tests green, publish?' with the "
+            "evidence and WAIT for the owner. The publish tool is absent in "
+            "this mode on purpose: publishing happens only through the "
+            "owner approving your proposal."
+        ),
+        "fix_publish": (
+            "## Ops chat — mode: Fix & publish\n"
+            "You may fix and publish yourself. The publish gate is "
+            "machine-checked and WILL refuse a draft with no green test run "
+            "since its last edit — run the test first "
+            "(playbook_run_candidate) instead of arguing with the gate. "
+            "Playbooks whose publish autonomy is 'ask' still wait for the "
+            "owner's approval even here."
+        ),
+    }
+
+    async def prompt_sections(
+        self, kind: str | None = None, state: str | None = None,
+    ) -> list[str]:
+        # 0.26.0 (plans/015, 089 contract #6): core passes the current
+        # chat's kind/state; pre-089 cores call with no args (None/None →
+        # the pre-0.26 rendering, unchanged).
         if not self._session_factory:
             return []
 
@@ -861,20 +919,40 @@ class PlaybooksPlugin(LunaPlugin):
                 logger.exception("playbooks: failure digest query failed")
                 digest = []
 
+        sections: list[str] = []
+        if kind == "ops" and (mode := self._OPS_MODE_SECTIONS.get(state or "")):
+            sections.append(mode)
+
         if not rows:
-            return []
+            return sections
 
         lines = [
             "## Your playbooks (IMPORTANT — read carefully)",
             "Playbooks are your pre-built capabilities. They work like tools "
             "but are multi-step workflows you run with `playbook_run(name, inputs)`.",
             "",
-            "**RULE: When a user's request matches a playbook below, you MUST "
-            "use it. Do NOT do the work manually, do NOT load skills to handle "
-            "it yourself, do NOT build a new workflow. The playbook already "
-            "exists for this exact purpose. Just run it.**",
-            "",
         ]
+        # 089 §5: the "MUST use it" rule is not rendered while planning
+        # (nothing may change the system there) and is softened in building
+        # chats; unknown kind/state (pre-089 core, headless) keeps the
+        # strong rule.
+        if state == "planning":
+            pass
+        elif kind == "building" or state == "building":
+            lines += [
+                "**Prefer running an existing playbook below over redoing "
+                "its work manually — unless the owner is currently editing "
+                "that playbook with you.**",
+                "",
+            ]
+        elif kind != "ops":
+            lines += [
+                "**RULE: When a user's request matches a playbook below, you MUST "
+                "use it. Do NOT do the work manually, do NOT load skills to handle "
+                "it yourself, do NOT build a new workflow. The playbook already "
+                "exists for this exact purpose. Just run it.**",
+                "",
+            ]
         for name, display_name, description, when_to_use in rows:
             parts = [p for p in [description, when_to_use] if p]
             desc = " — ".join(parts) if parts else display_name or name
@@ -885,15 +963,21 @@ class PlaybooksPlugin(LunaPlugin):
             "**Chat delivery**: playbook steps run in the background; an "
             "llm_step/agent_step's output goes to the run record, not the user. "
             "To surface something in the chat, a step must call the "
-            "`send_chat_message` tool — it posts into the conversation the "
-            "run was started from, live.",
+            "`send_chat_message` tool — live runs report into the ops chat, "
+            "test runs into the chat that started them.",
         ]
 
-        sections = ["\n".join(lines)]
-        if failure_section := render_failure_section(digest):
-            sections.append(failure_section)
+        sections.append("\n".join(lines))
+        # 089 §5: the failure digest is ops-chat material. It renders in the
+        # ops chat and (unchanged pre-0.26 behavior) when the core doesn't
+        # say which chat this is; building/planning chats stay clean.
+        if kind in (None, "ops"):
+            if failure_section := render_failure_section(digest):
+                sections.append(failure_section)
         return sections
 
     async def on_unload(self) -> None:
         if self._trigger_service:
             await self._trigger_service.stop()
+        if self._fix_proposals:
+            self._fix_proposals.stop()

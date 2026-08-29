@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
@@ -35,6 +36,7 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
+from .publish import announce_publish, test_run_gate
 from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
 from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
@@ -160,8 +162,14 @@ def build_tools(
     session_factory: async_sessionmaker[AsyncSession],
     events: EventBus,
     runner: Any,
+    ctx: Any = None,
 ) -> list[tuple[ToolDef, Any]]:
-    """Return (ToolDef, handler) pairs for all playbook agent tools."""
+    """Return (ToolDef, handler) pairs for all playbook agent tools.
+
+    0.26.0 (plans/015, 089): `ctx` (PluginContext, optional for tests) feeds
+    the publish path — ops-chat announcements and, on 089-capable cores, the
+    conversation kind/state accessors.
+    """
 
     tools: list[tuple[ToolDef, Any]] = []
 
@@ -321,6 +329,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_list",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description="List available playbooks.",
             parameters={
                 "type": "object",
@@ -417,7 +426,7 @@ def build_tools(
                 f"({playbook.live_version or playbook.version}) — an "
                 f"un-promoted candidate (v{playbook.candidate_version}) "
                 "exists. Use playbook_run_candidate to test it, "
-                "playbook_promote to make it live."
+                "playbook_publish to make it live."
             )
 
         if status == "running":
@@ -453,6 +462,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_run",
+            modes=["building", "fix_publish"],
             # chat_only: an agent_step INSIDE a playbook must never trigger
             # playbooks (006.707: working prompt_sections made nested agents
             # see the playbook list and recursively self-trigger — 8 stacked
@@ -542,6 +552,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_status",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Get the live state of a playbook run: overall status "
                 "(running/done/failed/cancelled), timing, and the full "
@@ -567,6 +578,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_cancel",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description="Cancel a running playbook.",
             parameters={
                 "type": "object",
@@ -580,10 +592,22 @@ def build_tools(
     ))
 
     # --- playbook_set_autonomy ---
-    async def _set_autonomy(*, name: str, agent_autonomy: str) -> str:
+    async def _set_autonomy(
+        *, name: str, agent_autonomy: str = "", publish_autonomy: str = "",
+    ) -> str:
+        if not agent_autonomy and not publish_autonomy:
+            return json.dumps({
+                "error": "Nothing to change — pass agent_autonomy and/or "
+                         "publish_autonomy.",
+            })
         valid = {e.value for e in AgentAutonomy}
-        if agent_autonomy not in valid:
+        if agent_autonomy and agent_autonomy not in valid:
             return json.dumps({"error": f"Invalid autonomy: {agent_autonomy}. Valid: {sorted(valid)}"})
+        if publish_autonomy and publish_autonomy not in ("ask", "auto"):
+            return json.dumps({
+                "error": f"Invalid publish_autonomy: {publish_autonomy}. "
+                         "Valid: ['ask', 'auto']",
+            })
 
         async with session_factory() as session:
             playbook = (await session.execute(
@@ -592,25 +616,41 @@ def build_tools(
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
             old = playbook.agent_autonomy
-            playbook.agent_autonomy = agent_autonomy
+            old_publish = getattr(playbook, "publish_autonomy", "ask")
+            if agent_autonomy:
+                playbook.agent_autonomy = agent_autonomy
+            if publish_autonomy:
+                playbook.publish_autonomy = publish_autonomy
             await session.commit()
-        return json.dumps({
+        result: dict[str, Any] = {
             "playbook": name,
             "old_autonomy": old,
-            "new_autonomy": agent_autonomy,
+            "new_autonomy": agent_autonomy or old,
+            "old_publish_autonomy": old_publish,
+            "new_publish_autonomy": publish_autonomy or old_publish,
             "status": "updated",
-        })
+        }
+        if publish_autonomy == "auto":
+            # plans/015 (089 §3): chat state gates broadly, this refines —
+            # 'auto' is only honored when the ops chat is in fix_publish.
+            result["note"] = (
+                "publish_autonomy=auto is honored only in the ops chat's "
+                "'fix & publish' mode; elsewhere publishing still asks."
+            )
+        return json.dumps(result)
 
     tools.append((
         ToolDef(
             name="playbook_set_autonomy",
             chat_only=True,
             description=(
-                "Change who can trigger a playbook. Use this when the owner wants to "
-                "allow or restrict agent execution of a specific playbook. "
-                "Options: 'agent_may_trigger' (agent runs freely), "
-                "'agent_must_confirm' (agent must ask first), "
-                "'manual_only' (agent cannot run it at all)."
+                "Change per-playbook autonomy. agent_autonomy = who may RUN "
+                "it: 'agent_may_trigger' (agent runs freely), "
+                "'agent_must_confirm' (agent must ask first), 'manual_only' "
+                "(agent cannot run it at all). publish_autonomy = may the "
+                "agent PUBLISH fixes to it without asking: 'ask' (default) "
+                "or 'auto' — 'auto' is honored only in the ops chat's "
+                "fix & publish mode."
             ),
             parameters={
                 "type": "object",
@@ -619,10 +659,15 @@ def build_tools(
                     "agent_autonomy": {
                         "type": "string",
                         "enum": ["agent_may_trigger", "agent_must_confirm", "manual_only"],
-                        "description": "The new autonomy level",
+                        "description": "The new run-autonomy level",
+                    },
+                    "publish_autonomy": {
+                        "type": "string",
+                        "enum": ["ask", "auto"],
+                        "description": "The new publish-autonomy level",
                     },
                 },
-                "required": ["name", "agent_autonomy"],
+                "required": ["name"],
             },
             policy="prompt_always",
             risk_level="medium",
@@ -632,7 +677,7 @@ def build_tools(
 
     # --- playbook_ack_failures ---
     # plans/014: dismisses the failing-playbooks prompt digest for the
-    # CURRENT live version only. A later edit+promote re-arms the digest by
+    # CURRENT live version only. A later edit+publish re-arms the digest by
     # itself (the ack is version-scoped), so "ignore it" never silences a
     # playbook the owner has since changed.
     async def _ack_failures(*, name: str) -> str:
@@ -658,12 +703,13 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_ack_failures",
+            modes=["building", "identify", "fix_approve", "fix_publish"],
             chat_only=True,
             description=(
                 "Dismiss the 'playbook failures needing your attention' notice "
                 "for one playbook. Call this ONLY after the owner has decided "
                 "what to do about the failures (ignore / fix later). Fixing the "
-                "playbook (edit + promote) clears the notice by itself — no ack "
+                "playbook (edit + publish) clears the notice by itself — no ack "
                 "needed then."
             ),
             parameters={
@@ -810,6 +856,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_get_definition",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Get a playbook's full source so you can edit it. Returns the "
                 "playbook CODE (the Python-like playbook language) by default — "
@@ -909,6 +956,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_validate",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Statically check a playbook WITHOUT running it (the compiler). "
                 "Returns ALL issues at once: compile errors, schema errors, unknown "
@@ -939,6 +987,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_language_reference",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "The complete playbook-language quick reference: every "
                 "combinator with its exact kwargs, value assignment "
@@ -1160,7 +1209,7 @@ def build_tools(
                         "or old=/new= (targeted snippet). The ticket is "
                         "single-use and expires. Saving creates a CANDIDATE — "
                         "the live playbook keeps running unchanged until "
-                        "playbook_promote."
+                        "playbook_publish."
                     ),
                 }
                 manifest_text = playbook.manifest
@@ -1361,8 +1410,8 @@ def build_tools(
                 "still execute version "
                 f"{live_version}. Test the candidate with playbook_dry_run "
                 "(it targets the candidate by default), then call "
-                "playbook_promote(name) to make it live. playbook_rollback "
-                "restores the previous live version after a promote."
+                "playbook_publish(name) to make it live. playbook_rollback "
+                "restores the previous live version after a publish."
             ),
         }
         if spec_summary["total"]:
@@ -1376,7 +1425,7 @@ def build_tools(
                 ]
                 result["next"] = (
                     f"{spec_summary['failed']} spec(s) FAILED against this "
-                    "candidate — playbook_promote will refuse until they "
+                    "candidate — playbook_publish will refuse until they "
                     "pass. Fix the code (playbook_edit) or update the spec "
                     "(playbook_spec_add upserts by name) if the expectation "
                     "itself changed."
@@ -1546,33 +1595,52 @@ def build_tools(
         _manifest_set,
     ))
 
-    # --- playbook_promote (the gate: candidate → live) ---
+    # --- playbook_publish (the gate: nothing goes live except through here) ---
     # 0.10.0 (plans/002 phase 3): promotion runs an extensible gate list —
     # static validation and manifest drift today; specs (phase 4) and probes
     # (phase 5) plug in as new entries. A refusal names the failing gate.
-    async def _promote(*, name: str) -> str:
+    async def _do_publish(name: str, version: int | None, *, action: str) -> str:
+        """0.26.0 (plans/015, 089 contract #8): THE publish function — the
+        only way any version becomes live. version=None publishes the
+        candidate through the full gate; version=N restores a previously
+        stored version (rollback = publishing an older version through this
+        same function). Preconditions are machine-checked HERE, never LLM
+        discretion, and every success is announced in the ops chat."""
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
-            if not playbook.candidate_version:
-                return json.dumps({
-                    "error": f"'{name}' has no candidate to promote. Save an "
-                             "edit first (playbook_edit).",
-                })
-            row = await _get_version_row(
-                session, playbook, playbook.candidate_version,
-            )
-            if row is None:
-                return json.dumps({
-                    "error": "Candidate version row is missing (corrupt "
-                             "state) — save the edit again.",
-                })
+            is_candidate = version is None
+            if is_candidate:
+                if not playbook.candidate_version:
+                    return json.dumps({
+                        "error": f"'{name}' has no candidate to publish. Save "
+                                 "an edit first (playbook_edit).",
+                    })
+                row = await _get_version_row(
+                    session, playbook, playbook.candidate_version,
+                )
+                if row is None:
+                    return json.dumps({
+                        "error": "Candidate version row is missing (corrupt "
+                                 "state) — save the edit again.",
+                    })
+            else:
+                if version == _live_version_of(playbook):
+                    return json.dumps({
+                        "error": f"Version {version} is already live.",
+                    })
+                row = await _get_version_row(session, playbook, version)
+                if row is None:
+                    return json.dumps({
+                        "error": f"No stored content for version {version} — "
+                                 "cannot publish it.",
+                    })
 
             gates: list[dict[str, Any]] = []
-            # gate 1: static validation of the candidate definition.
+            # gate 1: static validation of the definition going live.
             all_pb = await _load_all_playbook_steps(session, exclude=name)
             issues = validate_definition(
                 row.definition,
@@ -1584,41 +1652,64 @@ def build_tools(
             gates.append({"gate": "static_validation", "ok": not errors})
             if errors:
                 return json.dumps({
-                    "error": "Promote refused — gate 'static_validation' failed.",
+                    "error": "Publish refused — gate 'static_validation' failed.",
                     "gate": "static_validation",
                     "issues": errors,
                     "hint": "Fix the candidate via playbook_edit and retry.",
                 })
-            # gate 2 (0.11.0): specs — every stored spec must pass against
-            # the candidate. Failing results are cached on the spec rows
-            # (committed even on refusal, so playbook_spec_list shows them).
-            spec_summary = await run_all_specs(
-                session, runner, playbook.id,
-                _shim_playbook(playbook, row), row.version,
-            )
-            gates.append({
-                "gate": "specs",
-                "ok": spec_summary["failed"] == 0,
-                "note": (
-                    "no specs defined" if spec_summary["total"] == 0
-                    else f"{spec_summary['passed']}/{spec_summary['total']} passed"
-                ),
-            })
-            if spec_summary["failed"]:
-                await session.commit()  # persist last_result on the spec rows
-                return json.dumps({
-                    "error": "Promote refused — gate 'specs' failed.",
+            # gate 2 (0.11.0): specs — candidate publishes only. A restore
+            # re-activates content that already shipped; its evidence is its
+            # run history (gate 3), and old versions routinely predate newer
+            # specs (plans/015 deviation).
+            if is_candidate:
+                spec_summary = await run_all_specs(
+                    session, runner, playbook.id,
+                    _shim_playbook(playbook, row), row.version,
+                )
+                gates.append({
                     "gate": "specs",
-                    "failing_specs": [
-                        r for r in spec_summary["results"] if not r["passed"]
-                    ],
-                    "hint": (
-                        "Fix the candidate via playbook_edit, or update the "
-                        "spec if the expectation itself changed "
-                        "(playbook_spec_add upserts by name)."
+                    "ok": spec_summary["failed"] == 0,
+                    "note": (
+                        "no specs defined" if spec_summary["total"] == 0
+                        else f"{spec_summary['passed']}/{spec_summary['total']} passed"
                     ),
                 })
-            # gate 3: manifest drift — candidates only exist because the save
+                if spec_summary["failed"]:
+                    await session.commit()  # persist last_result on the spec rows
+                    return json.dumps({
+                        "error": "Publish refused — gate 'specs' failed.",
+                        "gate": "specs",
+                        "failing_specs": [
+                            r for r in spec_summary["results"] if not r["passed"]
+                        ],
+                        "hint": (
+                            "Fix the candidate via playbook_edit, or update the "
+                            "spec if the expectation itself changed "
+                            "(playbook_spec_add upserts by name)."
+                        ),
+                    })
+            else:
+                gates.append({
+                    "gate": "specs", "ok": True,
+                    "note": "skipped — restoring a previously stored version",
+                })
+            # gate 3 (0.26.0, 089 contract #8): the TEST-RUN gate — a green
+            # run of this EXACT version recorded after the version row was
+            # created (rows are immutable, so that is "since its last edit").
+            # For restores the version's live history counts as evidence.
+            test_gate, refusal, evidence = await test_run_gate(
+                session, playbook.id, row.version, row.created_at,
+                include_live=not is_candidate,
+            )
+            gates.append(test_gate)
+            if refusal:
+                return refusal
+            # capture before commit — expired ORM attrs must not be touched
+            # after the session closes.
+            evidence_ref = SimpleNamespace(
+                id=evidence.id, completed_at=evidence.completed_at,
+            ) if evidence is not None else None
+            # gate 4: manifest drift — candidates only exist because the save
             # passed the drift check or the owner approved a forced edit
             # (recorded on the version row). Reported, never re-run here.
             forced = "forced" in (row.message or "")
@@ -1629,7 +1720,7 @@ def build_tools(
                     else "checked at save time"
                 ),
             })
-            # gate 4 (0.12.0): probes — every tool the candidate touches must
+            # gate 5 (0.12.0): probes — every tool the version touches must
             # not be KNOWN-broken. Only `failed` probes block; `unprobeable`
             # (no probe declared) passes with a note. Results are cached on
             # playbook_probe_results (committed even on refusal).
@@ -1644,7 +1735,7 @@ def build_tools(
             if probe_summary["failed"]:
                 await session.commit()  # persist the probe cache rows
                 return json.dumps({
-                    "error": "Promote refused — gate 'probes' failed.",
+                    "error": "Publish refused — gate 'probes' failed.",
                     "gate": "probes",
                     "failing_tools": [
                         r for r in probe_summary["results"]
@@ -1654,16 +1745,22 @@ def build_tools(
                         "A tool this playbook uses is broken or missing "
                         "(dead credential, removed plugin, blocked policy). "
                         "Fix the connection/plugin, or edit the playbook to "
-                        "stop using the tool, then promote again."
+                        "stop using the tool, then publish again."
                     ),
                 })
 
             old_live = _live_version_of(playbook)
             await _ensure_live_row(session, playbook)
-            _apply_version_to_live(playbook, row, restore_manifest=False)
-            row.promoted_from = old_live  # rollback lineage
-            playbook.candidate_version = None
+            # candidate publish keeps the live manifest (drift was checked at
+            # save); a restore brings the old manifest back with the content.
+            _apply_version_to_live(
+                playbook, row, restore_manifest=not is_candidate,
+            )
+            if is_candidate:
+                row.promoted_from = old_live  # rollback lineage
+                playbook.candidate_version = None
             new_live = playbook.live_version
+            change_summary = (row.message or "") if is_candidate else ""
             await session.commit()
 
         # live content changed — resync triggers and refresh the canvas.
@@ -1674,48 +1771,80 @@ def build_tools(
             "payload": {"draft_id": name, "action": "replace", "name": name},
             "focus": True,
         })
+        # contract #8: announce in the ops chat (version + test evidence)
+        # and emit `playbook.published` for other plugins/UI.
+        await announce_publish(
+            ctx, events,
+            name=name,
+            old_version=old_live,
+            new_version=new_live,
+            evidence=evidence_ref,
+            actor="agent",
+            action=action,
+            summary=change_summary,
+        )
+        rolled_back = action == "rollback"
         return json.dumps({
             "playbook": name,
-            "status": "promoted",
+            "status": "rolled_back" if rolled_back else "published",
             "live_version": new_live,
             "previous_live_version": old_live,
             "gates": gates,
             "note": (
-                "The candidate is now LIVE — triggers and playbook_run "
-                "execute it. playbook_rollback(name) restores version "
-                f"{old_live} if it misbehaves."
+                f"Version {new_live} is live again (manifest included). "
+                f"Version {old_live} stays in history — publish a new "
+                "candidate to move forward."
+                if rolled_back else
+                f"Version {new_live} is now LIVE — triggers and playbook_run "
+                f"execute it. playbook_rollback(name) restores version "
+                f"{old_live} if it misbehaves. Announced in the ops chat."
             ),
         })
 
+    async def _publish(*, name: str, version: int | None = None) -> str:
+        return await _do_publish(name, version, action="publish")
+
     tools.append((
         ToolDef(
-            name="playbook_promote",
+            name="playbook_publish",
             description=(
-                "Make a playbook's CANDIDATE version live. Runs the promotion "
-                "gate first (static validation; manifest drift was enforced "
-                "at save time) and refuses naming the failing gate. Until "
-                "this succeeds, triggers and playbook_run keep executing the "
-                "old live version. Test the candidate first: playbook_dry_run "
-                "targets it by default."
+                "Publish a playbook version — the ONLY way content goes "
+                "live. Default: publishes the CANDIDATE. version=N restores "
+                "a previously stored version instead. The gate is "
+                "machine-checked and refuses with the exact reason: static "
+                "validation, specs, a GREEN TEST RUN of that exact version "
+                "since its last edit (playbook_run_candidate provides it — "
+                "run the test BEFORE publishing), and tool probes. Every "
+                "publish is announced in the ops chat with its evidence."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
+                    "version": {
+                        "type": "integer",
+                        "description": (
+                            "Publish this stored version instead of the "
+                            "candidate (restore an older version)."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
             policy="prompt_always",
             risk_level="medium",
+            modes=["building", "fix_publish"],
         ),
-        _promote,
+        _publish,
     ))
 
-    # --- playbook_rollback (live ← previous live) ---
+    # --- playbook_rollback (live ← previous live, via the publish path) ---
     async def _rollback(*, name: str) -> str:
+        # 0.26.0 (plans/015, 089 contract #8): rollback resolves the target
+        # version, then publishes it through the SAME gated function.
         async with session_factory() as session:
             playbook = (await session.execute(
-                select(Playbook).where(Playbook.name == name).with_for_update()
+                select(Playbook).where(Playbook.name == name)
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
@@ -1736,42 +1865,17 @@ def build_tools(
                 return json.dumps({
                     "error": f"'{name}' has no previous version to roll back to.",
                 })
-            row = await _get_version_row(session, playbook, target_n)
-            if row is None:
-                return json.dumps({
-                    "error": f"No stored content for version {target_n} — "
-                             "cannot roll back.",
-                })
-            await _ensure_live_row(session, playbook)
-            _apply_version_to_live(playbook, row, restore_manifest=True)
-            await session.commit()
-
-        await events.emit("playbook.saved", {"name": name})
-        await events.emit("ui.plugin.event", {
-            "plugin": "plugin-playbooks",
-            "event": "playbook.patch",
-            "payload": {"draft_id": name, "action": "replace", "name": name},
-            "focus": True,
-        })
-        return json.dumps({
-            "playbook": name,
-            "status": "rolled_back",
-            "live_version": target_n,
-            "previous_live_version": live_n,
-            "note": (
-                f"Version {target_n} is live again (manifest included). "
-                f"Version {live_n} stays in history — playbook_promote a new "
-                "candidate to move forward."
-            ),
-        })
+        return await _do_publish(name, target_n, action="rollback")
 
     tools.append((
         ToolDef(
             name="playbook_rollback",
             description=(
                 "Restore a playbook's PREVIOUS live version (the one the "
-                "current live was promoted from). Use when a promoted change "
-                "misbehaves. The rolled-back-from version stays in history."
+                "current live was published from). Use when a published "
+                "change misbehaves. Runs through the same publish gate "
+                "(the prior version's live history is its test evidence) "
+                "and announces in the ops chat."
             ),
             parameters={
                 "type": "object",
@@ -1782,6 +1886,7 @@ def build_tools(
             },
             policy="prompt_always",
             risk_level="medium",
+            modes=["building", "fix_publish"],
         ),
         _rollback,
     ))
@@ -1820,8 +1925,10 @@ def build_tools(
             shim = _shim_playbook(playbook, row)
             candidate_version = row.version
 
+        # 0.26.0 (plans/015, 089): candidate runs ARE the test evidence the
+        # publish gate looks for — stamped is_test at creation.
         run = await runner.start_run_background(
-            shim, inputs=input_data, trigger="agent-candidate",
+            shim, inputs=input_data, trigger="agent-candidate", is_test=True,
         )
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
@@ -1832,9 +1939,9 @@ def build_tools(
             "candidate_version": candidate_version,
             "status": status,
             "note": (
-                "This was a REAL run of the CANDIDATE (side effects "
+                "This was a REAL test run of the CANDIDATE (side effects "
                 "included). The live playbook is unchanged — call "
-                "playbook_promote when satisfied."
+                "playbook_publish when it completes green."
             ),
         }
         if status == "running":
@@ -1845,8 +1952,9 @@ def build_tools(
             )
         elif status == "failed":
             result["error"] = (
-                "Candidate run FAILED. Do NOT fabricate results and do NOT "
-                "promote. Check playbook_status for the error details."
+                "Candidate test run FAILED. Do NOT fabricate results — "
+                "playbook_publish will refuse until a green test run "
+                "exists. Check playbook_status for the error details."
             )
         elif status == "done":
             async with session_factory() as session:
@@ -1869,7 +1977,7 @@ def build_tools(
                 "history against the candidate version number. The live "
                 "playbook stays untouched. Prefer playbook_dry_run first; "
                 "use this when the owner wants proof against real systems "
-                "before playbook_promote."
+                "before playbook_publish."
             ),
             parameters={
                 "type": "object",
@@ -2003,7 +2111,7 @@ def build_tools(
             if res and not res["passed"]:
                 out["warning"] = (
                     "The spec FAILS against the current content — it was stored "
-                    "anyway. playbook_promote will refuse while it fails."
+                    "anyway. playbook_publish will refuse while it fails."
                 )
             return json.dumps(out)
         out = {
@@ -2018,7 +2126,7 @@ def build_tools(
             )
         if summary.get("failed"):
             out["warning"] = (
-                "Failing specs were stored anyway — playbook_promote will "
+                "Failing specs were stored anyway — playbook_publish will "
                 "refuse while any spec fails."
             )
         return json.dumps(out)
@@ -2040,7 +2148,7 @@ def build_tools(
                 "output_contains: {step_id: substring}, error_contains}. "
                 "Specs run immediately against the candidate (or live "
                 "when none) and on every future candidate save; a failing "
-                "spec blocks playbook_promote."
+                "spec blocks playbook_publish."
             ),
             parameters={
                 "type": "object",
@@ -2099,6 +2207,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_list",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "List a playbook's specs (its tests) with each spec's last "
                 "result, when it last ran, and against which version."
@@ -2183,7 +2292,7 @@ def build_tools(
             **summary,
             **({"note": (
                 "No specs defined — nothing was tested. This playbook has "
-                "no safety net for promote."
+                "no safety net for publish."
             )} if summary["total"] == 0 else {}),
         })
 
@@ -2334,7 +2443,7 @@ def build_tools(
             result["next"] = (
                 "BROKEN: " + "; ".join(
                     f"{r['tool']} ({r['failure_class']})" for r in broken
-                ) + " — playbook_promote will refuse, and live runs would "
+                ) + " — playbook_publish will refuse, and live runs would "
                 "fail at these steps. Fix the connection/plugin or edit the "
                 "playbook to stop using the tool."
             )
@@ -2348,13 +2457,14 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_preflight",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Check that every tool a playbook touches would work RIGHT "
                 "NOW (credentials alive, resources reachable) — the check "
                 "specs can't do because they stub the outside world. Probes "
                 "each tool (including subtask targets' tools): ok / "
                 "unprobeable (no probe declared) / failed. Failed probes "
-                "block playbook_promote. version: auto (candidate when one "
+                "block playbook_publish. version: auto (candidate when one "
                 "exists, else live) | candidate | live | a number."
             ),
             parameters={

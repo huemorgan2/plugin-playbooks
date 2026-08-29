@@ -30,8 +30,28 @@ from luna_sdk import EventBus, PluginContext, ToolRegistry, message_source
 
 from .definition import OnError, PlaybookDef, StepDef, StepKind
 from .models import Playbook, PlaybookRun, PlaybookStepRun
+from .publish import ops_conversation_id as _ops_conversation_id
 
 log = logging.getLogger("luna.playbooks.runner")
+
+
+def _pin_conversation(ctx: Any, conversation_id: Any):
+    """0.26.0 (plans/015, 089 §1): pin the core's notion of "current
+    conversation" to the run's stamped report_to for the duration of the run,
+    so chat-delivery seams that consult it (send_chat_message steps, muted
+    routing) target the stamped conversation — not whatever origin the run
+    inherited. Uses the declared core P2 surface (`ctx.pin_conversation`)
+    when present; on cores without it this is a no-op and delivery relies on
+    the explicit conversation_id the runner already threads through
+    (recorded deviation, plans/015). Returns a reset callable."""
+    pin = getattr(ctx, "pin_conversation", None) if ctx is not None else None
+    if not callable(pin):
+        return lambda: None
+    try:
+        reset = pin(conversation_id)
+    except Exception:  # noqa: BLE001 — a broken seam must not kill the run
+        return lambda: None
+    return reset if callable(reset) else (lambda: None)
 
 class _PlaybookEnvironment(SandboxedEnvironment):
     """plans/003: Mappings are DATA — `.attr` on a dict always reads the key.
@@ -162,6 +182,7 @@ class PlaybookRunner:
         inputs: dict[str, Any] | None = None,
         trigger: str | None = None,
         parent_run_id: Any = None,
+        is_test: bool = False,
     ) -> PlaybookRun:
         """Create a run and execute it to completion (blocking).
 
@@ -170,7 +191,8 @@ class PlaybookRunner:
         `start_run_background` instead (plans/009).
         """
         run = await self._create_run(
-            playbook, inputs=inputs, trigger=trigger, parent_run_id=parent_run_id,
+            playbook, inputs=inputs, trigger=trigger,
+            parent_run_id=parent_run_id, is_test=is_test,
         )
         await self._drive_run(run, playbook, inputs or {})
         return run
@@ -181,6 +203,7 @@ class PlaybookRunner:
         inputs: dict[str, Any] | None = None,
         trigger: str | None = None,
         parent_run_id: Any = None,
+        is_test: bool = False,
     ) -> PlaybookRun:
         """Create a run and execute it in a background task.
 
@@ -190,7 +213,8 @@ class PlaybookRunner:
         wait, `playbook_status` for polling, `cancel_run` to stop it.
         """
         run = await self._create_run(
-            playbook, inputs=inputs, trigger=trigger, parent_run_id=parent_run_id,
+            playbook, inputs=inputs, trigger=trigger,
+            parent_run_id=parent_run_id, is_test=is_test,
         )
         task = asyncio.create_task(
             self._drive_run(run, playbook, inputs or {}),
@@ -259,6 +283,7 @@ class PlaybookRunner:
         inputs: dict[str, Any] | None = None,
         trigger: str | None = None,
         parent_run_id: Any = None,
+        is_test: bool = False,
     ) -> PlaybookRun:
         """Persist the run row and announce it — shared by both entry points."""
         # 006.712: capture the originating conversation so agent_steps can
@@ -266,6 +291,26 @@ class PlaybookRunner:
         # inside a chat turn, where the contextvar is pinned; trigger/cron
         # runs have no origin and stay null.
         conversation_id = self._ctx.current_conversation_id if self._ctx else None
+
+        # 0.26.0 (plans/015, 089 §1): stamp WHERE this run reports at
+        # creation — delivery-time resolution is abolished. Test runs report
+        # to the chat that started them (fallback ops); background live runs
+        # report to ops even when they inherited an origin contextvar (bus
+        # dispatch inside a chat turn must not leak into that chat). The one
+        # deliberate exception: a live run the agent starts inside a chat
+        # ("agent"/subtask triggers) reports where it was asked for. On
+        # cores without an ops chat report_to stays NULL and delivery
+        # behaves as before 0.26 — never "most recent".
+        ops_id = _ops_conversation_id(self._ctx)
+        chat_invoked = trigger is not None and (
+            trigger == "agent" or trigger.startswith("subtask:")
+        )
+        if is_test:
+            report_to = conversation_id or ops_id
+        elif chat_invoked and conversation_id is not None:
+            report_to = conversation_id
+        else:
+            report_to = ops_id
 
         async with self._sf() as session:
             run = PlaybookRun(
@@ -283,6 +328,8 @@ class PlaybookRunner:
                 status="running",
                 parent_run_id=parent_run_id,
                 conversation_id=conversation_id,
+                report_to=report_to,
+                is_test=is_test,
             )
             session.add(run)
             await session.commit()
@@ -323,15 +370,23 @@ class PlaybookRunner:
         })
 
         definition = PlaybookDef.model_validate(playbook.definition)
+        # 0.26.0 (plans/015, 089 §1): the stamped report_to is authoritative
+        # for chat delivery; origin conversation_id is the pre-0.26 fallback.
+        deliver_to = run.report_to or run.conversation_id
         context = _RunContext(
             run_id=run.id,
             inputs=inputs,
             step_outputs={},
-            conversation_id=run.conversation_id,
+            conversation_id=deliver_to,
+            is_test=run.is_test,
         )
 
         token = _active_run_id.set(str(run.id))
         source_token = message_source.set("playbook")
+        reset_pin = (
+            _pin_conversation(self._ctx, run.report_to)
+            if run.report_to is not None else (lambda: None)
+        )
         heartbeat_task = asyncio.create_task(
             self._activity_heartbeat(activity_id, activity_label, activity_meta)
         )
@@ -388,6 +443,7 @@ class PlaybookRunner:
             })
             message_source.reset(source_token)
             _active_run_id.reset(token)
+            reset_pin()
 
     async def _activity_heartbeat(
         self, activity_id: str, label: str, meta: dict[str, Any]
@@ -867,6 +923,7 @@ class PlaybookRunner:
             inputs=mapped_inputs,
             trigger=f"subtask:{ctx.run_id}",
             parent_run_id=ctx.run_id,
+            is_test=ctx.is_test,
         )
         out = {"subtask_run_id": str(sub_run.id), "status": sub_run.status}
         # 007.009.01: surface sub-workflow outputs to the parent so it can read
@@ -1182,10 +1239,16 @@ class PlaybookRunner:
 
         started_at = None
         completed_at = datetime.now(timezone.utc)
+        playbook_id = None
+        playbook_version = None
+        is_test = False
         async with self._sf() as session:
             run = await session.get(PlaybookRun, run_id)
             if run:
                 started_at = run.started_at
+                playbook_id = run.playbook_id
+                playbook_version = run.playbook_version
+                is_test = bool(run.is_test)
 
         if started_at is not None and started_at.tzinfo is None:
             # sqlite returns naive datetimes; stored values are UTC
@@ -1196,6 +1259,11 @@ class PlaybookRunner:
             "status": status,
             "duration_ms": duration_ms,
             "error": error,
+            # 0.26.0 (plans/015, 089 §4): identity for the fix-proposal
+            # service — it must skip test runs and dedupe per playbook.
+            "playbook_id": str(playbook_id) if playbook_id else None,
+            "playbook_version": playbook_version,
+            "is_test": is_test,
         })
 
 
@@ -1208,11 +1276,15 @@ class _RunContext:
         inputs: dict[str, Any],
         step_outputs: dict[str, Any],
         conversation_id: Any = None,
+        is_test: bool = False,
     ) -> None:
         self.run_id = run_id
         self.inputs = inputs
         self.step_outputs = step_outputs
         self.conversation_id = conversation_id
+        # 0.26.0 (plans/015, 089 §1): test runs propagate the flag into their
+        # subtask runs so a draft test never pollutes production stats.
+        self.is_test = is_test
         # 006.712: loop `item_name` exposes the current item as a top-level
         # template var ({{ number }}) — friendlier than steps.<id>._item.
         self.extra_vars: dict[str, Any] = {}

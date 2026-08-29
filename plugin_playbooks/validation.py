@@ -573,7 +573,7 @@ def _check_leaf(
                     "(tool 'code_run'), which is not installed on this agent",
                     step_id=step.id, field="source",
                     hint="install plugin-inline-code-run from the marketplace; "
-                    "promote will refuse until the tool is available",
+                    "publish will refuse until the tool is available",
                 ))
         for key, val in (step.code_inputs or {}).items():
             _check_value(val, step_id=step.id, field=f"code_inputs.{key}", **kw)

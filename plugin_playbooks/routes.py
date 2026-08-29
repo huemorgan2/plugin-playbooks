@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import uuid
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -31,6 +32,7 @@ from .models import (
     PlaybookVersion,
 )
 from .probes import run_preflight
+from .publish import announce_publish, test_run_gate
 from .specs import run_all_specs
 from .validation import validate_definition
 
@@ -47,6 +49,7 @@ _runner: Any = None
 _events: Any = None
 _sync_bindings: Any = None
 _trigger_sources: Any = None
+_ctx: Any = None
 
 
 def init_routes(
@@ -55,13 +58,15 @@ def init_routes(
     events: Any = None,
     sync_bindings: Any = None,
     trigger_sources: Any = None,
+    ctx: Any = None,
 ) -> None:
-    global _session_factory, _runner, _events, _sync_bindings, _trigger_sources
+    global _session_factory, _runner, _events, _sync_bindings, _trigger_sources, _ctx
     _session_factory = sf
     _runner = runner
     _events = events
     _sync_bindings = sync_bindings
     _trigger_sources = trigger_sources
+    _ctx = ctx
     _reset_icon_cache()
 
 
@@ -1045,7 +1050,7 @@ async def promote_version(name: str, body: PromoteBody):
                     "issues": errors,
                 })
             # 0.11.0: specs gate — every stored spec must pass against the
-            # candidate (same gate as the playbook_promote tool).
+            # candidate (same gate as the playbook_publish tool).
             spec_summary = await run_all_specs(
                 session, _runner, p.id, _shim_for(p, row), row.version,
             )
@@ -1075,6 +1080,20 @@ async def promote_version(name: str, body: PromoteBody):
                     ],
                 })
 
+        # 0.26.0 (plans/015, 089 contract #8): test-run gate — same rule as
+        # the playbook_publish tool, so no code path skips it. Restores accept
+        # the version's live history as evidence.
+        _gate, refusal, ev_run = await test_run_gate(
+            session, p.id, row.version, row.created_at,
+            include_live=not candidate,
+        )
+        if refusal is not None:
+            raise HTTPException(422, json.loads(refusal))
+        evidence = (
+            SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
+            if ev_run is not None else None
+        )
+
         old_live = _live_version_of(p)
         await _ensure_live_row(session, p)
         # candidate promote keeps the live manifest (manifest is live-owned);
@@ -1093,6 +1112,11 @@ async def promote_version(name: str, body: PromoteBody):
             "status": "promoted",
         }
     await _notify_changed(name)
+    if _events is not None:
+        await announce_publish(
+            _ctx, _events, name=name, old_version=old_live,
+            new_version=target_n, evidence=evidence, actor="owner",
+        )
     return result
 
 
@@ -1123,6 +1147,18 @@ async def rollback_playbook(name: str):
         if not row:
             raise HTTPException(404, f"No stored content for version {target_n}")
 
+        # 0.26.0 (plans/015, 089 contract #8): rollback IS a publish of a
+        # previous version — same test-run gate, live history counts.
+        _gate, refusal, ev_run = await test_run_gate(
+            session, p.id, row.version, row.created_at, include_live=True,
+        )
+        if refusal is not None:
+            raise HTTPException(422, json.loads(refusal))
+        evidence = (
+            SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
+            if ev_run is not None else None
+        )
+
         await _ensure_live_row(session, p)
         _apply_row_to_live(p, row, restore_manifest=True)
         await session.commit()
@@ -1133,6 +1169,12 @@ async def rollback_playbook(name: str):
             "status": "rolled_back",
         }
     await _notify_changed(name)
+    if _events is not None:
+        await announce_publish(
+            _ctx, _events, name=name, old_version=live_n,
+            new_version=target_n, evidence=evidence, actor="owner",
+            action="rollback",
+        )
     return result
 
 

@@ -6,7 +6,8 @@ restricted Python subset that is compiled to a step graph, never executed),
 carries a plain-text **manifest** stating its intent, and is guarded by
 **specs** (dry-run behavioral tests) and **probes** (are the tools it uses
 actually installed and answering). Changes land as **candidates** and only go
-live through `promote`, which runs validation → specs → probes as gates.
+live through `publish`, which runs validation → specs → a green test run →
+probes as gates.
 
 Extracted from Luna core in 009.001 (Luna ≥ 0.29). History up to Luna 0.29.006
 lives in the main luna repo.
@@ -29,18 +30,18 @@ the next turn):
 | --- | --- |
 | `playbook_propose` | Create a new playbook from code (saved as a candidate) |
 | `playbook_edit` | Edit: full `code=` or targeted `old=`/`new=` snippet; read-stage ticket flow enforces manifest+code reading first |
-| `playbook_edit_force` | Escape hatch past the drift check; gates still run at promote |
+| `playbook_edit_force` | Escape hatch past the drift check; gates still run at publish |
 | `playbook_get_definition` | Read code / compiled definition / manifest |
 | `playbook_validate` | Static-check code or YAML without saving |
 | `playbook_dry_run` | Simulate a run (no tools/LLMs executed), returns the trace |
 | `playbook_manifest_set` | Write the plain-text intent manifest |
-| `playbook_promote` | Candidate → live, through validation/specs/probes gates |
+| `playbook_publish` | Candidate → live, through validation/specs/test-run/probes gates |
 | `playbook_rollback` | Point live back to an earlier version |
 | `playbook_run_candidate` | Live-run the candidate version once |
 | `playbook_set_autonomy` | Ask-first / autonomous execution modes |
 | `playbook_list_available_triggers` | Cron/webhook/connector trigger catalog |
 | `playbook_spec_add` / `playbook_spec_list` / `playbook_spec_delete` | Manage specs |
-| `playbook_spec_run` | Run all specs (same evaluation the promote gate uses) |
+| `playbook_spec_run` | Run all specs (same evaluation the publish gate uses) |
 | `playbook_spec_from_run` | Propose a spec from a recorded real run |
 | `playbook_preflight` | Probe the playbook's tools: installed and answering? |
 
@@ -63,7 +64,7 @@ edits for the wrong reason.
 Specs are YAML documents (`inputs`, `stubs`, `expect`) evaluated against a
 **dry run** — templates render and branching executes, but tools and LLMs are
 stubbed. They run on every candidate save, via `playbook_spec_run`, and as a
-promote gate.
+publish gate.
 
 Happy path with a scripted tool result:
 

@@ -27,19 +27,19 @@ def _ev(label, *, ms, age_s=60.0, kind="tool"):
 
 
 def test_pending_gated_call_old_enough_is_waiting():
-    events = [_ev("playbook_edit", ms=40), _ev("playbook_promote", ms=None)]
-    assert waiting_on_owner(events, now=NOW) == "playbook_promote"
+    events = [_ev("playbook_edit", ms=40), _ev("playbook_publish", ms=None)]
+    assert waiting_on_owner(events, now=NOW) == "playbook_publish"
 
 
 def test_fresh_pending_gated_call_is_not_waiting_yet():
     # A gated call younger than the threshold is probably just executing.
-    events = [_ev("playbook_promote", ms=None,
+    events = [_ev("playbook_publish", ms=None,
                   age_s=_WAITING_THRESHOLD_S - 1)]
     assert waiting_on_owner(events, now=NOW) is None
 
 
 def test_resolved_gated_call_is_not_waiting():
-    events = [_ev("playbook_promote", ms=812)]
+    events = [_ev("playbook_publish", ms=812)]
     assert waiting_on_owner(events, now=NOW) is None
 
 
@@ -51,7 +51,7 @@ def test_pending_ungated_call_is_not_waiting():
 
 def test_gated_call_followed_by_later_event_is_not_waiting():
     # Only the LAST event counts — once anything follows, the run moved on.
-    events = [_ev("playbook_promote", ms=None),
+    events = [_ev("playbook_publish", ms=None),
               _ev("thinking about rollout", ms=None, kind="thought")]
     assert waiting_on_owner(events, now=NOW) is None
 
@@ -60,7 +60,7 @@ def test_empty_or_garbage_events_are_not_waiting():
     assert waiting_on_owner(None, now=NOW) is None
     assert waiting_on_owner([], now=NOW) is None
     assert waiting_on_owner(
-        [{"kind": "tool", "label": "playbook_promote", "ms": None,
+        [{"kind": "tool", "label": "playbook_publish", "ms": None,
           "ts": "not-a-date"}], now=NOW) is None
 
 
@@ -95,15 +95,15 @@ def test_payload_prefers_live_feed_over_stale_row():
 
     feed = _EventFeed(None, row.id)
     feed.events = [_ev("playbook_edit", ms=40),
-                   _ev("playbook_promote", ms=None, age_s=60)]
+                   _ev("playbook_publish", ms=None, age_s=60)]
     feed.steps_used = 2
     _LIVE_FEEDS[row.id] = feed
     try:
         p = _delegation_payload(row, for_status_tool=True)
-        assert p["waiting_for_approval"] == "playbook_promote"
+        assert p["waiting_for_approval"] == "playbook_publish"
         assert "PAUSED" in p["message"]
         assert p["steps_used"] == 2
-        assert p["recent_events"][-1]["label"] == "playbook_promote"
+        assert p["recent_events"][-1]["label"] == "playbook_publish"
     finally:
         _LIVE_FEEDS.pop(row.id, None)
 
@@ -127,12 +127,12 @@ def test_paused_message_speaks_owner_words_not_tool_codes():
     row.events = []
     row.steps_used = 1
     feed = _EventFeed(None, row.id)
-    feed.events = [_ev("playbook_promote", ms=None, age_s=60)]
+    feed.events = [_ev("playbook_publish", ms=None, age_s=60)]
     feed.steps_used = 1
     _LIVE_FEEDS[row.id] = feed
     try:
         p = _delegation_payload(row, for_status_tool=False)
         assert "make the change live" in p["message"]
-        assert "playbook_promote" not in p["message"]
+        assert "playbook_publish" not in p["message"]
     finally:
         _LIVE_FEEDS.pop(row.id, None)

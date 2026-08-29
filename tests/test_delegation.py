@@ -254,7 +254,7 @@ async def test_toolset_includes_referenced_tools_of_target_playbook(env):
 
     tools = await delegate_toolset(env, "candidate-intake", AUTHORING)
     for expected in ("gmail_search", "sheets_append", "slack_post",
-                     "playbook_list", "playbook_status", "playbook_promote"):
+                     "playbook_list", "playbook_status", "playbook_publish"):
         assert expected in tools
     assert "send_chat_message" not in tools  # card is the surface, always
 
@@ -289,8 +289,8 @@ async def test_events_recorded_with_inferred_phases(env):
             FunctionToolResultEvent("playbook_edit", "c2", "candidate_saved"),
             FunctionToolCallEvent("playbook_spec_run", "c3"),
             FunctionToolResultEvent("playbook_spec_run", "c3", "8/8 pass"),
-            FunctionToolCallEvent("playbook_promote", "c4"),
-            FunctionToolResultEvent("playbook_promote", "c4", "v4 live"),
+            FunctionToolCallEvent("playbook_publish", "c4"),
+            FunctionToolResultEvent("playbook_publish", "c4", "v4 live"),
         ],
     )
     tools = _tools(FakeCtx(agent), env)
@@ -392,7 +392,7 @@ async def test_orphan_sweep_fails_rows_without_live_tasks(env):
 def test_phase_vocabulary_is_owner_words_only():
     assert phase_for_tool("playbook_edit") == "Change"
     assert phase_for_tool("playbook_dry_run") == "Prove"
-    assert phase_for_tool("playbook_promote") == "Ship"
+    assert phase_for_tool("playbook_publish") == "Ship"
     assert phase_for_tool("gmail_search") == "Understand"  # probing = exploring
     for t in AUTHORING:
         assert phase_for_tool(t) in ("Understand", "Change", "Prove", "Ship")

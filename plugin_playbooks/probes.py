@@ -8,7 +8,7 @@ touches and classifies the failures.
 
 Statuses: ``ok`` (probed, works), ``unprobeable`` (tool present, no probe
 declared — the common case today), ``failed`` (missing, blocked, or the
-probe said no). Only ``failed`` blocks a promote.
+probe said no). Only ``failed`` blocks a publish.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def collect_tools(definition: dict[str, Any]) -> list[str]:
                 found.add(step["tool"])
             if step.get("kind") == "code":
                 # plans/004: code steps delegate to plugin-inline-code-run —
-                # advertise the dependency so preflight/promote gate on it.
+                # advertise the dependency so preflight/publish gate on it.
                 found.add("code_run")
             for name in step.get("tools") or []:
                 found.add(name)

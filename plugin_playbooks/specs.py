@@ -3,7 +3,7 @@
 A spec is a stored test for a playbook: fixture ``inputs``, scripted
 ``stubs`` for effectful steps, and ``expect`` assertions evaluated against
 the dry-run trace. Specs auto-run on every candidate save and gate
-``playbook_promote``.
+``playbook_publish``.
 
 ``evaluate_spec`` is a pure function over (spec, dry-run result) — no DB, no
 runner import — so the assertion semantics are unit-testable in isolation.
@@ -280,7 +280,7 @@ async def run_all_specs(
 
     Caller owns the session/transaction — commit after (the cache updates
     ride along). Shared by the candidate auto-run, playbook_spec_run, and
-    the promote gate (tool + REST).
+    the publish gate (tool + REST).
     """
     from sqlalchemy import select  # local: keep module import-light for tests
 

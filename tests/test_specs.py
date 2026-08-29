@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from evidence import green_run
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -347,7 +348,7 @@ async def test_candidate_save_autoruns_specs(env):
     assert out["status"] == "candidate_saved"  # save NOT blocked
     assert out["specs"]["failed"] == 1
     assert out["specs"]["failures"][0]["spec"] == "s1"
-    assert "promote will refuse" in out["next"].lower()
+    assert "publish will refuse" in out["next"].lower()
 
 
 @pytest.mark.asyncio
@@ -361,7 +362,7 @@ async def test_promote_refused_on_failing_spec_then_passes_after_fix(env):
     await handlers["playbook_edit"](
         name="greeter", ticket=await _ticket(handlers, "greeter"), code=new_code,
     )
-    refused = json.loads(await handlers["playbook_promote"](name="greeter"))
+    refused = json.loads(await handlers["playbook_publish"](name="greeter"))
     assert refused["gate"] == "specs"
     assert refused["failing_specs"][0]["spec"] == "s1"
     pb = await _get(sf, "greeter")
@@ -373,8 +374,9 @@ async def test_promote_refused_on_failing_spec_then_passes_after_fix(env):
     await handlers["playbook_edit"](
         name="greeter", ticket=await _ticket(handlers, "greeter"), code=good_code,
     )
-    out = json.loads(await handlers["playbook_promote"](name="greeter"))
-    assert out["status"] == "promoted"
+    await green_run(sf, 3)
+    out = json.loads(await handlers["playbook_publish"](name="greeter"))
+    assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["specs"]["ok"] is True
     assert "1/1" in gates["specs"]["note"]
@@ -388,8 +390,9 @@ async def test_promote_with_no_specs_passes_with_note(env):
         name="greeter", ticket=await _ticket(handlers, "greeter"),
         old="says hi", new="says hello",
     )
-    out = json.loads(await handlers["playbook_promote"](name="greeter"))
-    assert out["status"] == "promoted"
+    await green_run(sf, 2)
+    out = json.loads(await handlers["playbook_publish"](name="greeter"))
+    assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["specs"]["ok"] is True
     assert gates["specs"]["note"] == "no specs defined"

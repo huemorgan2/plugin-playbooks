@@ -85,14 +85,14 @@ async def test_live_feed_beats_stale_db_row(env):
     c, sf, row = env
     feed = _EventFeed(sf, row.id)
     feed._append("tool", "playbook_spec_run", phase="Prove")
-    feed._append("tool", "playbook_promote", phase="Ship")
+    feed._append("tool", "playbook_publish", phase="Ship")
     feed.steps_used = 3
     _LIVE_FEEDS[row.id] = feed  # newer than the flushed row
 
     body = (await c.get(_url(row.id, TOKEN))).json()
     assert body["steps_used"] == 3
     assert [e["label"] for e in body["events"]] == [
-        "playbook_spec_run", "playbook_promote",
+        "playbook_spec_run", "playbook_publish",
     ]
 
 
@@ -131,13 +131,13 @@ async def test_running_payload_surfaces_waiting_for_approval(env):
         fresh = await s.get(PlaybookDelegation, row.id)
         fresh.events = list(fresh.events) + [
             {"ts": stale, "phase": "Ship", "kind": "tool",
-             "label": "playbook_promote", "detail": "", "ms": None},
+             "label": "playbook_publish", "detail": "", "ms": None},
         ]
         await s.commit()
 
     body = (await c.get(_url(row.id, TOKEN))).json()
     assert body["status"] == "running"
-    assert body["waiting_for_approval"] == "playbook_promote"
+    assert body["waiting_for_approval"] == "playbook_publish"
 
     # Resolved (ms stamped) → field clears.
     async with sf() as s:
