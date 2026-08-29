@@ -127,11 +127,22 @@ details[open] summary::before{{content:"▾ "}}
 <script>
 (function(){{
 var BOOT={boot};
+// Hosted tenants live under /a/{{slug}} behind the cloud proxy; a
+// root-relative fetch would leave the tenant entirely (plans/014). The
+// sandboxed iframe can't reach window.parent (opaque origin), but srcdoc
+// documents inherit the parent page's base URL, so parse the prefix out of
+// document.baseURI. Self-hosted/QA has no prefix -> ''.
+var API_BASE=(function(){{
+  try{{if(window.parent&&window.parent.__LUNA_BASE)return window.parent.__LUNA_BASE;}}catch(e){{}}
+  var m=(document.baseURI||'').match(/^[a-z]+:\\/\\/[^\\/]+(\\/a\\/[^\\/]+)/i);
+  return m?m[1]:'';
+}})();
 var card=document.getElementById('card'),headline=document.getElementById('headline'),
     support=document.getElementById('support'),phasesEl=document.getElementById('phases'),
     feed=document.getElementById('feed'),resultEl=document.getElementById('result'),
     elapsedEl=document.getElementById('elapsed'),waitingEl=document.getElementById('waiting');
-var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='';
+var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='',
+    everPolled=false;
 var WAIT_WORDS={{playbook_promote:'make the change live',
   playbook_rollback:'roll back the live version',
   playbook_edit_force:'force past failing specs',
@@ -229,13 +240,29 @@ function render(st){{
   reportHeight();
 }}
 
+function offline(){{
+  stopped=true;
+  headline.textContent='Working — live updates can\\'t show here';
+  support.textContent='The playbook agent keeps going. Ask me how it\\'s going.';
+  reportHeight();
+}}
+
 function poll(){{
-  fetch('/api/p/plugin-playbooks/delegations/'+BOOT.id+'/card?token='+
+  fetch(API_BASE+'/api/p/plugin-playbooks/delegations/'+BOOT.id+'/card?token='+
         encodeURIComponent(BOOT.token))
-    .then(function(r){{if(!r.ok)throw new Error(r.status);return r.json();}})
-    .then(function(st){{failedPolls=0;render(st);}})
+    .then(function(r){{
+      if(r.status===401||r.status===403){{offline();return null;}}
+      if(!r.ok)throw new Error(r.status);
+      return r.json();
+    }})
+    .then(function(st){{if(st){{failedPolls=0;everPolled=true;render(st);}}}})
     .catch(function(){{
       failedPolls++;
+      // The hosted proxy's auth errors have no CORS header, so from this
+      // opaque-origin sandbox they look like network failures — the status
+      // above is unreadable. If the very first polls all fail, this view
+      // can't reach the agent at all: say so instead of retrying forever.
+      if(!everPolled&&failedPolls>=5){{offline();return;}}
       if(failedPolls>2){{support.textContent='Connection lost — retrying';}}
     }})
     .finally(function(){{

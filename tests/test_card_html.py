@@ -62,3 +62,27 @@ def test_waiting_banner_wiring_present():
     # Owner words, not tool codes, reach the reader.
     assert "make the change live" in doc
     assert "roll back the live version" in doc
+
+
+def test_poll_url_uses_hosted_base_prefix():
+    # plans/014 — hosted tenants live under /a/{slug}; a root-relative fetch
+    # leaves the tenant. The card must compute API_BASE and prepend it.
+    doc = _card()
+    assert "var API_BASE=" in doc
+    assert "document.baseURI" in doc
+    assert r"(\/a\/[^\/]+)" in doc
+    assert "fetch(API_BASE+'/api/p/plugin-playbooks/delegations/'" in doc
+    # No bare root-relative fetch may remain.
+    assert "fetch('/api" not in doc
+
+
+def test_auth_blocked_poll_shows_honest_offline_state():
+    # plans/014 — the sandboxed iframe has no credentials, so a proxy 401/403
+    # can never heal: stop polling and say so instead of "Connection lost".
+    doc = _card()
+    assert "r.status===401||r.status===403" in doc
+    assert "offline()" in doc
+    assert "live updates can\\'t show here" in doc
+    # CORS-less proxy errors surface as network failures — the fallback must
+    # trip after the first polls all fail.
+    assert "!everPolled&&failedPolls>=5" in doc
