@@ -54,17 +54,11 @@ class FixProposalService:
         self._tasks: set[asyncio.Task] = set()
 
     def start(self) -> None:
-        # background=True where the core supports it; either way the real
-        # work runs in its own task so a blocking approval card can never
-        # stall the emitting run's completion path.
-        try:
-            self._unsub = self._events.subscribe(
-                "playbook.run.completed", self._on_completed, background=True,
-            )
-        except TypeError:
-            self._unsub = self._events.subscribe(
-                "playbook.run.completed", self._on_completed,
-            )
+        # background=True: the real work runs in its own task so a blocking
+        # approval card can never stall the emitting run's completion path.
+        self._unsub = self._events.subscribe(
+            "playbook.run.completed", self._on_completed, background=True,
+        )
         log.info("fix_proposals.started")
 
     def stop(self) -> None:
@@ -173,11 +167,11 @@ class FixProposalService:
         """Post the proposal as an approval card in the ops chat. Approval
         wakes the ops chat to do the fix; denial dismisses the proposal."""
         ctx = self._ctx
-        ops = ops_conversation_id(ctx)
+        ops = await ops_conversation_id(ctx)
         approval = getattr(ctx, "approval", None) if ctx else None
         if ops is None or approval is None:
-            # pre-089 core: ledger row only — surfaced via the failure
-            # digest until the ops chat exists.
+            # headless test ctx, or a broken ops lookup: ledger row only —
+            # surfaced via the failure digest.
             return
         try:
             result = await approval.request(

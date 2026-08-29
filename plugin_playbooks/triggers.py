@@ -114,16 +114,9 @@ class PlaybookTriggerService:
             # 0.26.0 (plans/015, 089 §6): background=True — the handler must
             # run off the emitting task so a bus event fired inside a chat
             # turn cannot start a playbook run within that turn's context.
-            # Older cores don't take the flag; fall back to inline dispatch
-            # (report_to stamping in the runner still keeps delivery clean).
-            try:
-                self._unsubs[event_name] = self._events.subscribe(
-                    event_name, _handler, background=True,
-                )
-            except TypeError:
-                self._unsubs[event_name] = self._events.subscribe(
-                    event_name, _handler,
-                )
+            self._unsubs[event_name] = self._events.subscribe(
+                event_name, _handler, background=True,
+            )
             log.info("trigger.subscribed bus_event=%s count=%s", event_name, len(entries))
 
     @staticmethod

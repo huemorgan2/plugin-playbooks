@@ -343,33 +343,28 @@ async def _drive_delegation(
     prompt: str,
     tools: list[str],
     conversation_id: Any,
+    conversation_state: str | None,
 ) -> None:
     feed = _EventFeed(session_factory, delegation_id)
     # Expose the live feed for the card route (phase 2) — DB flushes are
     # throttled, but a poll may read the in-memory feed for freshness.
     _LIVE_FEEDS[delegation_id] = feed
     try:
-        try:
-            result, _usage = await ctx.agent.run_turn(
-                prompt,
-                tools=tools,
-                memory_write=False,
-                memory_read=False,
-                conversation_id=conversation_id,
-                max_turns=_MAX_TURNS,
-                timeout_s=_TIMEOUT_S,
-                event_stream_handler=feed.handle,
-            )
-        except TypeError:
-            # Older core without the 049 containment kwargs: run uncontained,
-            # say so on the card instead of silently pretending.
-            feed._append("thought", "budget unenforced (older Luna core)")
-            result, _usage = await ctx.agent.run_turn(
-                prompt,
-                tools=tools,
-                memory_write=False,
-                conversation_id=conversation_id,
-            )
+        # 089 §6: the delegate inherits the spawning chat's state, so core's
+        # per-state tool filtering contains it exactly like the owner's turn
+        # (fix_approve delegate cannot see playbook_publish, etc.) — belt and
+        # braces with the explicit `tools` allowlist.
+        result, _usage = await ctx.agent.run_turn(
+            prompt,
+            tools=tools,
+            memory_write=False,
+            memory_read=False,
+            conversation_id=conversation_id,
+            max_turns=_MAX_TURNS,
+            timeout_s=_TIMEOUT_S,
+            event_stream_handler=feed.handle,
+            conversation_state=conversation_state,
+        )
 
         if isinstance(result, dict) and result.get("_aborted"):
             last = feed.events[-1]["label"] if feed.events else "the start"
@@ -485,7 +480,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                     "existing name, or omit `playbook` for a from-scratch job."
                 })
 
-        conversation_id = getattr(ctx, "current_conversation_id", None)
+        conversation_id = ctx.current_conversation_id
         row = PlaybookDelegation(
             task=task,
             playbook=playbook,
@@ -528,6 +523,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
 
         task_obj = asyncio.create_task(_drive_delegation(
             ctx, session_factory, row.id, prompt, tools, conversation_id,
+            ctx.conversation_state() if ctx is not None else None,
         ))
         _TASKS[row.id] = task_obj
         task_obj.add_done_callback(lambda _t, _id=row.id: _TASKS.pop(_id, None))
@@ -555,6 +551,8 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
         (
             ToolDef(
                 name="playbook_agent",
+                modes=["building", "fix_approve", "fix_publish"],
+                artifact_ref="playbook:{playbook}",
                 # chat_only: a delegate (or any headless turn) must never
                 # spawn delegations — same recursion guard as playbook_run.
                 chat_only=True,
@@ -603,6 +601,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
         (
             ToolDef(
                 name="playbook_agent_status",
+                modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
                 timeout_seconds=30,
                 description=(
                     "Check a playbook delegation started by playbook_agent. "

@@ -5,9 +5,9 @@ machine-checked in the handler — never LLM discretion. This module holds the
 pieces every publish path (agent tool, HTTP route) shares, so no code path
 makes a version live without passing the gate:
 
-- feature-detected core accessors (`ops_conversation_id`,
-  `conversation_kind`, `conversation_state`) that return None on cores
-  without the 089 P1–P3 surfaces instead of raising;
+- thin wrappers over the core 089 P1–P3 accessors (`ops_conversation_id`,
+  `conversation_kind`, `conversation_state`) that tolerate a missing ctx
+  (headless tests) but otherwise call the shipped SDK directly;
 - the test-run gate: a version may go live only with a green run of that
   EXACT version recorded after the version snapshot was created (version
   rows are immutable — every edit mints a new number, so "since last edit"
@@ -17,7 +17,6 @@ makes a version live without passing the gate:
 """
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 from datetime import datetime, timezone
@@ -31,46 +30,33 @@ from .models import PlaybookRun, PlaybookStepRun
 log = logging.getLogger("luna.plugin.playbooks.publish")
 
 
-# --- feature-detected core accessors (089 core P1–P3) -----------------------
+# --- core 089 accessors (real on luna >= 0.87.003) --------------------------
 
-def _call_accessor(ctx: Any, name: str) -> Any | None:
-    fn = getattr(ctx, name, None)
-    if fn is None:
-        return None
-    try:
-        value = fn() if callable(fn) else fn
-    except Exception:  # noqa: BLE001 — absent/broken accessor == old core
-        return None
-    if inspect.isawaitable(value):
-        # An async accessor we can't await from a sync helper — treat the
-        # surface as absent rather than leak a pending coroutine.
-        value.close()
-        return None
-    return value
-
-
-def ops_conversation_id(ctx: Any) -> Any | None:
-    """The ops chat's id, or None on cores without one (pre-089 P1)."""
+async def ops_conversation_id(ctx: Any) -> Any | None:
+    """The singleton ops chat's id (`await ctx.ops_conversation_id()`,
+    get-or-create). None only with no ctx, or if the lookup itself fails —
+    delivery seams degrade to their origin fallback rather than raising."""
     if ctx is None:
         return None
-    return _call_accessor(ctx, "ops_conversation_id")
+    try:
+        return await ctx.ops_conversation_id()
+    except Exception:  # noqa: BLE001 — a broken DB must not undo the caller
+        log.exception("ops_conversation_id lookup failed")
+        return None
 
 
 def conversation_kind(ctx: Any) -> str | None:
-    """'building' | 'ops' for the current turn's chat; None when headless
-    or on cores without 089 P3."""
+    """'building' | 'ops' for the current turn's chat; None when headless."""
     if ctx is None:
         return None
-    value = _call_accessor(ctx, "conversation_kind")
-    return value if isinstance(value, str) else None
+    return ctx.conversation_kind()
 
 
 def conversation_state(ctx: Any) -> str | None:
-    """planning/building/identify/fix_approve/fix_publish, or None."""
+    """planning/building/identify/fix_approve/fix_publish; None headless."""
     if ctx is None:
         return None
-    value = _call_accessor(ctx, "conversation_state")
-    return value if isinstance(value, str) else None
+    return ctx.conversation_state()
 
 
 # --- the test-run gate ------------------------------------------------------
@@ -223,10 +209,10 @@ async def announce_publish(
     send = getattr(ctx, "send_muted_message", None)
     if send is None:
         return
-    target = ops_conversation_id(ctx)
+    target = await ops_conversation_id(ctx)
     if target is None:
-        # Pre-089 core: no ops chat. The current conversation (when there is
-        # one) still hears about it via the tool result; skip the muted note.
+        # Ops lookup failed (broken DB). The current conversation (when there
+        # is one) still hears about it via the tool result; skip the note.
         log.info(
             "playbook.publish announce skipped (no ops chat) name=%s v%s→v%s",
             name, old_version, new_version,
@@ -256,11 +242,5 @@ async def announce_publish(
             conversation_id=target,
             source="playbooks",
         )
-    except TypeError:
-        # Older send_muted_message signature — retry with the minimal form.
-        try:
-            await send(f"Playbook {verb}: {name}", "\n".join(lines))
-        except Exception:  # noqa: BLE001
-            log.exception("publish announce failed name=%s", name)
     except Exception:  # noqa: BLE001
         log.exception("publish announce failed name=%s", name)

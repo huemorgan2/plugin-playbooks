@@ -526,7 +526,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.26.0",
+        version="0.27.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -603,8 +603,10 @@ class PlaybooksPlugin(LunaPlugin):
         self._binding_service = None
         self._session_factory = None
         self._fix_proposals = None
+        self._ctx = None
 
     async def on_load(self, ctx: PluginContext) -> None:
+        self._ctx = ctx
         self._session_factory = ctx.db_session_factory
         from .agent_tools import build_tools
         from .models import Base
@@ -834,6 +836,7 @@ class PlaybooksPlugin(LunaPlugin):
             ctx,
             ToolDef(
                 name="playbook_list_available_triggers",
+                modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
                 description=(
                     "List external event triggers a playbook can bind to (from "
                     "connected apps that expose triggers — gmail, slack, github...). "
@@ -889,12 +892,14 @@ class PlaybooksPlugin(LunaPlugin):
         ),
     }
 
-    async def prompt_sections(
-        self, kind: str | None = None, state: str | None = None,
-    ) -> list[str]:
-        # 0.26.0 (plans/015, 089 contract #6): core passes the current
-        # chat's kind/state; pre-089 cores call with no args (None/None →
-        # the pre-0.26 rendering, unchanged).
+    async def prompt_sections(self) -> list[str]:
+        # 089 contract #6: the shipped base calls this with no args — the
+        # current chat's kind/state come from the ctx accessors (None when
+        # headless, which keeps the pre-0.26 rendering).
+        from .publish import conversation_kind, conversation_state
+
+        kind = conversation_kind(self._ctx)
+        state = conversation_state(self._ctx)
         if not self._session_factory:
             return []
 

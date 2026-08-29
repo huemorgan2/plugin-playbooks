@@ -94,7 +94,7 @@ class _Ctx:
         self.current_conversation_id = origin
         self._ops = ops
 
-    def ops_conversation_id(self):
+    async def ops_conversation_id(self):
         return self._ops
 
 
@@ -328,16 +328,43 @@ async def test_identical_concurrent_trigger_deliveries_dedupe():
 
 def test_mode_declarations():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
-    if getattr(tds["playbook_publish"], "modes", None) is None:
-        pytest.skip("SDK predates 089 P1 (ToolDef drops `modes`) — kwarg is "
-                    "forward-declared and ignored")
+    # 089 §5: EVERY tool declares modes — an undeclared tool falls back to
+    # core's DEFAULT_TOOL_MODES, which silently drops it from planning and
+    # identify without this plugin ever having decided that.
+    undeclared = [n for n, td in tds.items() if getattr(td, "modes", None) is None]
+    assert undeclared == [], undeclared
     assert tds["playbook_publish"].modes == ["building", "fix_publish"]
     assert tds["playbook_rollback"].modes == ["building", "fix_publish"]
     assert tds["playbook_run"].modes == ["building", "fix_publish"]
+    assert tds["playbook_set_autonomy"].modes == ["building", "fix_publish"]
     all_five = {"planning", "building", "identify", "fix_approve", "fix_publish"}
-    for name in ("playbook_list", "playbook_status", "playbook_get_definition"):
+    for name in ("playbook_list", "playbook_status", "playbook_get_definition",
+                 "playbook_spec_from_run"):
         assert set(tds[name].modes) == all_five, name
     assert "planning" not in tds["playbook_ack_failures"].modes
+    # draft-authoring tools: absent in planning (nothing may change the
+    # system there) and in identify (triage is read-only).
+    for name in ("playbook_propose", "playbook_edit", "playbook_edit_force",
+                 "playbook_manifest_set", "playbook_spec_add",
+                 "playbook_spec_delete", "playbook_spec_run",
+                 "playbook_dry_run", "playbook_run_candidate"):
+        assert tds[name].modes == ["building", "fix_approve", "fix_publish"], name
+
+
+def test_artifact_ref_declarations():
+    """089 P5 work registry: mutating playbook tools claim playbook:{name}."""
+    tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
+    for name in ("playbook_propose", "playbook_edit", "playbook_edit_force",
+                 "playbook_manifest_set", "playbook_publish",
+                 "playbook_rollback", "playbook_run_candidate",
+                 "playbook_spec_add", "playbook_spec_delete"):
+        assert getattr(tds[name], "artifact_ref", None) == "playbook:{name}", name
+    assert getattr(tds["playbook_publish"], "artifact_verb", None) == "publishing"
+    assert getattr(tds["playbook_run_candidate"], "artifact_verb", None) == "testing"
+    # read/inspect tools never claim work
+    for name in ("playbook_list", "playbook_status", "playbook_get_definition",
+                 "playbook_validate", "playbook_spec_list"):
+        assert getattr(tds[name], "artifact_ref", None) is None, name
 
 
 # --- fix proposals (089 §4) -------------------------------------------------

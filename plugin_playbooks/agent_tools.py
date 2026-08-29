@@ -270,6 +270,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_propose",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             chat_only=True,
             description=(
                 "Create a new playbook from its FULL source, written all at "
@@ -642,6 +644,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_set_autonomy",
+            modes=["building", "fix_publish"],
             chat_only=True,
             description=(
                 "Change per-playbook autonomy. agent_autonomy = who may RUN "
@@ -1070,6 +1073,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_dry_run",
+            modes=["building", "fix_approve", "fix_publish"],
             chat_only=True,
             timeout_seconds=60,
             description=(
@@ -1467,6 +1471,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             # 0.6.0 (luna 074/phase4): no longer chat_only. Headless turns
             # (scheduled fires, playbook agent_steps) could only reach
             # playbook_validate — the no-op twin with a near-identical schema
@@ -1514,6 +1520,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit_force",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             description=(
                 "Save a playbook edit even though it conflicts with the "
                 "playbook's manifest. Same arguments and ticket flow as "
@@ -1569,6 +1577,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_manifest_set",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             description=(
                 "Set or replace a playbook's MANIFEST — the owner-stated "
                 "intent in plain markdown: Purpose, Side effects, Never "
@@ -1807,6 +1817,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_publish",
+            artifact_ref="playbook:{name}",
+            artifact_verb="publishing",
             description=(
                 "Publish a playbook version — the ONLY way content goes "
                 "live. Default: publishes the CANDIDATE. version=N restores "
@@ -1870,6 +1882,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_rollback",
+            artifact_ref="playbook:{name}",
+            artifact_verb="publishing",
             description=(
                 "Restore a playbook's PREVIOUS live version (the one the "
                 "current live was published from). Use when a published "
@@ -1969,6 +1983,9 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_run_candidate",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
+            artifact_verb="testing",
             chat_only=True,
             timeout_seconds=120,
             description=(
@@ -2134,6 +2151,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_add",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             description=(
                 "Add or update (upsert by name) SPECS — stored tests for a "
                 "playbook: fixture inputs, scripted stubs for "
@@ -2247,6 +2266,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_delete",
+            modes=["building", "fix_approve", "fix_publish"],
+            artifact_ref="playbook:{name}",
             description="Delete one of a playbook's specs by name.",
             parameters={
                 "type": "object",
@@ -2299,6 +2320,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_run",
+            modes=["building", "fix_approve", "fix_publish"],
             description=(
                 "Run a playbook's specs (all, or one via spec_name=) as "
                 "dry-runs with the spec's fixture inputs and stubs — no side "
@@ -2389,6 +2411,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_from_run",
+            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Record & replay: build a spec PROPOSAL from a real "
                 "finished run — recorded tool outputs become stubs, the "

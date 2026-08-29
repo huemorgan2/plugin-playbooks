@@ -35,24 +35,6 @@ from .publish import ops_conversation_id as _ops_conversation_id
 log = logging.getLogger("luna.playbooks.runner")
 
 
-def _pin_conversation(ctx: Any, conversation_id: Any):
-    """0.26.0 (plans/015, 089 §1): pin the core's notion of "current
-    conversation" to the run's stamped report_to for the duration of the run,
-    so chat-delivery seams that consult it (send_chat_message steps, muted
-    routing) target the stamped conversation — not whatever origin the run
-    inherited. Uses the declared core P2 surface (`ctx.pin_conversation`)
-    when present; on cores without it this is a no-op and delivery relies on
-    the explicit conversation_id the runner already threads through
-    (recorded deviation, plans/015). Returns a reset callable."""
-    pin = getattr(ctx, "pin_conversation", None) if ctx is not None else None
-    if not callable(pin):
-        return lambda: None
-    try:
-        reset = pin(conversation_id)
-    except Exception:  # noqa: BLE001 — a broken seam must not kill the run
-        return lambda: None
-    return reset if callable(reset) else (lambda: None)
-
 class _PlaybookEnvironment(SandboxedEnvironment):
     """plans/003: Mappings are DATA — `.attr` on a dict always reads the key.
 
@@ -298,10 +280,8 @@ class PlaybookRunner:
         # report to ops even when they inherited an origin contextvar (bus
         # dispatch inside a chat turn must not leak into that chat). The one
         # deliberate exception: a live run the agent starts inside a chat
-        # ("agent"/subtask triggers) reports where it was asked for. On
-        # cores without an ops chat report_to stays NULL and delivery
-        # behaves as before 0.26 — never "most recent".
-        ops_id = _ops_conversation_id(self._ctx)
+        # ("agent"/subtask triggers) reports where it was asked for.
+        ops_id = await _ops_conversation_id(self._ctx)
         chat_invoked = trigger is not None and (
             trigger == "agent" or trigger.startswith("subtask:")
         )
@@ -383,10 +363,6 @@ class PlaybookRunner:
 
         token = _active_run_id.set(str(run.id))
         source_token = message_source.set("playbook")
-        reset_pin = (
-            _pin_conversation(self._ctx, run.report_to)
-            if run.report_to is not None else (lambda: None)
-        )
         heartbeat_task = asyncio.create_task(
             self._activity_heartbeat(activity_id, activity_label, activity_meta)
         )
@@ -443,7 +419,6 @@ class PlaybookRunner:
             })
             message_source.reset(source_token)
             _active_run_id.reset(token)
-            reset_pin()
 
     async def _activity_heartbeat(
         self, activity_id: str, label: str, meta: dict[str, Any]

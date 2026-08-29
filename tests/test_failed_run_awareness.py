@@ -250,3 +250,63 @@ class TestPromptSection:
         plugin._session_factory = db
         sections = await plugin.prompt_sections()
         assert len(sections) == 1
+
+
+class _KindStateCtx:
+    def __init__(self, kind=None, state=None):
+        self._kind, self._state = kind, state
+
+    def conversation_kind(self):
+        return self._kind
+
+    def conversation_state(self):
+        return self._state
+
+
+class TestPromptSectionPerState:
+    """089 §5: kind/state come from the ctx accessors (no-arg signature)."""
+
+    async def _plugin(self, db, kind, state):
+        from plugin_playbooks import PlaybooksPlugin
+
+        plugin = PlaybooksPlugin()
+        plugin._session_factory = db
+        plugin._ctx = _KindStateCtx(kind, state)
+        return plugin
+
+    async def test_planning_drops_must_use_rule(self, db):
+        await _playbook(db, name="mailer", live_version=1)
+        plugin = await self._plugin(db, "building", "planning")
+        text = "\n".join(await plugin.prompt_sections())
+        assert "`mailer`" in text
+        assert "MUST" not in text
+        assert "Prefer running" not in text
+
+    async def test_building_softens_rule(self, db):
+        await _playbook(db, name="mailer", live_version=1)
+        plugin = await self._plugin(db, "building", "building")
+        text = "\n".join(await plugin.prompt_sections())
+        assert "Prefer running an existing playbook" in text
+        assert "you MUST use it" not in text
+
+    async def test_ops_renders_mode_section_and_digest(self, db):
+        pid = await _playbook(db, name="mailer", live_version=1)
+        await _run(db, pid, version=1, status="failed")
+        plugin = await self._plugin(db, "ops", "identify")
+        sections = await plugin.prompt_sections()
+        assert "Ops chat — mode: Identify" in sections[0]
+        assert any("failures needing your attention" in s for s in sections)
+
+    async def test_ops_fix_publish_mentions_gate(self, db):
+        await _playbook(db, name="mailer", live_version=1)
+        plugin = await self._plugin(db, "ops", "fix_publish")
+        sections = await plugin.prompt_sections()
+        assert "Fix & publish" in sections[0]
+        assert "playbook_run_candidate" in sections[0]
+
+    async def test_building_chat_omits_digest(self, db):
+        pid = await _playbook(db, name="mailer", live_version=1)
+        await _run(db, pid, version=1, status="failed")
+        plugin = await self._plugin(db, "building", "building")
+        sections = await plugin.prompt_sections()
+        assert not any("failures needing your attention" in s for s in sections)

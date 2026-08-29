@@ -88,20 +88,14 @@ class FakeAgent:
 
     def __init__(self, result="All done: candidate v3 promoted.",
                  events=None, gate: asyncio.Event | None = None,
-                 reject_049_kwargs: bool = False,
                  raise_exc: Exception | None = None) -> None:
         self.result = result
         self.script = events or []
         self.gate = gate
-        self.reject_049_kwargs = reject_049_kwargs
         self.raise_exc = raise_exc
         self.calls: list[dict] = []
 
     async def run_turn(self, prompt, **kwargs):
-        if self.reject_049_kwargs and (
-            "max_turns" in kwargs or "event_stream_handler" in kwargs
-        ):
-            raise TypeError("run_turn() got an unexpected keyword argument")
         self.calls.append({"prompt": prompt, **kwargs})
         handler = kwargs.get("event_stream_handler")
         if handler is not None and self.script:
@@ -117,9 +111,16 @@ class FakeAgent:
 
 
 class FakeCtx:
-    def __init__(self, agent: FakeAgent) -> None:
+    def __init__(self, agent: FakeAgent, state: str | None = None) -> None:
         self.agent = agent
         self.current_conversation_id = uuid.uuid4()
+        self._state = state
+
+    def conversation_kind(self):
+        return None
+
+    def conversation_state(self):
+        return self._state
 
 
 @pytest.fixture
@@ -338,19 +339,15 @@ async def test_v2_result_events_still_stamp_duration_and_detail(env):
     assert runs[0]["detail"] == "2/2 pass"
 
 
-async def test_typeerror_fallback_runs_uncontained_and_says_so(env):
-    agent = FakeAgent(result="done anyway", reject_049_kwargs=True)
-    tools = _tools(FakeCtx(agent), env)
+async def test_delegate_inherits_spawning_chat_state(env):
+    # 089 §6: run_turn gets the spawning chat's conversation_state so core
+    # applies the same per-state tool filtering to the delegate.
+    agent = FakeAgent(result="done")
+    tools = _tools(FakeCtx(agent, state="fix_approve"), env)
     _, run = tools["playbook_agent"]
     out = json.loads(await run(task="job", wait_seconds=10))
     assert out["status"] == "done"
-    # The fallback call carries no budget kwargs but keeps the allowlist.
-    call = agent.calls[0]
-    assert "max_turns" not in call
-    assert "playbook_edit" in call["tools"]
-    async with env() as s:
-        row = await s.get(PlaybookDelegation, uuid.UUID(out["delegation_id"]))
-    assert any("budget unenforced" in e["label"] for e in row.events)
+    assert agent.calls[0]["conversation_state"] == "fix_approve"
 
 
 async def test_main_turn_payloads_stay_small(env):
