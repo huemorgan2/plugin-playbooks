@@ -114,27 +114,43 @@ async def test_run_gate(
     states exactly what's missing so the agent can go do it instead of
     arguing with the gate.
     """
+    # 0.27.1 (plans/016 phase 1): for restores/rollbacks the `since` bound
+    # is dropped. Version rows are immutable, so ANY completed run of exactly
+    # this version ran exactly this content — and snapshot rows are minted at
+    # the NEXT edit ("before whole-YAML edit", `_ensure_live_row`), so their
+    # created_at post-dates every run the version ever had. Keeping the
+    # bound made every owner restore fail with "not tested since its last
+    # edit" (silently, in the UI). Candidates keep the strict rule: they are
+    # the one case where "since the row was created" means "since the edit".
+    since = None if include_live else _aware(edited_at)
     run = await latest_run_evidence(
-        session, playbook_id, version, _aware(edited_at),
-        include_live=include_live,
+        session, playbook_id, version, since, include_live=include_live,
     )
     if run is None:
-        gate = {
-            "gate": "test_run", "ok": False,
-            "note": f"version {version} has no test run since its last edit",
-        }
-        refusal = json.dumps({
-            "error": (
+        if include_live:
+            note = f"version {version} has never completed a run"
+            error = (
+                "Publish refused — gate 'test_run' failed: version "
+                f"{version} has never completed a run, so there is no "
+                "evidence it works."
+            )
+            hint = (
+                "Run this version once (a test run is enough) and restore "
+                "it again once that run completes green."
+            )
+        else:
+            note = f"version {version} has no test run since its last edit"
+            error = (
                 "Publish refused — gate 'test_run' failed: version "
                 f"{version} has not been tested since its last edit."
-            ),
-            "gate": "test_run",
-            "hint": (
+            )
+            hint = (
                 "Run it as a test first — playbook_run_candidate for the "
                 "candidate (real run, real side effects) — and publish "
                 "again once it completes green."
-            ),
-        })
+            )
+        gate = {"gate": "test_run", "ok": False, "note": note}
+        refusal = json.dumps({"error": error, "gate": "test_run", "hint": hint})
         return gate, refusal, None
     if run.status != "done":
         # run rows carry no error text — the failed step does.
