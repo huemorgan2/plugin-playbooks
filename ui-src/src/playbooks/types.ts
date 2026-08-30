@@ -133,6 +133,21 @@ export interface PlaybookSummary {
   runs_window?: number
 }
 
+// plans/016 phase 2: one version's full content (`GET /versions/{n}`).
+export interface VersionDetail {
+  version: number
+  definition: PlaybookDef
+  code: string | null
+  manifest: string | null
+  author: string
+  message: string
+  created_at: string
+  promoted_from: number | null
+  live: boolean
+  candidate: boolean
+  runs: number
+}
+
 export interface PlaybookRunSummary {
   id: string
   status: RunStatus

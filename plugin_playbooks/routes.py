@@ -861,7 +861,9 @@ async def start_run(name: str, body: RunCreate):
 
 
 @router.get("/playbooks/{name}/runs")
-async def list_runs(name: str):
+async def list_runs(name: str, version: int | None = None):
+    """Runs newest first; `?version=N` narrows to runs of that version
+    (plans/016: the Versions tab shows runs per version)."""
     async with _sf()() as session:
         p = (await session.execute(
             select(Playbook).where(Playbook.name == name)
@@ -869,8 +871,11 @@ async def list_runs(name: str):
         if not p:
             raise HTTPException(404)
 
+        q = select(PlaybookRun).where(PlaybookRun.playbook_id == p.id)
+        if version is not None:
+            q = q.where(PlaybookRun.playbook_version == version)
         runs = (await session.execute(
-            select(PlaybookRun).where(PlaybookRun.playbook_id == p.id).order_by(PlaybookRun.started_at.desc())
+            q.order_by(PlaybookRun.started_at.desc())
         )).scalars().all()
 
         return [{
@@ -986,6 +991,58 @@ async def list_versions(name: str):
 
         result.sort(key=lambda r: r["version"], reverse=True)
         return result
+
+
+@router.get("/playbooks/{name}/versions/{n}")
+async def get_version(name: str, n: int):
+    """One version's full content — what the Versions tab renders on the
+    left (plans/016). Stored rows are served as-is; the legacy live version
+    without a row (see `list_versions`) is served from the Playbook row."""
+    from sqlalchemy import func as sa_func
+
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        live_n = _live_version_of(p)
+        row = await _get_version_row(session, p, n)
+        if row is None and n != live_n:
+            raise HTTPException(404, f"Version {n} of '{name}' not found")
+        runs = (await session.execute(
+            select(sa_func.count()).select_from(PlaybookRun).where(
+                PlaybookRun.playbook_id == p.id,
+                PlaybookRun.playbook_version == n,
+            )
+        )).scalar_one()
+        if row is None:
+            return {
+                "version": live_n,
+                "definition": p.definition,
+                "code": p.code,
+                "manifest": p.manifest,
+                "author": "",
+                "message": "",
+                "created_at": p.updated_at.isoformat(),
+                "promoted_from": None,
+                "live": True,
+                "candidate": False,
+                "runs": runs,
+            }
+        return {
+            "version": row.version,
+            "definition": row.definition,
+            "code": row.code,
+            "manifest": row.manifest,
+            "author": row.author,
+            "message": row.message,
+            "created_at": row.created_at.isoformat(),
+            "promoted_from": row.promoted_from,
+            "live": row.version == live_n,
+            "candidate": row.version == p.candidate_version,
+            "runs": runs,
+        }
 
 
 class PromoteBody(BaseModel):

@@ -1,6 +1,6 @@
 import type {
   PlaybookSummary, PlaybookRunSummary, PlaybookRunDetail,
-  SpecEntry, ProbeEntry,
+  SpecEntry, ProbeEntry, VersionDetail,
 } from './types'
 import { getToken, getTokenAsync, invalidateToken } from '../lib/auth'
 
@@ -85,8 +85,11 @@ export const playbooksApi = {
       body: JSON.stringify({ agent_autonomy }),
     }),
 
-  listRuns: (name: string) =>
-    apiFetch<PlaybookRunSummary[]>(`${BASE}/playbooks/${name}/runs`),
+  // plans/016: `version` narrows to runs of that version (Versions tab).
+  listRuns: (name: string, version?: number) =>
+    apiFetch<PlaybookRunSummary[]>(
+      `${BASE}/playbooks/${name}/runs${version != null ? `?version=${version}` : ''}`,
+    ),
 
   getRun: (runId: string) =>
     apiFetch<PlaybookRunDetail>(`${BASE}/playbooks/runs/${runId}`),
@@ -111,6 +114,9 @@ export const playbooksApi = {
       promoted_from: number | null
       current: boolean
     }[]>(`${BASE}/playbooks/${name}/versions`),
+
+  getVersion: (name: string, n: number) =>
+    apiFetch<VersionDetail>(`${BASE}/playbooks/${name}/versions/${n}`),
 
   promoteVersion: (name: string, version: number) =>
     apiFetch<{ name: string; version: number; promoted_from: number; status: string }>(
