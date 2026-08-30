@@ -100,6 +100,9 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt
 
 
+_RELAX = "Owner can relax this in Settings → Publish."
+
+
 async def test_run_gate(
     session: AsyncSession,
     playbook_id: Any,
@@ -107,6 +110,7 @@ async def test_run_gate(
     edited_at: datetime | None,
     *,
     include_live: bool = False,
+    require: bool = True,
 ) -> tuple[dict[str, Any], str | None, PlaybookRun | None]:
     """Machine-checked precondition #2 of the publish contract.
 
@@ -150,6 +154,12 @@ async def test_run_gate(
                 "again once it completes green."
             )
         gate = {"gate": "test_run", "ok": False, "note": note}
+        if not require:
+            # plans/016 phase 6: reported, never refused (Settings → Publish)
+            gate["enforced"] = False
+            gate["note"] += " — not enforced (Settings → Publish)"
+            return gate, None, None
+        error += " " + _RELAX
         refusal = json.dumps({"error": error, "gate": "test_run", "hint": hint})
         return gate, refusal, None
     if run.status != "done":
@@ -164,10 +174,14 @@ async def test_run_gate(
             "gate": "test_run", "ok": False,
             "note": f"latest test of version {version} FAILED (run {run.id})",
         }
+        if not require:
+            gate["enforced"] = False
+            gate["note"] += " — not enforced (Settings → Publish)"
+            return gate, None, run
         refusal = json.dumps({
             "error": (
                 "Publish refused — gate 'test_run' failed: the latest test "
-                f"run of version {version} FAILED."
+                f"run of version {version} FAILED. " + _RELAX
             ),
             "gate": "test_run",
             "run_id": str(run.id),
@@ -268,13 +282,18 @@ async def specs_gate(
     playbook_id: Any,
     target: Any,
     version_n: int,
+    *,
+    require: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """plans/016 phase 5: the specs gate, evaluated on the specs OF the
     version going live (`playbook_specs.playbook_version == version_n`)
     against that version's content — candidates AND restores/rollbacks
     (supersedes plans/015 deviation #4). Returns (gate_entry, refusal_dict);
     the refusal is None when every spec passed or the version has none.
-    Spec result caches are updated on the rows — the caller commits."""
+    Spec result caches are updated on the rows — the caller commits.
+
+    plans/016 phase 6: `require=False` (Settings → Publish) keeps the run and
+    the report but never refuses — the gate entry carries `enforced: False`."""
     from .specs import run_all_specs
 
     summary = await run_all_specs(session, runner, playbook_id, target, version_n)
@@ -289,19 +308,24 @@ async def specs_gate(
     if not summary["failed"]:
         return gate, None
     failing = [r for r in summary["results"] if not r["passed"]]
+    if not require:
+        gate["enforced"] = False
+        gate["note"] += " — not enforced (Settings → Publish)"
+        return gate, None
     return gate, {
         "error": (
             f"Publish refused — gate 'specs' failed ({len(failing)} of "
-            f"{summary['total']} red on version {version_n})."
+            f"{summary['total']} red on version {version_n}). Owner can relax this in Settings → Publish."
         ),
         "message": (
             f"Promote refused — gate 'specs' failed ({len(failing)} of "
-            f"{summary['total']} red on v{version_n})."
+            f"{summary['total']} red on v{version_n}). Owner can relax this in Settings → Publish."
         ),
         "gate": "specs",
         "failing_specs": failing,
         "hint": (
             "Fix the candidate via playbook_edit, or update the spec if the "
-            "expectation itself changed (playbook_spec_add upserts by name)."
+            "expectation itself changed (playbook_spec_add upserts by name). "
+            "Owner can relax this in Settings → Publish."
         ),
     }

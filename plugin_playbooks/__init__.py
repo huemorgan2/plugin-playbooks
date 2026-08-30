@@ -29,6 +29,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "publish_autonomy", "VARCHAR(16) NOT NULL DEFAULT 'ask'"),
     ("playbook_runs", "report_to", "UUID"),
     ("playbook_runs", "is_test", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # 0.28.0 (plans/016 phase 6): switchable publish gates
+    ("playbooks", "publish_require_specs", "BOOLEAN NOT NULL DEFAULT TRUE"),
+    ("playbooks", "publish_require_run", "BOOLEAN NOT NULL DEFAULT TRUE"),
     # 0.28.0 (plans/016 phase 5): specs belong to a version
     ("playbook_specs", "playbook_version", "INTEGER NOT NULL DEFAULT 0"),
 ]

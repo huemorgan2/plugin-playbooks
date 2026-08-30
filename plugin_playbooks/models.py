@@ -66,6 +66,10 @@ class Playbook(Base):
     # which governs who may RUN it. 'auto' is only honored in the ops chat's
     # fix_publish state — chat state gates broadly, this refines.
     publish_autonomy: Mapped[str] = mapped_column(String(16), default="ask", nullable=False)
+    # 0.28.0 (plans/016 phase 6): owner-switchable publish gates (Settings →
+    # Publish). Off = the gate still runs and is reported, but never refuses.
+    publish_require_specs: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    publish_require_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
     cost_estimate_cents: Mapped[float | None] = mapped_column(nullable=True)

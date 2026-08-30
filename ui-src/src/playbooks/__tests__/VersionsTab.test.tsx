@@ -60,7 +60,7 @@ function detailOf(version: number, live: boolean, candidate = false): VersionDet
   }
 }
 
-function setup({ candidate = false, redV1 = false }: { candidate?: boolean; redV1?: boolean } = {}) {
+function setup({ candidate = false, redV1 = false, requireSpecs = true }: { candidate?: boolean; redV1?: boolean; requireSpecs?: boolean } = {}) {
   api.listVersions.mockResolvedValue([
     ...(candidate ? [entry(3, { candidate: true })] : []),
     entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
@@ -74,7 +74,7 @@ function setup({ candidate = false, redV1 = false }: { candidate?: boolean; redV
     <VersionsTab
       name="greeter" agentName="Luna" liveVersion={2}
       candidateVersion={candidate ? 3 : null}
-      onPromoted={onPromoted} onManifestSaved={() => {}}
+      onPromoted={onPromoted} onManifestSaved={() => {}} requireSpecs={requireSpecs}
     />,
   )
   return { onPromoted }
@@ -170,6 +170,16 @@ describe('VersionsTab — per-version tests (phase 5)', () => {
     const btn = await screen.findByTestId('promote-btn')
     expect((btn as HTMLButtonElement).disabled).toBe(true)
     expect(btn.getAttribute('title')).toContain('red')
+  })
+
+  // plans/016 phase 6: the client-side red-disable follows the specs gate switch.
+  it('a red version can be promoted when the specs gate is off in Settings → Publish', async () => {
+    setup({ redV1: true, requireSpecs: false })
+    await screen.findByTestId('version-toolbar')
+    expect(screen.getByTestId('version-specs-1').textContent).toBe('2 tests · 1 red')
+    fireEvent.click(screen.getByTestId('version-row-1'))
+    const btn = await screen.findByTestId('promote-btn')
+    expect((btn as HTMLButtonElement).disabled).toBe(false)
   })
 })
 

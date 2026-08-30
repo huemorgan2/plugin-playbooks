@@ -597,11 +597,13 @@ def build_tools(
     # --- playbook_set_autonomy ---
     async def _set_autonomy(
         *, name: str, agent_autonomy: str = "", publish_autonomy: str = "",
+        require_specs: bool | None = None, require_run: bool | None = None,
     ) -> str:
-        if not agent_autonomy and not publish_autonomy:
+        if (not agent_autonomy and not publish_autonomy
+                and require_specs is None and require_run is None):
             return json.dumps({
-                "error": "Nothing to change — pass agent_autonomy and/or "
-                         "publish_autonomy.",
+                "error": "Nothing to change — pass agent_autonomy, "
+                         "publish_autonomy, require_specs and/or require_run.",
             })
         valid = {e.value for e in AgentAutonomy}
         if agent_autonomy and agent_autonomy not in valid:
@@ -624,13 +626,21 @@ def build_tools(
                 playbook.agent_autonomy = agent_autonomy
             if publish_autonomy:
                 playbook.publish_autonomy = publish_autonomy
+            # plans/016 phase 6: switchable publish gates (Settings → Publish)
+            if require_specs is not None:
+                playbook.publish_require_specs = require_specs
+            if require_run is not None:
+                playbook.publish_require_run = require_run
             await session.commit()
+            req_specs, req_run = playbook.publish_require_specs, playbook.publish_require_run
         result: dict[str, Any] = {
             "playbook": name,
             "old_autonomy": old,
             "new_autonomy": agent_autonomy or old,
             "old_publish_autonomy": old_publish,
             "new_publish_autonomy": publish_autonomy or old_publish,
+            "publish_require_specs": req_specs,
+            "publish_require_run": req_run,
             "status": "updated",
         }
         if publish_autonomy == "auto":
@@ -654,7 +664,9 @@ def build_tools(
                 "(agent cannot run it at all). publish_autonomy = may the "
                 "agent PUBLISH fixes to it without asking: 'ask' (default) "
                 "or 'auto' — 'auto' is honored only in the ops chat's "
-                "fix & publish mode."
+                "fix & publish mode. require_specs / require_run switch the "
+                "publish gates (Settings → Publish): off = the gate is still "
+                "run and reported but never refuses a publish."
             ),
             parameters={
                 "type": "object",
@@ -669,6 +681,14 @@ def build_tools(
                         "type": "string",
                         "enum": ["ask", "auto"],
                         "description": "The new publish-autonomy level",
+                    },
+                    "require_specs": {
+                        "type": "boolean",
+                        "description": "Pushing a version requires all tests green",
+                    },
+                    "require_run": {
+                        "type": "boolean",
+                        "description": "Pushing a version requires at least one successful run",
                     },
                 },
                 "required": ["name"],
@@ -1657,6 +1677,7 @@ def build_tools(
             spec_gate, spec_refusal = await specs_gate(
                 session, runner, playbook.id,
                 _shim_playbook(playbook, row), row.version,
+                require=playbook.publish_require_specs,
             )
             gates.append(spec_gate)
             if spec_refusal is not None:
@@ -1669,6 +1690,7 @@ def build_tools(
             test_gate, refusal, evidence = await test_run_gate(
                 session, playbook.id, row.version, row.created_at,
                 include_live=not is_candidate,
+                require=playbook.publish_require_run,
             )
             gates.append(test_gate)
             if refusal:

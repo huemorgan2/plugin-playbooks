@@ -21,6 +21,7 @@ import type { PlaybookDef, StepDef } from './types'
 import { StepDetailPanel } from './StepDetailPanel'
 import { TabBtn } from './editorBits'
 import { VersionsTab } from './VersionsTab'
+import { PublishSettings, type PublishSettingsValue } from './PublishSettings'
 import { findStepById } from './explain/dataflow'
 
 export { promoteRefusalMessage } from './VersionsTab'
@@ -56,6 +57,10 @@ export function PlaybookEditor(props: Props) {
   const [promoting, setPromoting] = useState(false)
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
   const [autonomy, setAutonomy] = useState<string>('agent_must_confirm')
+  // plans/016 phase 6: Settings → Publish switches (default on).
+  const [publishSettings, setPublishSettings] = useState<PublishSettingsValue>({
+    require_specs: true, require_run: true,
+  })
   // Bumped on every reload so the Versions tab re-lists and re-fetches.
   const [refreshKey, setRefreshKey] = useState(0)
   // The latest live agent patch, handed to the Versions tab.
@@ -100,6 +105,10 @@ export function PlaybookEditor(props: Props) {
           setDefinition(def)
           defRef.current = def
           setAutonomy(pb.agent_autonomy)
+          setPublishSettings({
+            require_specs: pb.publish_require_specs ?? true,
+            require_run: pb.publish_require_run ?? true,
+          })
           setMeta({
             display_name: pb.display_name,
             status: pb.status as string,
@@ -218,6 +227,21 @@ export function PlaybookEditor(props: Props) {
     }
   }
 
+  const changePublishSettings = async (patch: Partial<PublishSettingsValue>) => {
+    if (!props.name) return
+    const before = publishSettings
+    setPublishSettings({ ...before, ...patch })
+    try {
+      const r = await playbooksApi.patchPublishSettings(props.name, patch)
+      setPublishSettings({
+        require_specs: r.publish_require_specs, require_run: r.publish_require_run,
+      })
+    } catch (e) {
+      console.error('Failed to update publish settings', e)
+      setPublishSettings(before)
+    }
+  }
+
   const changeAutonomy = async (value: string) => {
     if (!props.name || value === autonomy) return
     try {
@@ -328,6 +352,7 @@ export function PlaybookEditor(props: Props) {
         mode === 'versions' ? (
           <div className="flex-1 min-h-0">
             <VersionsTab
+            requireSpecs={publishSettings.require_specs}
               name={props.name}
               agentName={agentName}
               liveVersion={meta?.version ?? 0}
@@ -342,7 +367,9 @@ export function PlaybookEditor(props: Props) {
             />
           </div>
         ) : (
-          <SettingsTab autonomy={autonomy} onChangeAutonomy={changeAutonomy} />
+          <SettingsTab autonomy={autonomy} onChangeAutonomy={changeAutonomy}>
+            <PublishSettings value={publishSettings} onChange={changePublishSettings} />
+          </SettingsTab>
         )
       ) : (
         <div className="flex-1 min-h-0 relative flex">

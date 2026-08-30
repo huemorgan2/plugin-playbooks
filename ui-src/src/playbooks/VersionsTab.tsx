@@ -113,6 +113,7 @@ export function VersionsTab({
   patch = null,
   onPromoted,
   onManifestSaved,
+  requireSpecs = true,
 }: {
   name: string
   agentName: string
@@ -124,6 +125,9 @@ export function VersionsTab({
   patch?: { seq: number; evt: PlaybookPatchEvt } | null
   onPromoted: (liveVersion: number) => void
   onManifestSaved: (version: number) => void
+  // plans/016 phase 6: client-side "disabled when red" only while the
+  // specs gate is on (Settings → Publish).
+  requireSpecs?: boolean
 }) {
   const [versions, setVersions] = useState<VersionEntry[] | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
@@ -278,7 +282,9 @@ export function VersionsTab({
   const isLive = !!detail?.live
   // Known-red specs of the selected version (from the list's cache) block
   // Promote up front — the server gate would refuse anyway.
-  const redSpecs = versions?.find((v) => v.version === selected)?.specs.failed ?? 0
+  const redSpecs = requireSpecs
+    ? (versions?.find((v) => v.version === selected)?.specs.failed ?? 0)
+    : 0
 
   return (
     <div className="h-full flex min-h-0">

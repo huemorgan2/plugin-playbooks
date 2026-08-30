@@ -123,6 +123,9 @@ export interface PlaybookSummary {
   description: string | null
   status: string
   agent_autonomy: string
+  // plans/016 phase 6: owner-switchable publish gates (Settings → Publish).
+  publish_require_specs?: boolean
+  publish_require_run?: boolean
   version: number
   live_version?: number
   candidate_version?: number | null

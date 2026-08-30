@@ -495,6 +495,12 @@ class AutonomyPatch(BaseModel):
     agent_autonomy: str
 
 
+class PublishSettingsPatch(BaseModel):
+    # plans/016 phase 6: Settings → Publish switches; omitted = unchanged.
+    require_specs: bool | None = None
+    require_run: bool | None = None
+
+
 class RunCreate(BaseModel):
     inputs: dict[str, Any] = {}
     trigger: str = "api"
@@ -644,6 +650,8 @@ async def get_playbook(name: str):
             "inputs_schema": p.inputs_schema,
             "status": p.status,
             "agent_autonomy": p.agent_autonomy,
+            "publish_require_specs": p.publish_require_specs,
+            "publish_require_run": p.publish_require_run,
             "version": p.version,
             "live_version": _live_version_of(p),
             "candidate_version": p.candidate_version,
@@ -815,6 +823,29 @@ async def patch_autonomy(name: str, body: AutonomyPatch):
         p.agent_autonomy = body.agent_autonomy
         await session.commit()
         return {"name": name, "agent_autonomy": body.agent_autonomy}
+
+
+@router.patch("/playbooks/{name}/publish-settings")
+async def patch_publish_settings(name: str, body: PublishSettingsPatch):
+    """plans/016 phase 6: owner-switchable publish gates."""
+    if body.require_specs is None and body.require_run is None:
+        raise HTTPException(400, "Nothing to change — pass require_specs and/or require_run")
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404)
+        if body.require_specs is not None:
+            p.publish_require_specs = body.require_specs
+        if body.require_run is not None:
+            p.publish_require_run = body.require_run
+        await session.commit()
+        return {
+            "name": name,
+            "publish_require_specs": p.publish_require_specs,
+            "publish_require_run": p.publish_require_run,
+        }
 
 
 @router.delete("/playbooks/{name}")
@@ -1057,6 +1088,7 @@ async def _specs_gate_or_422(session: AsyncSession, p: Playbook, row: PlaybookVe
     """Run the specs of `row.version` against its content; 422 on red."""
     _gate, refusal = await specs_gate(
         session, _runner, p.id, _shim_for(p, row), row.version,
+        require=p.publish_require_specs,
     )
     if refusal is not None:
         await session.commit()  # persist last_result on spec rows
@@ -1149,7 +1181,7 @@ async def promote_version(name: str, body: PromoteBody):
         # the version's live history as evidence.
         _gate, refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at,
-            include_live=not candidate,
+            include_live=not candidate, require=p.publish_require_run,
         )
         if refusal is not None:
             raise HTTPException(422, json.loads(refusal))
@@ -1222,6 +1254,7 @@ async def rollback_playbook(name: str):
         await _specs_gate_or_422(session, p, row)
         _gate, refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at, include_live=True,
+            require=p.publish_require_run,
         )
         if refusal is not None:
             raise HTTPException(422, json.loads(refusal))

@@ -85,6 +85,13 @@ export const playbooksApi = {
       body: JSON.stringify({ agent_autonomy }),
     }),
 
+  // plans/016 phase 6: Settings → Publish switches.
+  patchPublishSettings: (name: string, body: { require_specs?: boolean; require_run?: boolean }) =>
+    apiFetch<{ name: string; publish_require_specs: boolean; publish_require_run: boolean }>(
+      `${BASE}/playbooks/${name}/publish-settings`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
+
   // plans/016: `version` narrows to runs of that version (Versions tab).
   listRuns: (name: string, version?: number) =>
     apiFetch<PlaybookRunSummary[]>(
