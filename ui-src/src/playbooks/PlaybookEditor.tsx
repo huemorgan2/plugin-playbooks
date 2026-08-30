@@ -1,27 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ReactFlow,
-  Background,
-  Controls,
-  MiniMap,
   useNodesState,
   useEdgesState,
-  BackgroundVariant,
   type Node,
   type Edge,
   type NodeMouseHandler,
 } from '@xyflow/react'
-import '@xyflow/react/dist/style.css'
 import {
-  ArrowLeft, Play, FileCode, Eye, Loader2, Rocket, Workflow,
+  ArrowLeft, Play, FileCode, Eye, Loader2, Rocket,
   X, ChevronDown, ChevronRight, Settings, History,
-  ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle, Copy,
+  ShieldCheck, ShieldAlert, ShieldOff, Check, ArrowUpCircle,
   FileText, FlaskConical,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
-import { StepNode } from './nodes/StepNode'
-import { TriggerNode } from './nodes/TriggerNode'
 import { buildGraph } from './layout'
+import { CanvasSurface, CodeView, sourceFor } from './VersionCanvas'
 import { applyPlaybookPatch, patchMatchesEditor, type PlaybookPatchEvt } from './livePatch'
 import { setPlaybookConsumerReady } from './liveBus'
 import { subscribePlaybookEvents } from '../lib/events'
@@ -36,17 +29,12 @@ import { RunsTab } from './RunsTab'
 import { TestsTab } from './TestsTab'
 import { ManifestTab } from './ManifestTab'
 
-import { KIND_LABELS, kindIcon, Code } from './explain/primitives'
+import { KIND_LABELS, kindIcon } from './explain/primitives'
 import { IntegrationIcon, toolIconUrl, useIconRef } from './icons'
 import { headline } from './explain/headline'
 import { STEP_EXPLAINERS, DataFlow, FooterChips } from './explain/registry'
 import { findStepById } from './explain/dataflow'
 import { JsonTree } from './explain/jsontree'
-
-const nodeTypes = {
-  stepNode: StepNode,
-  triggerNode: TriggerNode,
-}
 
 // 0.13.0 (plans/002 phase 6): view modes became real tabs. Drafts keep
 // Canvas | Code only — the other tabs are live-playbook surfaces.
@@ -150,8 +138,6 @@ export function PlaybookEditor(props: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('canvas')
   const [promoting, setPromoting] = useState(false)
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
-  const [explainOpen, setExplainOpen] = useState(false)
-  const [copied, setCopied] = useState(false)
   const [autonomy, setAutonomy] = useState<string>('agent_must_confirm')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [versionsOpen, setVersionsOpen] = useState(false)
@@ -449,8 +435,8 @@ export function PlaybookEditor(props: Props) {
   const canvasDef = canvasSource === 'candidate' && candidateDef ? candidateDef : definition
   const playbookExplanation = canvasDef?.explanation
   const codeShown = canvasSource === 'candidate' && candidateDef
-    ? (candidateCode || JSON.stringify(candidateDef, null, 2))
-    : (code || (definition ? JSON.stringify(definition, null, 2) : '{}'))
+    ? sourceFor(candidateCode, candidateDef)
+    : sourceFor(code, definition)
 
   const tabs: { mode: ViewMode; label: string; icon: React.ComponentType<{ className?: string }> }[] =
     isDraft
@@ -581,162 +567,85 @@ export function PlaybookEditor(props: Props) {
       <div className="flex-1 min-h-0 relative flex">
         <div className="flex-1 min-w-0 relative">
           {viewMode === 'canvas' && (
-            <>
-              {hasSteps || (canvasSource === 'candidate' && candidateDef?.steps?.length) ? (
-                <>
-                  {/* Name + foldable explanation overlay */}
-                  <div className="absolute top-3 left-3 z-10 max-w-[340px]">
-                    <span className="inline-flex items-center gap-1.5 text-sm font-mono text-white">
-                      {canvasDef?.name || props.name}
-                      <button
-                        onClick={() => {
-                          navigator.clipboard.writeText(canvasDef?.name || props.name || '')
-                          setCopied(true)
-                          setTimeout(() => setCopied(false), 1500)
-                        }}
-                        className="text-ink-500 hover:text-ink-200 transition"
-                        title="Copy name"
-                      >
-                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                      </button>
-                    </span>
-                    {playbookExplanation && (
-                      <div className="mt-1">
-                        <button
-                          onClick={() => setExplainOpen(!explainOpen)}
-                          className="flex items-center gap-1 text-[11px] text-ink-400 hover:text-ink-200 transition"
-                        >
-                          {explainOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                          About this playbook
-                        </button>
-                        {explainOpen && (
-                          <p className="mt-1 text-xs text-ink-400 leading-relaxed">
-                            {playbookExplanation}
-                          </p>
-                        )}
-                      </div>
-                    )}
+            <CanvasSurface
+              name={canvasDef?.name || props.name || ''}
+              explanation={playbookExplanation}
+              agentName={agentName}
+              hasSteps={hasSteps || !!(canvasSource === 'candidate' && candidateDef?.steps?.length)}
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onNodeClick={handleNodeClick}
+              onPaneClick={handlePaneClick}
+              runDetail={!isDraft && canvasSource === 'live' ? runDetail : null}
+              onClearRun={() => {
+                setRunDetail(null)
+                if (defRef.current) {
+                  const { nodes: n, edges: e } = buildGraph(defRef.current)
+                  setNodes(n)
+                  setEdges(e)
+                }
+              }}
+              overlay={
+                /* 0.13.0: live/candidate switch — which version the canvas shows. */
+                !isDraft && candidateVersion != null && candidateDef ? (
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-0.5 p-0.5 rounded-full border border-white/10 bg-ink-950/90 backdrop-blur-sm shadow-lg">
+                    <button
+                      onClick={() => showSource('live')}
+                      className={cn(
+                        'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
+                        canvasSource === 'live'
+                          ? 'bg-luna-600/30 text-luna-200'
+                          : 'text-ink-400 hover:text-ink-200',
+                      )}
+                      data-testid="canvas-source-live"
+                    >
+                      Live v{meta?.version}
+                    </button>
+                    <button
+                      onClick={() => showSource('candidate')}
+                      className={cn(
+                        'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
+                        canvasSource === 'candidate'
+                          ? 'bg-violet-600/30 text-violet-200'
+                          : 'text-ink-400 hover:text-ink-200',
+                      )}
+                      data-testid="canvas-source-candidate"
+                    >
+                      Candidate v{candidateVersion}
+                    </button>
                   </div>
-                  {/* 0.13.0: live/candidate switch — which version the canvas shows. */}
-                  {!isDraft && candidateVersion != null && candidateDef && (
-                    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-0.5 p-0.5 rounded-full border border-white/10 bg-ink-950/90 backdrop-blur-sm shadow-lg">
-                      <button
-                        onClick={() => showSource('live')}
-                        className={cn(
-                          'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
-                          canvasSource === 'live'
-                            ? 'bg-luna-600/30 text-luna-200'
-                            : 'text-ink-400 hover:text-ink-200',
-                        )}
-                        data-testid="canvas-source-live"
-                      >
-                        Live v{meta?.version}
-                      </button>
-                      <button
-                        onClick={() => showSource('candidate')}
-                        className={cn(
-                          'px-2.5 py-1 rounded-full text-[11px] font-medium transition',
-                          canvasSource === 'candidate'
-                            ? 'bg-violet-600/30 text-violet-200'
-                            : 'text-ink-400 hover:text-ink-200',
-                        )}
-                        data-testid="canvas-source-candidate"
-                      >
-                        Candidate v{candidateVersion}
-                      </button>
-                    </div>
-                  )}
-                  {/* Run coloring banner: the canvas is showing a PAST run. */}
-                  {!isDraft && runDetail && canvasSource === 'live' && (
-                    <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border border-amber-500/30 bg-ink-950/90 backdrop-blur-sm shadow-lg text-xs text-amber-100">
-                      <span className="text-[10px] uppercase tracking-wide text-amber-400/80 font-medium">
-                        {runDetail.status === 'running' ? 'Live run' : 'Past run'}
-                      </span>
-                      <button
-                        onClick={() => {
-                          setRunDetail(null)
-                          if (defRef.current) {
-                            const { nodes: n, edges: e } = buildGraph(defRef.current)
-                            setNodes(n)
-                            setEdges(e)
-                          }
-                        }}
-                        title="Back to definition"
-                        className="p-0.5 rounded text-ink-500 hover:text-ink-200 transition"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  )}
-                  <ReactFlow
-                    nodes={nodes}
-                    edges={edges}
-                    onNodesChange={onNodesChange}
-                    onEdgesChange={onEdgesChange}
-                    onNodeClick={handleNodeClick}
-                    onPaneClick={handlePaneClick}
-                    nodeTypes={nodeTypes}
-                    fitView
-                    fitViewOptions={{ padding: 0.3 }}
-                    proOptions={{ hideAttribution: true }}
-                    className="bg-ink-950"
-                  >
-                    <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1e293b" />
-                    <Controls
-                      showInteractive={false}
-                      className="!bg-ink-900/80 !border-ink-700/50 !rounded-lg !shadow-lg [&>button]:!bg-ink-800 [&>button]:!border-ink-700/50 [&>button]:!text-ink-300 [&>button:hover]:!bg-ink-700"
-                    />
-                    {!runDetail && (
-                      <MiniMap
-                        className="!bg-ink-900/80 !border-ink-700/50 !rounded-lg"
-                        nodeColor="#334155"
-                        maskColor="rgba(0,0,0,0.6)"
-                      />
-                    )}
-                  </ReactFlow>
-                </>
-              ) : (
-                <div className="h-full flex flex-col items-center justify-center text-ink-500 gap-4">
-                  <Workflow className="w-16 h-16 text-ink-700" />
-                  <div className="text-center">
-                    <p className="text-sm font-medium text-ink-300">Empty playbook</p>
-                    <p className="text-xs text-ink-500 mt-1 max-w-xs">
-                      Ask {agentName} in chat to build this playbook — steps
-                      appear here as they are written.
-                    </p>
-                  </div>
-                </div>
-              )}
-            </>
+                ) : null
+              }
+            />
           )}
 
           {viewMode === 'code' && (
-            <div className="h-full p-4 overflow-auto">
-              {!isDraft && candidateVersion != null && candidateDef && (
-                <div className="flex items-center gap-1 mb-3">
-                  {(['live', 'candidate'] as const).map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => showSource(s)}
-                      className={cn(
-                        'px-2.5 py-1 rounded-md text-[11px] font-medium transition',
-                        canvasSource === s
-                          ? s === 'candidate' ? 'bg-violet-600/30 text-violet-200' : 'bg-luna-600/30 text-luna-200'
-                          : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
-                      )}
-                    >
-                      {s === 'live' ? `Live v${meta?.version}` : `Candidate v${candidateVersion}`}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <div data-testid="code-view">
-                <Code source={codeShown} />
-              </div>
-              <p className="text-[11px] text-ink-600 mt-2">
-                {agentName} writes this — ask in chat to change the playbook.
-              </p>
-            </div>
+            <CodeView
+              source={codeShown}
+              agentName={agentName}
+              header={
+                !isDraft && candidateVersion != null && candidateDef ? (
+                  <div className="flex items-center gap-1 mb-3">
+                    {(['live', 'candidate'] as const).map((src) => (
+                      <button
+                        key={src}
+                        onClick={() => showSource(src)}
+                        className={cn(
+                          'px-2.5 py-1 rounded-md text-[11px] font-medium transition',
+                          canvasSource === src
+                            ? src === 'candidate' ? 'bg-violet-600/30 text-violet-200' : 'bg-luna-600/30 text-luna-200'
+                            : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
+                        )}
+                      >
+                        {src === 'live' ? `Live v${meta?.version}` : `Candidate v${candidateVersion}`}
+                      </button>
+                    ))}
+                  </div>
+                ) : null
+              }
+            />
           )}
 
           {viewMode === 'manifest' && !isDraft && props.name && (
