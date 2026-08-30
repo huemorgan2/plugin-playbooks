@@ -292,32 +292,17 @@ export function VersionsTab({
       <div className="flex-1 min-w-0 flex flex-col">
         {detail && (
           <div
-            className="flex items-center gap-3 px-4 py-2.5 border-b border-white/5 shrink-0"
+            className="px-4 pt-2.5 pb-2 border-b border-white/5 shrink-0 space-y-2"
             data-testid="version-toolbar"
           >
+            {/* Row 1: version · date · (badge | promote) */}
+            <div className="flex items-center gap-3">
             <span className="text-lg font-bold text-ink-50 leading-none" data-testid="toolbar-version">
               v{detail.version}
             </span>
-            <span className="text-[11px] text-ink-500" title={timeAgo(detail.created_at)}>
+            <span className="text-[11px] text-ink-500 whitespace-nowrap" title={timeAgo(detail.created_at)}>
               {fmtAbsolute(detail.created_at)}
             </span>
-            <div className="flex items-center gap-1 bg-ink-900/60 rounded-lg p-0.5 ml-2">
-              {VIEWS.map(({ view: v, label, icon: Icon }) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  className={cn(
-                    'flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition',
-                    view === v
-                      ? 'bg-luna-600/30 text-luna-200'
-                      : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
-                  )}
-                  data-testid={`view-${v}`}
-                >
-                  <Icon className="w-3.5 h-3.5" /> {label}
-                </button>
-              ))}
-            </div>
             <div className="flex-1" />
             {isLive ? (
               <LiveBadge className="px-2.5 py-1 text-[11px]" />
@@ -337,6 +322,25 @@ export function VersionsTab({
                 Promote to live
               </button>
             )}
+            </div>
+            {/* Row 2: view tabs, left-aligned */}
+            <div className="flex items-center gap-1 bg-ink-900/60 rounded-lg p-0.5 w-fit">
+              {VIEWS.map(({ view: v, label, icon: Icon }) => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  className={cn(
+                    'flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition',
+                    view === v
+                      ? 'bg-luna-600/30 text-luna-200'
+                      : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
+                  )}
+                  data-testid={`view-${v}`}
+                >
+                  <Icon className="w-3.5 h-3.5" /> {label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
 
@@ -452,10 +456,10 @@ export function VersionsTab({
                     key={v.version}
                     onClick={() => selectVersion(v.version)}
                     className={cn(
-                      'w-full text-left rounded-lg px-3 py-2.5 border-l-2 transition',
+                      'w-full text-left rounded-lg px-3 py-2.5 transition',
                       active
-                        ? 'bg-luna-600/20 border-luna-400 text-luna-200'
-                        : 'border-transparent hover:bg-white/[.03] text-ink-300',
+                        ? 'bg-luna-600/20 text-luna-200'
+                        : 'hover:bg-white/[.03] text-ink-300',
                     )}
                     data-testid={`version-row-${v.version}`}
                     aria-current={active ? 'true' : undefined}
