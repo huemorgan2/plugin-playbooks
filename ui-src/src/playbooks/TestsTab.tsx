@@ -40,7 +40,9 @@ function Dot({ tone }: { tone: 'ok' | 'warn' | 'bad' }) {
   )
 }
 
-export function TestsTab({ name }: { name: string }) {
+// plans/016 phase 5: tests belong to a version — the tab shows and runs
+// ONE version's set (the Versions tab passes the selected version).
+export function TestsTab({ name, version }: { name: string; version?: number }) {
   const agentName = useAgentName()
   const [specs, setSpecs] = useState<SpecEntry[] | null>(null)
   const [probes, setProbes] = useState<ProbeEntry[] | null>(null)
@@ -49,9 +51,9 @@ export function TestsTab({ name }: { name: string }) {
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(() => {
-    playbooksApi.getSpecs(name).then((r) => setSpecs(r.specs)).catch(() => setSpecs([]))
+    playbooksApi.getSpecs(name, version).then((r) => setSpecs(r.specs)).catch(() => setSpecs([]))
     playbooksApi.getProbes(name).then((r) => setProbes(r.probes)).catch(() => setProbes([]))
-  }, [name])
+  }, [name, version])
 
   useEffect(() => { refresh() }, [refresh])
 
@@ -60,7 +62,7 @@ export function TestsTab({ name }: { name: string }) {
     setRunningSpecs(true)
     setError(null)
     try {
-      await playbooksApi.runSpecs(name)
+      await playbooksApi.runSpecs(name, version)
       refresh()
     } catch (e: any) {
       setError(e.message)
@@ -109,7 +111,9 @@ export function TestsTab({ name }: { name: string }) {
         {/* TESTS */}
         <section>
           <div className="flex items-center justify-between">
-            <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500">Tests</div>
+            <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500" data-testid="tests-header">
+              {version != null ? `Tests of v${version}` : 'Tests'}
+            </div>
             <button
               onClick={runAllSpecs}
               disabled={runningSpecs || specs.length === 0}

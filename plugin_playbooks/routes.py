@@ -32,8 +32,9 @@ from .models import (
     PlaybookVersion,
 )
 from .probes import run_preflight
-from .publish import announce_publish, test_run_gate
+from .publish import announce_publish, test_run_gate, specs_gate
 from .specs import run_all_specs
+from .versioning import ensure_live_row, mint_version
 from .validation import validate_definition
 
 # 009.001/phase03: every endpoint requires an authenticated user (router-level
@@ -375,20 +376,7 @@ async def _get_version_row(
 
 async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
     """Guarantee a version row exists for the current live content."""
-    n = _live_version_of(p)
-    row = await _get_version_row(session, p, n)
-    if row is None:
-        row = PlaybookVersion(
-            playbook_id=p.id,
-            version=n,
-            definition=p.definition,
-            code=p.code,
-            manifest=p.manifest,
-            author="system",
-            message="live content (recorded on first candidate/promote)",
-        )
-        session.add(row)
-    return row
+    return await ensure_live_row(session, p)
 
 
 def _shim_for(p: Playbook, row: PlaybookVersion) -> Playbook:
@@ -524,32 +512,37 @@ async def _trust_summaries(session, playbook_ids):
     }
     if not playbook_ids:
         return trust
-    spec_rows = (await session.execute(
+    # plans/016 phase 5: specs are per version — the badge reflects the set
+    # the agent is working on (candidate, else live). Counted in Python:
+    # spec counts are tiny and the JSON last_result needs it anyway.
+    target_by_pb = {
+        str(pid): (cand or live or ver)
+        for pid, live, cand, ver in (await session.execute(
+            select(
+                Playbook.id, Playbook.live_version,
+                Playbook.candidate_version, Playbook.version,
+            ).where(Playbook.id.in_(playbook_ids))
+        )).all()
+    }
+    spec_results = (await session.execute(
         select(
-            PlaybookSpec.playbook_id,
-            func.count(PlaybookSpec.id),
-            func.max(PlaybookSpec.last_run_at),
+            PlaybookSpec.playbook_id, PlaybookSpec.playbook_version,
+            PlaybookSpec.last_result, PlaybookSpec.last_run_at,
         )
         .where(PlaybookSpec.playbook_id.in_(playbook_ids))
-        .group_by(PlaybookSpec.playbook_id)
     )).all()
-    # pass/fail needs the JSON last_result — fetch the failing count separately
-    # per DB-portable path: pull (playbook_id, last_result) and count in Python
-    # (spec counts are tiny).
-    spec_results = (await session.execute(
-        select(PlaybookSpec.playbook_id, PlaybookSpec.last_result)
-        .where(PlaybookSpec.playbook_id.in_(playbook_ids))
-    )).all()
-    failed_by_pb: dict[str, int] = {}
-    for pid, last in spec_results:
+    for pid, ver, last, last_run in spec_results:
+        key = str(pid)
+        if ver != target_by_pb.get(key):
+            continue
+        entry = trust[key]["specs"]
+        entry["total"] += 1
         if isinstance(last, dict) and last.get("passed") is False:
-            failed_by_pb[str(pid)] = failed_by_pb.get(str(pid), 0) + 1
-    for pid, total, last_run in spec_rows:
-        trust[str(pid)]["specs"] = {
-            "total": total,
-            "failed": failed_by_pb.get(str(pid), 0),
-            "last_run_at": last_run.isoformat() if last_run else None,
-        }
+            entry["failed"] += 1
+        if last_run and (
+            entry["last_run_at"] is None or last_run.isoformat() > entry["last_run_at"]
+        ):
+            entry["last_run_at"] = last_run.isoformat()
     probe_rows = (await session.execute(
         select(
             PlaybookProbeResult.playbook_id,
@@ -735,16 +728,13 @@ async def update_playbook(name: str, body: PlaybookUpdate):
             p.code = generate_code(pb_def)
         except Exception:  # noqa: BLE001
             p.code = None
-        p.version += 1
-        session.add(PlaybookVersion(
-            playbook_id=p.id,
-            version=p.version,
-            definition=p.definition,
-            code=p.code,
-            manifest=p.manifest,
-            author="owner",
-            message=body.message or "REST update",
-        ))
+        # plans/016 phase 5: mint_version inherits live's specs.
+        await mint_version(
+            session, p,
+            definition=p.definition, code=p.code, manifest=p.manifest,
+            author="owner", message=body.message or "REST update",
+            source_version=_live_version_of(p),
+        )
         p.live_version = p.version
         p.description = pb_def.description or p.description
         p.when_to_use = pb_def.when_to_use or p.when_to_use
@@ -960,6 +950,20 @@ async def list_versions(name: str):
         for ver_num, cnt in rows:
             run_counts[ver_num] = cnt
 
+        # plans/016 phase 5: per-version spec cache → "N tests · N green".
+        spec_counts: dict[int, dict[str, int]] = {}
+        for ver_num, last in (await session.execute(
+            select(PlaybookSpec.playbook_version, PlaybookSpec.last_result)
+            .where(PlaybookSpec.playbook_id == p.id)
+        )).all():
+            c = spec_counts.setdefault(ver_num, {"total": 0, "failed": 0, "green": 0})
+            c["total"] += 1
+            if isinstance(last, dict):
+                if last.get("passed") is False:
+                    c["failed"] += 1
+                elif last.get("passed") is True:
+                    c["green"] += 1
+
         # 0.10.0: rows are the history; live/candidate are pointers into it.
         # Legacy playbooks may lack a row for the current live version — the
         # synthesized entry covers that gap only (no duplicates).
@@ -976,6 +980,7 @@ async def list_versions(name: str):
                 "current": True,
                 "live": True,
                 "candidate": False,
+                "specs": spec_counts.get(live_n, {"total": 0, "failed": 0, "green": 0}),
             })
 
         for v in versions:
@@ -989,6 +994,7 @@ async def list_versions(name: str):
                 "current": v.version == live_n,
                 "live": v.version == live_n,
                 "candidate": v.version == p.candidate_version,
+                "specs": spec_counts.get(v.version, {"total": 0, "failed": 0, "green": 0}),
             })
 
         result.sort(key=lambda r: r["version"], reverse=True)
@@ -1045,6 +1051,16 @@ async def get_version(name: str, n: int):
             "candidate": row.version == p.candidate_version,
             "runs": runs,
         }
+
+
+async def _specs_gate_or_422(session: AsyncSession, p: Playbook, row: PlaybookVersion) -> None:
+    """Run the specs of `row.version` against its content; 422 on red."""
+    _gate, refusal = await specs_gate(
+        session, _runner, p.id, _shim_for(p, row), row.version,
+    )
+    if refusal is not None:
+        await session.commit()  # persist last_result on spec rows
+        raise HTTPException(422, refusal)
 
 
 class PromoteBody(BaseModel):
@@ -1110,18 +1126,7 @@ async def promote_version(name: str, body: PromoteBody):
                 })
             # 0.11.0: specs gate — every stored spec must pass against the
             # candidate (same gate as the playbook_publish tool).
-            spec_summary = await run_all_specs(
-                session, _runner, p.id, _shim_for(p, row), row.version,
-            )
-            if spec_summary["failed"]:
-                await session.commit()  # persist last_result on spec rows
-                raise HTTPException(422, {
-                    "message": "Promote refused — gate 'specs' failed",
-                    "gate": "specs",
-                    "failing_specs": [
-                        r for r in spec_summary["results"] if not r["passed"]
-                    ],
-                })
+            await _specs_gate_or_422(session, p, row)
             # 0.12.0: probes gate — no tool the candidate touches may be
             # KNOWN-broken (unprobeable tools pass; see probes.py).
             probe_summary = await run_preflight(
@@ -1152,6 +1157,11 @@ async def promote_version(name: str, body: PromoteBody):
             SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
             if ev_run is not None else None
         )
+
+        if not candidate:
+            # plans/016 phase 5: a restore runs the RESTORED version's own
+            # specs against its content (specs travel with versions).
+            await _specs_gate_or_422(session, p, row)
 
         old_live = _live_version_of(p)
         await _ensure_live_row(session, p)
@@ -1208,6 +1218,8 @@ async def rollback_playbook(name: str):
 
         # 0.26.0 (plans/015, 089 contract #8): rollback IS a publish of a
         # previous version — same test-run gate, live history counts.
+        # plans/016 phase 5: and the target version's own specs.
+        await _specs_gate_or_422(session, p, row)
         _gate, refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at, include_live=True,
         )
@@ -1239,22 +1251,31 @@ async def rollback_playbook(name: str):
 
 # --- Specs (0.11.0, plans/002 phase 4) ---
 
+def _default_spec_version(p: Playbook) -> int:
+    """The set the Tests tab shows when no version is asked for: the
+    candidate when one exists (what the agent is working on), else live."""
+    return p.candidate_version or _live_version_of(p)
+
+
 @router.get("/playbooks/{name}/specs")
-async def list_specs(name: str):
-    """The playbook's tests + last results — feeds the phase-6 Tests tab."""
+async def list_specs(name: str, version: int | None = None):
+    """The tests OF one version + last results — the Versions tab's Tests
+    view (`?version=N`; default candidate-else-live)."""
     async with _sf()() as session:
         p = (await session.execute(
             select(Playbook).where(Playbook.name == name)
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
+        n = version if version is not None else _default_spec_version(p)
         rows = (await session.execute(
             select(PlaybookSpec)
-            .where(PlaybookSpec.playbook_id == p.id)
+            .where(PlaybookSpec.playbook_id == p.id, PlaybookSpec.playbook_version == n)
             .order_by(PlaybookSpec.name)
         )).scalars().all()
         return {
             "name": name,
+            "version": n,
             "specs": [
                 {
                     "name": r.name,
@@ -1271,22 +1292,23 @@ async def list_specs(name: str):
 
 
 @router.post("/playbooks/{name}/specs/run")
-async def run_specs_route(name: str):
-    """Run all specs against the candidate (or live when none) — the Tests
-    tab's run-all button."""
+async def run_specs_route(name: str, version: int | None = None):
+    """Run one version's specs against that version's content — the Tests
+    view's run-all button (`?version=N`; default candidate-else-live)."""
     async with _sf()() as session:
         p = (await session.execute(
             select(Playbook).where(Playbook.name == name)
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
-        if p.candidate_version:
-            row = await _get_version_row(session, p, p.candidate_version)
-            if not row:
-                raise HTTPException(409, "Candidate version row is missing")
-            target, version_n = _shim_for(p, row), row.version
+        version_n = version if version is not None else _default_spec_version(p)
+        if version_n == _live_version_of(p):
+            target = p
         else:
-            target, version_n = p, _live_version_of(p)
+            row = await _get_version_row(session, p, version_n)
+            if not row:
+                raise HTTPException(404, f"No stored content for version {version_n}")
+            target = _shim_for(p, row)
         summary = await run_all_specs(
             session, _runner, p.id, target, version_n,
         )
@@ -1381,17 +1403,14 @@ async def put_manifest(name: str, body: ManifestBody):
         # new live version row (never snapshot at the counter: a pending
         # candidate may own that number).
         await _ensure_live_row(session, p)
+        old_live = _live_version_of(p)
         p.manifest = body.manifest
-        p.version += 1
-        session.add(PlaybookVersion(
-            playbook_id=p.id,
-            version=p.version,
-            definition=p.definition,
-            code=p.code,
-            manifest=p.manifest,
-            author="owner",
-            message="manifest updated",
-        ))
+        await mint_version(
+            session, p,
+            definition=p.definition, code=p.code, manifest=p.manifest,
+            author="owner", message="manifest updated",
+            source_version=old_live,
+        )
         p.live_version = p.version
         await session.commit()
         version = p.version

@@ -29,6 +29,15 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "publish_autonomy", "VARCHAR(16) NOT NULL DEFAULT 'ask'"),
     ("playbook_runs", "report_to", "UUID"),
     ("playbook_runs", "is_test", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # 0.28.0 (plans/016 phase 5): specs belong to a version
+    ("playbook_specs", "playbook_version", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+# Indexes whose definition changed — dropped on load so the model's current
+# index (a different name) can be created next to them without conflicts.
+_LEGACY_INDEXES: list[tuple[str, str]] = [
+    # (table, index name)
+    ("playbook_specs", "ix_playbook_specs_playbook_name"),   # 0.28.0: now (pb, version, name)
 ]
 
 
@@ -51,6 +60,63 @@ async def _ensure_columns(engine) -> None:
         for table, col, ddl in await conn.run_sync(_missing):
             await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
             logger.info("playbooks: added %s column to %s", col, table)
+
+
+async def _drop_legacy_indexes(engine) -> None:
+    """Drop indexes the model no longer declares (see _LEGACY_INDEXES)."""
+    from sqlalchemy import inspect, text
+
+    def _present(sync_conn):
+        insp = inspect(sync_conn)
+        return [
+            (t, name) for t, name in _LEGACY_INDEXES
+            if any(ix["name"] == name for ix in insp.get_indexes(t))
+        ]
+
+    async with engine.begin() as conn:
+        for table, name in await conn.run_sync(_present):
+            await conn.execute(text(f"DROP INDEX {name}"))
+            logger.info("playbooks: dropped legacy index %s on %s", name, table)
+
+
+async def backfill_spec_versions(session_factory) -> int:
+    """0.28.0 (plans/016 phase 5): pin pre-versioned specs (playbook_version
+    0) to the playbook's live version, and give the candidate — if one
+    exists — its own copy. Idempotent. Returns the number of rows touched."""
+    from sqlalchemy import select
+
+    from .models import Playbook, PlaybookSpec
+    from .versioning import copy_specs, live_version_of
+
+    touched = 0
+    async with session_factory() as session:
+        rows = (await session.execute(
+            select(PlaybookSpec).where(PlaybookSpec.playbook_version == 0)
+        )).scalars().all()
+        if not rows:
+            return 0
+        pids = {r.playbook_id for r in rows}
+        playbooks = {
+            p.id: p for p in (await session.execute(
+                select(Playbook).where(Playbook.id.in_(pids))
+            )).scalars().all()
+        }
+        for r in rows:
+            p = playbooks.get(r.playbook_id)
+            if p is None:
+                continue
+            r.playbook_version = live_version_of(p)
+            touched += 1
+        await session.flush()
+        for p in playbooks.values():
+            if p.candidate_version:
+                touched += await copy_specs(
+                    session, p.id, live_version_of(p), p.candidate_version,
+                )
+        await session.commit()
+    if touched:
+        logger.info("playbooks: versioned %d spec row(s)", touched)
+    return touched
 
 
 async def backfill_code(session_factory) -> int:
@@ -628,6 +694,10 @@ class PlaybooksPlugin(LunaPlugin):
             await _ensure_columns(ctx.engine)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: column migration failed: %s", e)
+        try:
+            await _drop_legacy_indexes(ctx.engine)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: legacy index drop failed: %s", e)
 
         # plans/001: `table.create(checkfirst=True)` skips the whole table when
         # it already exists, indexes included — so installs that predate an
@@ -672,6 +742,12 @@ class PlaybooksPlugin(LunaPlugin):
             await backfill_live_version(ctx.db_session_factory)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: live_version backfill failed: %s", e)
+
+        # 0.28.0 (plans/016 phase 5): specs belong to a version.
+        try:
+            await backfill_spec_versions(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: spec version backfill failed: %s", e)
 
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,

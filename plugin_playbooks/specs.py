@@ -287,7 +287,11 @@ async def run_all_specs(
     from .models import PlaybookSpec
     from datetime import datetime, timezone
 
-    q = select(PlaybookSpec).where(PlaybookSpec.playbook_id == playbook_id)
+    # plans/016 phase 5: only the specs OF the version being run.
+    q = select(PlaybookSpec).where(
+        PlaybookSpec.playbook_id == playbook_id,
+        PlaybookSpec.playbook_version == version_n,
+    )
     if only_name:
         q = q.where(PlaybookSpec.name == only_name)
     rows = (await session.execute(q.order_by(PlaybookSpec.name))).scalars().all()

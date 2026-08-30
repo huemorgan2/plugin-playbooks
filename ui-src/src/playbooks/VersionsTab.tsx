@@ -32,6 +32,8 @@ export type VersionEntry = {
   promoted_from: number | null
   live: boolean
   candidate: boolean
+  /** plans/016 phase 5: that version's spec cache. */
+  specs: { total: number; failed: number; green: number }
 }
 
 export type VersionView = 'canvas' | 'code' | 'manifest' | 'tests' | 'runs'
@@ -148,6 +150,7 @@ export function VersionsTab({
           runs: r.runs,
           promoted_from: r.promoted_from,
           live: !!(r.live ?? r.current),
+          specs: r.specs ?? { total: 0, failed: 0, green: 0 },
           candidate: !!r.candidate,
         }))
         setVersions(list)
@@ -273,6 +276,9 @@ export function VersionsTab({
 
   const def = patchedDef ?? detail?.definition ?? null
   const isLive = !!detail?.live
+  // Known-red specs of the selected version (from the list's cache) block
+  // Promote up front — the server gate would refuse anyway.
+  const redSpecs = versions?.find((v) => v.version === selected)?.specs.failed ?? 0
 
   return (
     <div className="h-full flex min-h-0">
@@ -312,11 +318,13 @@ export function VersionsTab({
             ) : (
               <button
                 onClick={handlePromote}
-                disabled={promoting}
+                disabled={promoting || redSpecs > 0}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium transition whitespace-nowrap"
-                title={detail.candidate
-                  ? 'Run the gates (tests, tool checks) and make this candidate live'
-                  : 'Make this version live again'}
+                title={redSpecs > 0
+                  ? `${redSpecs} of this version's tests ${redSpecs === 1 ? 'is' : 'are'} red — fix or re-run them first (Tests view)`
+                  : detail.candidate
+                    ? 'Run the gates (tests, tool checks) and make this candidate live'
+                    : 'Make this version live again'}
                 data-testid="promote-btn"
               >
                 {promoting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
@@ -384,7 +392,7 @@ export function VersionsTab({
                 </div>
               )
             ) : view === 'tests' ? (
-              <TestsTab name={name} />
+              <TestsTab name={name} version={detail.version} />
             ) : (
               <RunsTab
                 name={name}
@@ -466,6 +474,22 @@ export function VersionsTab({
                       <span>·</span>
                       <span>{v.runs} {v.runs === 1 ? 'run' : 'runs'}</span>
                     </div>
+                    {v.specs.total > 0 && (
+                      <div
+                        className={cn(
+                          'text-[11px] mt-1',
+                          v.specs.failed > 0 ? 'text-rose-400' : v.specs.green === v.specs.total ? 'text-emerald-400' : 'text-ink-500',
+                        )}
+                        data-testid={`version-specs-${v.version}`}
+                      >
+                        {v.specs.total} {v.specs.total === 1 ? 'test' : 'tests'} ·{' '}
+                        {v.specs.failed > 0
+                          ? `${v.specs.failed} red`
+                          : v.specs.green === v.specs.total
+                            ? `${v.specs.green} green`
+                            : `${v.specs.green} green, ${v.specs.total - v.specs.green} not run`}
+                      </div>
+                    )}
                     {v.promoted_from != null && (
                       <p className="text-[10px] text-ink-600 mt-1">← promoted from v{v.promoted_from}</p>
                     )}

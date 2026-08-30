@@ -260,3 +260,48 @@ async def announce_publish(
         )
     except Exception:  # noqa: BLE001
         log.exception("publish announce failed name=%s", name)
+
+
+async def specs_gate(
+    session: AsyncSession,
+    runner: Any,
+    playbook_id: Any,
+    target: Any,
+    version_n: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """plans/016 phase 5: the specs gate, evaluated on the specs OF the
+    version going live (`playbook_specs.playbook_version == version_n`)
+    against that version's content — candidates AND restores/rollbacks
+    (supersedes plans/015 deviation #4). Returns (gate_entry, refusal_dict);
+    the refusal is None when every spec passed or the version has none.
+    Spec result caches are updated on the rows — the caller commits."""
+    from .specs import run_all_specs
+
+    summary = await run_all_specs(session, runner, playbook_id, target, version_n)
+    gate = {
+        "gate": "specs",
+        "ok": summary["failed"] == 0,
+        "note": (
+            "no specs defined" if summary["total"] == 0
+            else f"{summary['passed']}/{summary['total']} passed"
+        ),
+    }
+    if not summary["failed"]:
+        return gate, None
+    failing = [r for r in summary["results"] if not r["passed"]]
+    return gate, {
+        "error": (
+            f"Publish refused — gate 'specs' failed ({len(failing)} of "
+            f"{summary['total']} red on version {version_n})."
+        ),
+        "message": (
+            f"Promote refused — gate 'specs' failed ({len(failing)} of "
+            f"{summary['total']} red on v{version_n})."
+        ),
+        "gate": "specs",
+        "failing_specs": failing,
+        "hint": (
+            "Fix the candidate via playbook_edit, or update the spec if the "
+            "expectation itself changed (playbook_spec_add upserts by name)."
+        ),
+    }

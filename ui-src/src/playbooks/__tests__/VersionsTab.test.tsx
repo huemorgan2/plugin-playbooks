@@ -41,7 +41,10 @@ const def: PlaybookDef = {
   steps: [{ id: 'a', kind: 'tool_call', tool: 'send_chat_message', args: { message: 'hi' } }],
 }
 
-function entry(version: number, extra: Partial<{ current: boolean; candidate: boolean }> = {}) {
+function entry(
+  version: number,
+  extra: Partial<{ current: boolean; candidate: boolean; specs: { total: number; failed: number; green: number } }> = {},
+) {
   return {
     version, title: `v${version} edit`, author: 'agent',
     created_at: '2026-08-30T10:00:00Z', runs: version, promoted_from: null,
@@ -57,10 +60,11 @@ function detailOf(version: number, live: boolean, candidate = false): VersionDet
   }
 }
 
-function setup({ candidate = false }: { candidate?: boolean } = {}) {
+function setup({ candidate = false, redV1 = false }: { candidate?: boolean; redV1?: boolean } = {}) {
   api.listVersions.mockResolvedValue([
     ...(candidate ? [entry(3, { candidate: true })] : []),
-    entry(2, { current: true }), entry(1),
+    entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
+    entry(1, redV1 ? { specs: { total: 2, failed: 1, green: 1 } } : {}),
   ])
   api.getVersion.mockImplementation((_n: string, v: number) =>
     Promise.resolve(detailOf(v, v === 2, candidate && v === 3)),
@@ -153,6 +157,19 @@ describe('VersionsTab', () => {
     expect(await screen.findByTestId('tests-tab')).toBeTruthy()
     fireEvent.click(screen.getByTestId('view-runs'))
     expect(await screen.findByTestId('runs-tab')).toBeTruthy()
+  })
+})
+
+describe('VersionsTab — per-version tests (phase 5)', () => {
+  it('rows show that version\'s test counts and a red version cannot be promoted', async () => {
+    setup({ redV1: true })
+    await screen.findByTestId('version-toolbar')
+    expect(screen.getByTestId('version-specs-2').textContent).toBe('2 tests · 2 green')
+    expect(screen.getByTestId('version-specs-1').textContent).toBe('2 tests · 1 red')
+    fireEvent.click(screen.getByTestId('version-row-1'))
+    const btn = await screen.findByTestId('promote-btn')
+    expect((btn as HTMLButtonElement).disabled).toBe(true)
+    expect(btn.getAttribute('title')).toContain('red')
   })
 })
 

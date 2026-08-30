@@ -200,13 +200,22 @@ class PlaybookSpec(Base):
     """
     __tablename__ = "playbook_specs"
 
+    # plans/016 phase 5: specs belong to a VERSION (duplicated on mint), so
+    # the key is (playbook, version, name). 0 = pre-phase-5 row awaiting the
+    # load-time backfill (`backfill_spec_versions`).
     __table_args__ = (
-        Index("ix_playbook_specs_playbook_name", "playbook_id", "name", unique=True),
+        Index(
+            "ix_playbook_specs_playbook_version_name",
+            "playbook_id", "playbook_version", "name", unique=True,
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
     playbook_id: Mapped[uuid.UUID] = mapped_column(
         UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    playbook_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     spec: Mapped[dict] = mapped_column(JSONB, nullable=False)

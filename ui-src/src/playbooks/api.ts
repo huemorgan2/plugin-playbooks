@@ -113,6 +113,9 @@ export const playbooksApi = {
       runs: number
       promoted_from: number | null
       current: boolean
+      live?: boolean
+      candidate?: boolean
+      specs?: { total: number; failed: number; green: number }
     }[]>(`${BASE}/playbooks/${name}/versions`),
 
   getVersion: (name: string, n: number) =>
@@ -139,10 +142,14 @@ export const playbooksApi = {
     ),
 
   // Specs + probes (phase 6 Tests tab)
-  getSpecs: (name: string) =>
-    apiFetch<{ name: string; specs: SpecEntry[] }>(`${BASE}/playbooks/${name}/specs`),
+  // plans/016 phase 5: specs belong to a version (`?version=N`; the server
+  // defaults to candidate-else-live when omitted).
+  getSpecs: (name: string, version?: number) =>
+    apiFetch<{ name: string; version: number; specs: SpecEntry[] }>(
+      `${BASE}/playbooks/${name}/specs${version != null ? `?version=${version}` : ''}`,
+    ),
 
-  runSpecs: (name: string) =>
+  runSpecs: (name: string, version?: number) =>
     apiFetch<{
       name: string
       ran_against_version: number
@@ -150,7 +157,10 @@ export const playbooksApi = {
       passed: number
       failed: number
       results: { spec: string; passed: boolean; failures: string[]; checked: number }[]
-    }>(`${BASE}/playbooks/${name}/specs/run`, { method: 'POST' }),
+    }>(
+      `${BASE}/playbooks/${name}/specs/run${version != null ? `?version=${version}` : ''}`,
+      { method: 'POST' },
+    ),
 
   getProbes: (name: string) =>
     apiFetch<{ name: string; probes: ProbeEntry[] }>(`${BASE}/playbooks/${name}/probes`),
