@@ -152,6 +152,7 @@ export interface PlaybookRunSummary {
   id: string
   status: RunStatus
   trigger: string
+  playbook_version?: number
   started_at: string | null
   completed_at: string | null
 }

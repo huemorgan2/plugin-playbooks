@@ -882,6 +882,7 @@ async def list_runs(name: str, version: int | None = None):
             "id": str(r.id),
             "status": r.status,
             "trigger": r.trigger,
+            "playbook_version": r.playbook_version,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "completed_at": r.completed_at.isoformat() if r.completed_at else None,
         } for r in runs]
@@ -904,6 +905,7 @@ async def get_run(run_id: str):
             "id": str(run.id),
             "status": run.status,
             "trigger": run.trigger,
+            "playbook_version": run.playbook_version,
             "inputs": run.inputs,
             "steps": [{
                 "step_id": s.step_id,

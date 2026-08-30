@@ -118,3 +118,15 @@ async def test_runs_filtered_by_version(client):
     assert len((await c.get(f"{BASE}/playbooks/greeter/runs?version=1")).json()) == 2
     assert len((await c.get(f"{BASE}/playbooks/greeter/runs?version=2")).json()) == 1
     assert (await c.get(f"{BASE}/playbooks/greeter/runs?version=9")).json() == []
+
+
+@pytest.mark.asyncio
+async def test_runs_carry_their_version(client):
+    """plans/016 phase 4: the Versions tab selects a run's version before
+    overlaying it, so summaries and detail both say which version ran."""
+    sf, c = client
+    await _seed(sf, rows=True)
+    runs = (await c.get(f"{BASE}/playbooks/greeter/runs")).json()
+    assert sorted(r["playbook_version"] for r in runs) == [1, 1, 2]
+    detail = (await c.get(f"{BASE}/playbooks/runs/{runs[0]['id']}")).json()
+    assert detail["playbook_version"] == runs[0]["playbook_version"]

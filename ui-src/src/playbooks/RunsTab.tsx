@@ -86,9 +86,12 @@ function triggerLabel(trigger: string): string {
 
 export function RunsTab({
   name,
+  version,
   onShowOnCanvas,
 }: {
   name: string
+  /** plans/016: runs of one version only (the Versions tab's Runs view). */
+  version?: number
   onShowOnCanvas: (runId: string) => void
 }) {
   const [runs, setRuns] = useState<PlaybookRunSummary[]>([])
@@ -100,20 +103,20 @@ export function RunsTab({
   useEffect(() => {
     setLoading(true)
     playbooksApi
-      .listRuns(name)
+      .listRuns(name, version)
       .then(setRuns)
       .catch(() => {})
       .finally(() => setLoading(false))
-  }, [name])
+  }, [name, version])
 
   // live: a run started or finished anywhere (chat, trigger, cron) — refetch
   // so the tab isn't frozen at its mount-time snapshot
   useEffect(() => {
     return subscribePlaybookEvents((evt) => {
       if (evt.event !== 'playbook.run.started' && evt.event !== 'playbook.run.completed') return
-      playbooksApi.listRuns(name).then(setRuns).catch(() => {})
+      playbooksApi.listRuns(name, version).then(setRuns).catch(() => {})
     })
-  }, [name])
+  }, [name, version])
 
   if (loading) {
     return (
@@ -127,8 +130,10 @@ export function RunsTab({
     return (
       <div className="flex flex-col items-center justify-center h-full text-ink-500 gap-2 px-4 text-center">
         <Play className="w-8 h-8 text-ink-600" />
-        <p className="text-sm">No runs yet</p>
-        <p className="text-[11px] text-ink-600">Run this playbook and its results show up here.</p>
+        <p className="text-sm">{version != null ? `No runs of v${version} yet` : 'No runs yet'}</p>
+        <p className="text-[11px] text-ink-600">
+          {version != null ? 'Run this version and its results show up here.' : 'Run this playbook and its results show up here.'}
+        </p>
       </div>
     )
   }

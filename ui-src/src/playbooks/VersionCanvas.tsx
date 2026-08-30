@@ -180,6 +180,7 @@ export function VersionCanvas({
   onClearRun,
   onSelectStep,
   overlay,
+  glow,
 }: {
   def: PlaybookDef | null
   name: string
@@ -188,6 +189,8 @@ export function VersionCanvas({
   onClearRun?: () => void
   onSelectStep?: (step: StepDef | null) => void
   overlay?: ReactNode
+  /** node id → glow sequence (live agent edits pop the touched node). */
+  glow?: Map<string, number>
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
@@ -199,9 +202,14 @@ export function VersionCanvas({
       return
     }
     const { nodes: n, edges: e } = buildGraph(def, runDetail?.steps)
-    setNodes(n)
+    setNodes(glow?.size
+      ? n.map((node) => {
+          const seq = glow.get(node.id)
+          return seq ? { ...node, data: { ...node.data, glowSeq: seq } } : node
+        })
+      : n)
     setEdges(e)
-  }, [def, runDetail, setNodes, setEdges])
+  }, [def, runDetail, glow, setNodes, setEdges])
 
   const handleNodeClick: NodeMouseHandler = useCallback((_e, node) => {
     const data = node.data as any
