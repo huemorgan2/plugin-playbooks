@@ -16,7 +16,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from luna_sdk import get_current_user
@@ -860,6 +860,29 @@ async def archive_playbook(name: str):
         await session.commit()
     await _notify_changed(name)
     return {"name": name, "status": "archived"}
+
+
+@router.delete("/playbooks/{name}/purge")
+async def purge_playbook(name: str):
+    """plans/017: hard-delete an ARCHIVED playbook and its version rows —
+    two explicit steps to destroy history (archive first, then purge)."""
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404)
+        if p.status != "archived":
+            raise HTTPException(
+                409, f"Playbook '{name}' is not archived — archive it first, then purge"
+            )
+        await session.execute(
+            delete(PlaybookVersion).where(PlaybookVersion.playbook_id == p.id)
+        )
+        await session.delete(p)
+        await session.commit()
+    await _notify_changed(name)
+    return {"name": name, "status": "purged"}
 
 
 @router.post("/playbooks/{name}/runs")

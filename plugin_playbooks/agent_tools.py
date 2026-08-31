@@ -208,7 +208,7 @@ def build_tools(
             existing = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
             )).scalar_one_or_none()
-            if existing:
+            if existing and existing.status != "archived":
                 return json.dumps({"error": f"Playbook '{name}' already exists"})
             all_pb = await _load_all_playbook_steps(session, exclude=name)
 
@@ -228,21 +228,42 @@ def build_tools(
                 })
             warnings = [i.to_dict() for i in issues if i.severity == "warning"]
 
-            playbook = Playbook(
-                name=name,
-                display_name=display_name or pb_def.display_name or name,
-                description=description or pb_def.description,
-                when_to_use=when_to_use or pb_def.when_to_use,
-                inputs_schema=pb_def.inputs,
-                definition=defn,
-                code=stored_code,
-                manifest=manifest,
-                live_version=1,  # a brand-new playbook goes live directly
-                agent_autonomy=agent_autonomy,
-                created_by="agent",
-                status="enabled",
-            )
-            session.add(playbook)
+            if existing:
+                # plans/017: an archived playbook no longer squats its name —
+                # the proposal takes over its row (id kept so run history
+                # survives; the version counter keeps climbing so old runs
+                # stay attributed to their versions).
+                playbook = existing
+                playbook.version = (existing.version or 1) + 1
+                playbook.live_version = playbook.version
+                playbook.candidate_version = None
+                playbook.failures_acked_version = None
+                playbook.display_name = display_name or pb_def.display_name or name
+                playbook.description = description or pb_def.description
+                playbook.when_to_use = when_to_use or pb_def.when_to_use
+                playbook.inputs_schema = pb_def.inputs
+                playbook.definition = defn
+                playbook.code = stored_code
+                playbook.manifest = manifest
+                playbook.agent_autonomy = agent_autonomy
+                playbook.created_by = "agent"
+                playbook.status = "enabled"
+            else:
+                playbook = Playbook(
+                    name=name,
+                    display_name=display_name or pb_def.display_name or name,
+                    description=description or pb_def.description,
+                    when_to_use=when_to_use or pb_def.when_to_use,
+                    inputs_schema=pb_def.inputs,
+                    definition=defn,
+                    code=stored_code,
+                    manifest=manifest,
+                    live_version=1,  # a brand-new playbook goes live directly
+                    agent_autonomy=agent_autonomy,
+                    created_by="agent",
+                    status="enabled",
+                )
+                session.add(playbook)
             await session.commit()
             await session.refresh(playbook)
 
