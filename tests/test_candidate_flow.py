@@ -14,6 +14,7 @@ import uuid
 import pytest
 
 from readstage import parse_read_stage
+from evidence import EXPLANATION
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -246,7 +247,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
     await _save_candidate(tools)
     await _green_run(sf, 2)
     bus.events.clear()
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "published"
     assert out["live_version"] == 2
     assert out["previous_live_version"] == 1
@@ -267,7 +268,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
 async def test_promote_without_candidate_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert "no candidate" in out["error"]
 
 
@@ -288,7 +289,7 @@ async def test_promote_gate_names_static_validation_failure(env):
         }]
         row.definition = bad
         await s.commit()
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert "static_validation" in out["error"]
     assert out["gate"] == "static_validation"
     assert out["issues"]
@@ -305,7 +306,7 @@ async def test_promote_keeps_live_manifest(env):
     )
     await _save_candidate(tools)
     await _green_run(sf, 2)
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "published"
     pb = await _get(sf)
     assert pb.manifest == "## Purpose\nGreets.\n"
@@ -319,11 +320,11 @@ async def test_rollback_restores_previous_live(env):
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
     await _green_run(sf, 2)
-    await tools["playbook_publish"](name="greeter")
+    await tools["playbook_publish"](explanation=EXPLANATION, name="greeter")
     # rollback publishes v1 through the same gate — its live history is
     # the evidence.
     await _green_run(sf, 1, is_test=False)
-    out = json.loads(await tools["playbook_rollback"](name="greeter"))
+    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "rolled_back"
     assert out["live_version"] == 1
     assert out["previous_live_version"] == 2
@@ -338,7 +339,7 @@ async def test_rollback_restores_previous_live(env):
 async def test_rollback_without_history_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_rollback"](name="greeter"))
+    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter"))
     assert "no previous version" in out["error"]
 
 
@@ -405,7 +406,13 @@ async def test_manifest_set_with_pending_candidate_keeps_versions_unique(env):
 
 def test_new_tool_policies():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _Runner())}
-    for name in ("playbook_publish", "playbook_rollback", "playbook_run_candidate"):
-        assert tds[name].policy == "prompt_always", name
+    # plans/018 phase 1: publish/rollback raise their own owner approval in
+    # the handler (one rich card per change) — core policy is auto_approve
+    # so the per-call prompt doesn't double-ask.
+    for name in ("playbook_publish", "playbook_rollback"):
+        assert tds[name].policy == "auto_approve", name
         assert tds[name].risk_level == "medium", name
+        assert "explanation" in tds[name].parameters["required"], name
+    assert tds["playbook_run_candidate"].policy == "prompt_always"
+    assert tds["playbook_run_candidate"].risk_level == "medium"
     assert "version" in tds["playbook_dry_run"].parameters["properties"]

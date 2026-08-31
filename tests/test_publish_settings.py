@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
+from evidence import EXPLANATION
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -173,7 +174,7 @@ async def test_tool_publish_reports_unenforced_specs_gate(env):
     await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_specs": False})
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](name="greeter", version=1))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out.get("status") == "published", out
     specs_gate = next(g for g in out["gates"] if g["gate"] == "specs")
     assert specs_gate["ok"] is False
@@ -229,7 +230,7 @@ async def test_candidate_tool_publish_run_gate_off(env):
     ))
     assert "error" not in out, out
     assert (await _pb(sf)).candidate_version == 2
-    out = json.loads(await handlers["playbook_publish"](name="greeter"))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out.get("status") == "published", out
     run_gate = next(g for g in out["gates"] if g["gate"] == "test_run")
     assert run_gate["ok"] is False and run_gate["enforced"] is False

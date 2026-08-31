@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from evidence import green_run
+from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -125,7 +125,7 @@ async def _make_candidate(tools) -> None:
 async def test_publish_refused_without_test_run(env):
     sf, tools, _, _ = env
     await _make_candidate(tools)
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
     assert "not been tested" in out["error"]
     assert "playbook_run_candidate" in out["hint"]
@@ -148,7 +148,7 @@ async def test_publish_refused_on_failed_test_run(env):
             completed_at=later,
         ))
         await s.commit()
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
     assert "FAILED" in out["error"]
     assert out["run_id"]
@@ -159,7 +159,7 @@ async def test_publish_passes_with_green_test_run_and_announces(env):
     sf, tools, _, bus = env
     await _make_candidate(tools)
     await green_run(sf, 2)
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["test_run"]["ok"] is True
@@ -182,7 +182,7 @@ async def test_stale_evidence_does_not_satisfy_a_new_edit(env):
         name="greeter", ticket=read["ticket"],
         old="inputs.name", new="inputs.nickname",
     )
-    out = json.loads(await tools["playbook_publish"](name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
 
 

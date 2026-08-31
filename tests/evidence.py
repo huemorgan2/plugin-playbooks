@@ -11,6 +11,15 @@ from sqlalchemy import select
 
 from plugin_playbooks.models import Playbook, PlaybookRun
 
+# plans/018 phase 1: publish/rollback require an owner-language explanation
+# (>= 80 chars, handler-enforced). Shared valid value for every test that is
+# not itself about the explanation gate.
+EXPLANATION = (
+    "The greeter playbook needed a small change to keep working. This "
+    "version fixes the reported problem and was tested with a green run "
+    "before publishing. Nothing else about the playbook changes."
+)
+
 
 async def green_run(
     sf, version: int, *, name: str | None = None, is_test: bool = True,

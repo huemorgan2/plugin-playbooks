@@ -75,7 +75,12 @@ def test_gated_set_matches_prompt_always_tooldefs():
         assert prior, "policy= before any name= — parser assumption broken"
         declared.add(prior[-1])
     assert declared, "no prompt_always ToolDefs found — regex rotted?"
-    assert declared == set(_GATED_TOOLS)
+    # plans/018 phase 1: publish/rollback moved to auto_approve but STILL
+    # park the delegate — the handler itself raises the owner approval after
+    # the gates pass, so they stay in the gated set.
+    handler_gated = {"playbook_publish", "playbook_rollback"}
+    assert declared.isdisjoint(handler_gated)
+    assert declared | handler_gated == set(_GATED_TOOLS)
 
 
 def test_payload_prefers_live_feed_over_stale_row():

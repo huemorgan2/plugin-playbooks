@@ -18,6 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
+from evidence import EXPLANATION
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -302,7 +303,7 @@ async def test_tool_publish_restore_uses_the_same_gate(env):
             "send_chat_message": {"args_contain": {"message": "Slartibartfast"}}}}}
         await s.commit()
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](name="greeter", version=1))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out["gate"] == "specs"
     assert (await _pb(sf)).live_version == 2
 

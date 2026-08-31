@@ -14,6 +14,7 @@ to check before `playbook_run`.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -36,11 +37,29 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
-from .publish import announce_publish, specs_gate, test_run_gate
+from .publish import (
+    announce_publish,
+    conversation_state,
+    ops_conversation_id,
+    specs_gate,
+    test_run_gate,
+)
 from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
 from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 from .versioning import ensure_live_row, mint_version, spec_source_version
+
+_log = logging.getLogger("luna.plugin.playbooks.agent_tools")
+
+# plans/018 phase 1: the explanation gate's steering hint — flows live in the
+# tool layer, so a thin call gets redirected instead of a raw TypeError.
+_EXPLANATION_HINT = (
+    "Write `explanation` for the OWNER, not for engineers: 2-6 plain "
+    "sentences — what issue was found (tie it to the failure or request "
+    "that started this), what the new version does differently, and why it "
+    "is safe to go live (what was tested, what stays the same). No stack "
+    "traces, no jargon. Then call the tool again."
+)
 
 
 def _compile_code(code: str, *, name: str) -> tuple[PlaybookDef | None, str | None]:
@@ -1633,13 +1652,158 @@ def build_tools(
     # 0.10.0 (plans/002 phase 3): promotion runs an extensible gate list —
     # static validation and manifest drift today; specs (phase 4) and probes
     # (phase 5) plug in as new entries. A refusal names the failing gate.
-    async def _do_publish(name: str, version: int | None, *, action: str) -> str:
+
+    async def _request_publish_decision(
+        *,
+        name: str,
+        action: str,
+        target_version: int,
+        explanation: str,
+        evidence: Any,
+        autonomy: str,
+        before_code: str,
+        after_code: str,
+        manifest_before: str,
+        manifest_after: str,
+        specs_added: list[str],
+        specs_removed: list[str],
+    ) -> str | None:
+        """plans/018 phase 1: ONE owner approval for the whole change, raised
+        AFTER every gate passed — owner-language presentation (luna 094) up
+        front, the technical diff collapsed behind it. Returns a refusal JSON
+        when the owner rejected, None to proceed. Contexts without an
+        approval engine (unit tests, headless cores) proceed ungated — the
+        old prompt_always card did not exist there either.
+        """
+        approvals = None
+        if ctx is not None:
+            try:
+                approvals = ctx.approval
+            except Exception:  # noqa: BLE001 — unwired engine: degrade, don't die
+                approvals = None
+        if approvals is None:
+            _log.warning(
+                "publish proceeding without owner approval (no approval "
+                "engine) playbook=%s action=%s", name, action,
+            )
+            return None
+
+        verb = "Restore" if action == "rollback" else "Publish"
+        headline = explanation.splitlines()[0].strip()[:90]
+        if evidence is not None:
+            evidence_line = (
+                f"Evidence: green run of version {target_version} "
+                f"(run {evidence.id})."
+            )
+        else:
+            evidence_line = (
+                f"Evidence: version {target_version} ran live before — this "
+                "restores a proven version."
+            )
+        changes: list[dict[str, Any]] = []
+        if before_code != after_code:
+            changes.append({
+                "label": "Playbook code", "kind": "diff",
+                "before": before_code, "after": after_code,
+            })
+        if manifest_before != manifest_after:
+            changes.append({
+                "label": "Manifest", "kind": "diff",
+                "before": manifest_before, "after": manifest_after,
+            })
+        if specs_added or specs_removed:
+            spec_lines = []
+            if specs_added:
+                spec_lines.append("Specs added: " + ", ".join(specs_added))
+            if specs_removed:
+                spec_lines.append("Specs removed: " + ", ".join(specs_removed))
+            changes.append({
+                "label": "Specs", "kind": "text",
+                "text": "\n".join(spec_lines),
+            })
+        presentation = {
+            "eyebrow": "Playbook change",
+            "headline": headline,
+            "explanation": f"{explanation}\n\n{evidence_line}",
+            "changes": changes,
+        }
+        # payload identity drives dedup/supersede/grants — presentation is
+        # advisory and must never leak into it.
+        payload = {"name": name, "version": target_version, "action": action}
+        summary = (
+            f"{verb} playbook '{name}' version {target_version}: {headline}"
+        )
+        ops = await ops_conversation_id(ctx)
+        try:
+            state = conversation_state(ctx)
+        except Exception:  # noqa: BLE001 — pre-089 cores lack the accessor
+            state = None
+        if autonomy == "auto" and state == "fix_publish":
+            # The 0.26.0 model contract, honored for real now: the owner
+            # pre-authorized fix-flow publishes of this playbook. Audited
+            # with the same presentation so History reads the same way.
+            try:
+                await approvals.record_auto_approval(
+                    kind="playbook_change",
+                    summary=summary,
+                    payload=payload,
+                    requested_by_plugin="plugin-playbooks",
+                    decided_by="policy",
+                    decision_reason=(
+                        "publish_autonomy='auto' for this playbook in the "
+                        "ops fix flow"
+                    ),
+                    conversation_id=ops,
+                    presentation=presentation,
+                )
+            except Exception:  # noqa: BLE001 — audit failure must not block
+                _log.exception("auto-approval audit failed playbook=%s", name)
+            return None
+        decision = await approvals.request(
+            kind="playbook_change",
+            summary=summary,
+            payload=payload,
+            requested_by_plugin="plugin-playbooks",
+            risk_level="medium",
+            conversation_id=ops,
+            presentation=presentation,
+        )
+        if getattr(decision, "decision", None) == "approved":
+            return None
+        return json.dumps({
+            "error": f"The owner did not approve this {action}.",
+            "owner_reason": getattr(decision, "reason", None),
+            "hint": (
+                "Relay the owner's reason in your reply and stand down — do "
+                "not retry the publish unless the owner asks for it or the "
+                "plan changes."
+            ),
+        })
+    async def _do_publish(
+        name: str, version: int | None, *, action: str, explanation: str = "",
+    ) -> str:
         """0.26.0 (plans/015, 089 contract #8): THE publish function — the
         only way any version becomes live. version=None publishes the
         candidate through the full gate; version=N restores a previously
         stored version (rollback = publishing an older version through this
         same function). Preconditions are machine-checked HERE, never LLM
-        discretion, and every success is announced in the ops chat."""
+        discretion, and every success is announced in the ops chat.
+
+        0.30.0 (plans/018 phase 1): after every gate passes, the handler
+        raises ONE owner approval for the whole change — plain-language
+        `explanation` up front, code/manifest diff collapsed behind it — and
+        only flips live once the owner approves. The gates run under the row
+        lock; the wait does not (an owner decision can take hours), so the
+        flip re-checks the approved target is still current."""
+        explanation = (explanation or "").strip()
+        if len(explanation) < 80:
+            return json.dumps({
+                "error": (
+                    f"{action.capitalize()} refused — `explanation` is "
+                    "missing or too short. Nothing was changed."
+                ),
+                "hint": _EXPLANATION_HINT,
+            })
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
@@ -1761,6 +1925,81 @@ def build_tools(
                     ),
                 })
 
+            # plans/018 phase 1: gather what the approval card and the later
+            # flip need, then release the row lock — the owner decision waits
+            # outside any transaction. Spec/probe caches commit here.
+            old_live = _live_version_of(playbook)
+            target_version = row.version
+            playbook_name = playbook.name
+            autonomy = getattr(playbook, "publish_autonomy", "ask")
+            try:
+                before_code = _derive_code(playbook)
+            except Exception:  # noqa: BLE001 — legacy defs may not codegen
+                before_code = playbook.code or ""
+            try:
+                after_code = _version_code(row)
+            except Exception:  # noqa: BLE001
+                after_code = row.code or ""
+            manifest_before = playbook.manifest or ""
+            manifest_after = (
+                manifest_before if is_candidate else (row.manifest or "")
+            )
+            spec_names_before = set((await session.execute(
+                select(PlaybookSpec.name).where(
+                    PlaybookSpec.playbook_id == playbook.id,
+                    PlaybookSpec.playbook_version == old_live,
+                )
+            )).scalars())
+            spec_names_after = set((await session.execute(
+                select(PlaybookSpec.name).where(
+                    PlaybookSpec.playbook_id == playbook.id,
+                    PlaybookSpec.playbook_version == target_version,
+                )
+            )).scalars())
+            await session.commit()
+
+        refusal = await _request_publish_decision(
+            name=playbook_name, action=action,
+            target_version=target_version, explanation=explanation,
+            evidence=evidence_ref, autonomy=autonomy,
+            before_code=before_code, after_code=after_code,
+            manifest_before=manifest_before, manifest_after=manifest_after,
+            specs_added=sorted(spec_names_after - spec_names_before),
+            specs_removed=sorted(spec_names_before - spec_names_after),
+        )
+        if refusal is not None:
+            return refusal
+
+        # Re-lock and flip: the approved target must still be current.
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name).with_for_update()
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            if is_candidate:
+                if playbook.candidate_version != target_version:
+                    return json.dumps({
+                        "error": (
+                            "The candidate changed while the approval was "
+                            f"pending — the owner approved version "
+                            f"{target_version}, but the candidate is now "
+                            f"{playbook.candidate_version}. Review the new "
+                            "candidate, test it, and publish again."
+                        ),
+                    })
+            elif target_version == _live_version_of(playbook):
+                return json.dumps({
+                    "error": f"Version {target_version} is already live.",
+                })
+            row = await _get_version_row(session, playbook, target_version)
+            if row is None:
+                return json.dumps({
+                    "error": (
+                        f"No stored content for version {target_version} — "
+                        "cannot publish it."
+                    ),
+                })
             old_live = _live_version_of(playbook)
             await _ensure_live_row(session, playbook)
             # candidate publish keeps the live manifest (drift was checked at
@@ -1813,8 +2052,12 @@ def build_tools(
             ),
         })
 
-    async def _publish(*, name: str, version: int | None = None) -> str:
-        return await _do_publish(name, version, action="publish")
+    async def _publish(
+        *, name: str, explanation: str = "", version: int | None = None,
+    ) -> str:
+        return await _do_publish(
+            name, version, action="publish", explanation=explanation,
+        )
 
     tools.append((
         ToolDef(
@@ -1828,13 +2071,26 @@ def build_tools(
                 "machine-checked and refuses with the exact reason: static "
                 "validation, specs, a GREEN TEST RUN of that exact version "
                 "since its last edit (playbook_run_candidate provides it — "
-                "run the test BEFORE publishing), and tool probes. Every "
+                "run the test BEFORE publishing), and tool probes. After "
+                "the gates pass, the owner gets ONE approval card for the "
+                "whole change: your `explanation` in plain language up "
+                "front, the technical diff collapsed behind it. Every "
                 "publish is announced in the ops chat with its evidence."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
+                    "explanation": {
+                        "type": "string",
+                        "description": (
+                            "2-6 sentences addressed to the OWNER in plain "
+                            "language: what issue was found, what this "
+                            "version changes, why it is safe to go live. "
+                            "Shown on the approval card — no jargon, no "
+                            "stack traces."
+                        ),
+                    },
                     "version": {
                         "type": "integer",
                         "description": (
@@ -1843,9 +2099,12 @@ def build_tools(
                         ),
                     },
                 },
-                "required": ["name"],
+                "required": ["name", "explanation"],
             },
-            policy="prompt_always",
+            # plans/018 phase 1: the owner approval is raised by the handler
+            # AFTER the gates pass (one rich card per change) — the core
+            # gate's per-call prompt would be a second, redundant ask.
+            policy="auto_approve",
             risk_level="medium",
             modes=["building", "fix_publish"],
         ),
@@ -1853,7 +2112,7 @@ def build_tools(
     ))
 
     # --- playbook_rollback (live ← previous live, via the publish path) ---
-    async def _rollback(*, name: str) -> str:
+    async def _rollback(*, name: str, explanation: str = "") -> str:
         # 0.26.0 (plans/015, 089 contract #8): rollback resolves the target
         # version, then publishes it through the SAME gated function.
         async with session_factory() as session:
@@ -1879,7 +2138,9 @@ def build_tools(
                 return json.dumps({
                     "error": f"'{name}' has no previous version to roll back to.",
                 })
-        return await _do_publish(name, target_n, action="rollback")
+        return await _do_publish(
+            name, target_n, action="rollback", explanation=explanation,
+        )
 
     tools.append((
         ToolDef(
@@ -1890,17 +2151,30 @@ def build_tools(
                 "Restore a playbook's PREVIOUS live version (the one the "
                 "current live was published from). Use when a published "
                 "change misbehaves. Runs through the same publish gate "
-                "(the prior version's live history is its test evidence) "
-                "and announces in the ops chat."
+                "(the prior version's live history is its test evidence), "
+                "asks the owner with ONE plain-language approval card, and "
+                "announces in the ops chat."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
+                    "explanation": {
+                        "type": "string",
+                        "description": (
+                            "2-6 sentences addressed to the OWNER in plain "
+                            "language: what went wrong with the current "
+                            "version, why rolling back is the right fix. "
+                            "Shown on the approval card — no jargon, no "
+                            "stack traces."
+                        ),
+                    },
                 },
-                "required": ["name"],
+                "required": ["name", "explanation"],
             },
-            policy="prompt_always",
+            # plans/018 phase 1: owner approval raised handler-side (see
+            # playbook_publish).
+            policy="auto_approve",
             risk_level="medium",
             modes=["building", "fix_publish"],
         ),
