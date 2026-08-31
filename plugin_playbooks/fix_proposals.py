@@ -267,6 +267,25 @@ class FixProposalService:
                 proposal.status = "approved" if approved else "dismissed"
                 await session.commit()
         if approved:
+            # 0.30.2 (luna 095): the wake turn inherits the ops chat's STORED
+            # state — in `identify` every mutation tool is absent by mode
+            # gating (tools="all" cannot override it), so the agent woke
+            # unable to fix anything. The owner's approval IS the consent to
+            # leave diagnose-only mode: advance identify → fix_publish, where
+            # the machine-checked publish gate + the playbook's publish
+            # autonomy still hold the promised second approval. only_from
+            # keeps us from downgrading a chat the owner already moved.
+            # Older cores (< 0.91.001) lack the API — degrade visible: the
+            # wake still fires and the agent reports what mode it needs.
+            set_state = getattr(ctx, "set_conversation_state", None)
+            if set_state is not None:
+                try:
+                    await set_state(ops, "fix_publish", only_from="identify")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "fix_proposal.state_flip_failed playbook=%s",
+                        playbook_name,
+                    )
             send = getattr(ctx, "send_muted_message", None)
             if send is None:
                 return

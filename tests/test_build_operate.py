@@ -479,6 +479,7 @@ class _OpsCtx:
     def __init__(self, approved: bool = True, ops=OPS) -> None:
         self.approval = _CardApprovals(approved)
         self.sent: list[tuple[str, str, dict]] = []
+        self.state_flips: list[tuple] = []
         self._ops = ops
 
     async def ops_conversation_id(self):
@@ -486,6 +487,18 @@ class _OpsCtx:
 
     async def send_muted_message(self, title, body, **kw):
         self.sent.append((title, body, kw))
+
+    async def set_conversation_state(self, cid, state, *, only_from=None):
+        # 0.30.2 (luna 095): record the flip and its ordering vs the wake
+        self.state_flips.append((cid, state, only_from, len(self.sent)))
+        return True
+
+
+class _OldCoreOpsCtx(_OpsCtx):
+    """A pre-0.91.001 core: no set_conversation_state. The approved path must
+    still wake the ops chat (degrade visible, never break)."""
+
+    set_conversation_state = None
 
 
 class _UnwiredApprovalCtx:
@@ -552,6 +565,13 @@ async def test_fix_proposal_card_is_owner_readable_and_wakes_with_tools():
         assert kw["conversation_id"] == OPS
         assert kw["channel"] == "moment"
         assert "greeter" in body
+
+        # 0.30.2 (luna 095): the approval advances the ops chat out of the
+        # diagnose-only mode BEFORE the wake, guarded so it never downgrades
+        # a chat the owner already moved (only_from="identify").
+        ((cid, state, only_from, sent_before),) = ctx.state_flips
+        assert (cid, state, only_from) == (OPS, "fix_publish", "identify")
+        assert sent_before == 0  # flip happened before the wake was sent
     finally:
         await engine.dispose()
 
@@ -567,6 +587,25 @@ async def test_fix_proposal_denied_dismisses_without_wake():
             row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
         assert row.status == "dismissed"
         assert ctx.sent == []
+        assert ctx.state_flips == []  # denial never touches the chat's mode
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fix_proposal_approved_on_old_core_still_wakes():
+    """Pre-0.91.001 cores have no set_conversation_state — the approved path
+    must degrade visible: wake anyway, in whatever mode the chat is in."""
+    ctx = _OldCoreOpsCtx(approved=True)
+    engine, sf, pb, svc = await _card_env(ctx)
+    try:
+        run = await _seed_failed_live_run(sf, pb)
+        await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
+        async with sf() as s:
+            row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
+        assert row.status == "approved"
+        ((_, _, kw),) = ctx.sent
+        assert kw["tools"] == "all"
     finally:
         await engine.dispose()
 
