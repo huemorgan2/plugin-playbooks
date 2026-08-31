@@ -454,8 +454,13 @@ def test_failure_signature_stable_across_volatile_details():
 # --- fix proposals: owner-readable card + wake (plans/018 phase 2) ----------
 
 class _CardDecision:
+    """Mirrors the REAL luna ApprovalDecision: it carries decision="approved"
+    and has NO `approved` attribute. 0.30.1: the stub used to expose
+    `.approved`, which hid a live bug — the service read only that attribute
+    and dismissed every approved card on a real Luna."""
+
     def __init__(self, approved: bool) -> None:
-        self.approved = approved
+        self.decision = "approved" if approved else "rejected"
 
 
 class _CardApprovals:

@@ -249,8 +249,16 @@ class FixProposalService:
         except Exception:  # noqa: BLE001
             log.exception("fix_proposal.card_failed playbook=%s", playbook_name)
             return
+        # 0.30.1: the real ApprovalDecision carries decision="approved" — it
+        # has no `approved` attribute, so the old attr-only read dismissed
+        # every approved card. Accept both shapes.
+        decision = (
+            getattr(result, "decision", None)
+            or (isinstance(result, dict) and result.get("decision"))
+        )
         approved = bool(
-            getattr(result, "approved", None)
+            decision == "approved"
+            or getattr(result, "approved", None)
             or (isinstance(result, dict) and result.get("approved"))
         )
         async with self._sf() as session:
