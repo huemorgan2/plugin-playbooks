@@ -2129,6 +2129,11 @@ def build_tools(
             # AFTER the gates pass (one rich card per change) — the core
             # gate's per-call prompt would be a second, redundant ask.
             policy="auto_approve",
+            # 0.30.3: the handler PARKS on the owner's approval card — the
+            # default 30s tool timeout killed every publish the owner didn't
+            # answer within half a minute (wait_for cancels the handler, so
+            # a late approval resumed nothing and the card was orphaned).
+            timeout_seconds=900,
             risk_level="medium",
             modes=["building", "fix_publish"],
         ),
@@ -2199,6 +2204,8 @@ def build_tools(
             # plans/018 phase 1: owner approval raised handler-side (see
             # playbook_publish).
             policy="auto_approve",
+            # 0.30.3: parks on the owner card, same as playbook_publish.
+            timeout_seconds=900,
             risk_level="medium",
             modes=["building", "fix_publish"],
         ),
