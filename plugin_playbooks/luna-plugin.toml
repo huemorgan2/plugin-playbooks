@@ -1,28 +1,28 @@
 name = "plugin-playbooks"
-version = "0.29.0"
+version = "0.30.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_delegations"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_delegations", "playbook_fix_proposals"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
 
 The **Playbooks engine** for Luna: durable, multi-step agent workflows.
-Playbooks are reusable YAML templates of steps (tool calls, LLM steps, agent
+Playbooks are reusable pblang templates of steps (tool calls, LLM steps, agent
 decisions, loops, branches, waits) that Luna authors through conversation and
 executes on triggers or on demand.
 
 Adds a **Playbooks** sidebar section with a full visual canvas (react-flow):
-list → canvas/YAML editor → run replay with per-step state visualization.
+list → canvas/code editor → run replay with per-step state visualization.
 Served as a full-pane iframe from the plugin's own prebuilt `ui/` dist; live
 agent edits stream in over the E12 `ui.plugin.event` bridge (`playbook.open`,
 `playbook.patch`, `navigate`), and run/step activity rides the `activity.*`
 SSE feed.
 
-Owns its **nine DB tables via the SDK** (E4 isolated metadata) and binds
+Owns its **ten DB tables via the SDK** (E4 isolated metadata) and binds
 external trigger sources (cron, webhooks, connector events) through the SDK
 `TriggerSourceRegistry`. Chat messages sent from playbook runs are tagged
 `source=playbook` (E11) for generic badging in core. Imports only `luna_sdk`
@@ -33,18 +33,17 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 12
-tables = 9
+tools = 25
+tables = 10
+
+# plans/018 phase 3: this list is generated from the ToolDefs in
+# agent_tools.build_tools + delegation.build_delegation_tools and pinned by
+# tests/test_manifest_drift.py — edit the code, then this file, or the drift
+# test fails.
 
 [[tools]]
 name = "playbook_propose"
-description = "Create a new playbook from a full YAML definition."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_edit"
-description = "Rewrite an existing playbook's full YAML definition."
+description = "Create a new playbook draft from pblang source."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -55,28 +54,10 @@ policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
-name = "playbook_get_definition"
-description = "Get the full YAML of a playbook."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_validate"
-description = "Statically check a playbook without running it."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_dry_run"
-description = "Simulate a playbook run with tool/LLM steps stubbed — no side effects."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
 name = "playbook_run"
 description = "Execute a playbook for real (runs tools and agent steps)."
 policy = "auto_approve"
-risk_level = "medium"
+risk_level = "low"
 
 [[tools]]
 name = "playbook_status"
@@ -92,9 +73,111 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_set_autonomy"
-description = "Change who can trigger a playbook (agent/owner/confirm)."
-policy = "ask"
+description = "Change per-playbook run/publish autonomy and publish gates (owner approval)."
+policy = "prompt_always"
 risk_level = "medium"
+
+[[tools]]
+name = "playbook_ack_failures"
+description = "Acknowledge production failures so the digest stops repeating them."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_get_definition"
+description = "Get the pblang source of a playbook version."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_validate"
+description = "Statically check a playbook without running it."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_language_reference"
+description = "Return the pblang language reference."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_dry_run"
+description = "Simulate a playbook run with tool/LLM steps stubbed — no side effects."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_edit"
+description = "Edit a playbook's candidate version (read-stage ticket flow)."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_edit_force"
+description = "Save an edit past the manifest drift gate (owner approval; lead with why)."
+policy = "prompt_always"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_manifest_set"
+description = "Set or replace a playbook's intent manifest (owner approval; lead with why)."
+policy = "prompt_always"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_publish"
+description = "Promote a green candidate to live — gates + ONE explained owner approval."
+policy = "auto_approve"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_rollback"
+description = "Restore the previous live version — gates + ONE explained owner approval."
+policy = "auto_approve"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_run_candidate"
+description = "Test-run the candidate version for real (owner approval)."
+policy = "prompt_always"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_spec_add"
+description = "Add a spec (test) to a playbook version."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_spec_list"
+description = "List a playbook version's specs and their last results."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_spec_delete"
+description = "Delete one spec from a version's test set (owner approval; lead with why)."
+policy = "prompt_always"
+risk_level = "medium"
+
+[[tools]]
+name = "playbook_spec_run"
+description = "Run a version's specs (dry-run) and report pass/fail."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_spec_from_run"
+description = "Draft a spec from a recorded run's actual step data."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_preflight"
+description = "Probe a playbook's external dependencies without side effects."
+policy = "auto_approve"
+risk_level = "low"
 
 [[tools]]
 name = "playbook_agent"

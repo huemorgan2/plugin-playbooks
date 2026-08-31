@@ -634,9 +634,22 @@ def build_tools(
         _cancel,
     ))
 
+    # plans/018 phase 3: the remaining prompt_always tools carry a `why` —
+    # optional, but FIRST in the schema so the legacy approval card leads
+    # with plain language instead of raw arguments.
+    _WHY_PROP = {
+        "type": "string",
+        "description": (
+            "One or two plain sentences FOR THE OWNER: why this change is "
+            "needed, in everyday language. Shown at the top of the approval "
+            "card — always provide it."
+        ),
+    }
+
     # --- playbook_set_autonomy ---
     async def _set_autonomy(
-        *, name: str, agent_autonomy: str = "", publish_autonomy: str = "",
+        *, name: str, why: str = "",
+        agent_autonomy: str = "", publish_autonomy: str = "",
         require_specs: bool | None = None, require_run: bool | None = None,
     ) -> str:
         if (not agent_autonomy and not publish_autonomy
@@ -706,11 +719,13 @@ def build_tools(
                 "or 'auto' — 'auto' is honored only in the ops chat's "
                 "fix & publish mode. require_specs / require_run switch the "
                 "publish gates (Settings → Publish): off = the gate is still "
-                "run and reported but never refuses a publish."
+                "run and reported but never refuses a publish. Lead with "
+                "`why` — the owner reads it on the approval card."
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "why": _WHY_PROP,
                     "name": {"type": "string", "description": "Playbook name"},
                     "agent_autonomy": {
                         "type": "string",
@@ -1210,6 +1225,7 @@ def build_tools(
         definition_yaml: str = "",
         skip_drift: bool = False,
         forced: bool = False,
+        why: str = "",
     ) -> str:
         # 0.14.0 (plans/002 phase 7): YAML input removed — steering hint for
         # stale callers instead of a TypeError.
@@ -1427,7 +1443,9 @@ def build_tools(
                 definition=data, code=stored_code, manifest=playbook.manifest,
                 author="agent",
                 message=(
-                    "candidate (drift gate skipped — forced edit)"
+                    # plans/018 phase 3: the owner's why travels into history
+                    ("candidate (drift gate skipped — forced edit)"
+                     + (f": {why}" if why else ""))
                     if forced else "candidate"
                 ),
                 source_version=spec_source_version(playbook),
@@ -1552,6 +1570,7 @@ def build_tools(
     async def _playbook_edit_force(
         *,
         name: str,
+        why: str = "",
         ticket: str = "",
         code: str = "",
         old: str = "",
@@ -1561,6 +1580,7 @@ def build_tools(
         return await _edit_impl(
             name=name, ticket=ticket, code=code, old=old, new=new,
             definition_yaml=definition_yaml, skip_drift=True, forced=True,
+            why=why,
         )
 
     tools.append((
@@ -1574,11 +1594,12 @@ def build_tools(
                 "playbook_edit; the manifest drift gate is skipped and the "
                 "version history records the override. Use ONLY after "
                 "playbook_edit refused for manifest conflict AND the owner "
-                "wants the change anyway — this raises an approval card."
+                "wants the change anyway — this raises an approval card. "
+                "Lead with `why` — the owner reads it on that card."
             ),
             parameters={
                 "type": "object",
-                "properties": _EDIT_PAYLOAD_PROPS,
+                "properties": {"why": _WHY_PROP, **_EDIT_PAYLOAD_PROPS},
                 "required": ["name", "ticket"],
             },
             policy="prompt_always",
@@ -1588,7 +1609,7 @@ def build_tools(
     ))
 
     # --- playbook_manifest_set (owner approval) ---
-    async def _manifest_set(*, name: str, manifest: str) -> str:
+    async def _manifest_set(*, name: str, manifest: str, why: str = "") -> str:
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
@@ -1605,7 +1626,8 @@ def build_tools(
             await mint_version(
                 session, playbook,
                 definition=playbook.definition, code=playbook.code,
-                manifest=manifest, author="agent", message="manifest updated",
+                manifest=manifest, author="agent",
+                message="manifest updated" + (f": {why}" if why else ""),
                 source_version=old_live,
             )
             playbook.live_version = playbook.version
@@ -1629,11 +1651,13 @@ def build_tools(
                 "it and refused when they conflict, so changing it is an "
                 "owner decision — this raises an approval card. Draft the "
                 "manifest from what the owner said and from the playbook's "
-                "code; keep it short and testable."
+                "code; keep it short and testable. Lead with `why` — the "
+                "owner reads it on the approval card."
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "why": _WHY_PROP,
                     "name": {"type": "string", "description": "Playbook name"},
                     "manifest": {
                         "type": "string",
@@ -2539,7 +2563,9 @@ def build_tools(
         _spec_list,
     ))
 
-    async def _spec_delete(*, name: str, spec_name: str, version: str = "auto") -> str:
+    async def _spec_delete(
+        *, name: str, spec_name: str, version: str = "auto", why: str = "",
+    ) -> str:
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
@@ -2572,10 +2598,15 @@ def build_tools(
             name="playbook_spec_delete",
             modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
-            description="Delete one spec by name from one version's test set.",
+            description=(
+                "Delete one spec by name from one version's test set. This "
+                "raises an approval card — lead with `why` so the owner "
+                "understands what coverage is being dropped and why."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "why": _WHY_PROP,
                     "name": {"type": "string", "description": "Playbook name"},
                     "spec_name": {"type": "string", "description": "Spec to delete"},
                     "version": {

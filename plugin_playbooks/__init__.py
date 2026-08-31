@@ -595,7 +595,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.29.0",
+        version="0.30.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -958,7 +958,13 @@ class PlaybooksPlugin(LunaPlugin):
             "green, post 'fix ready — tests green, publish?' with the "
             "evidence and WAIT for the owner. The publish tool is absent in "
             "this mode on purpose: publishing happens only through the "
-            "owner approving your proposal."
+            "owner approving your proposal.\n"
+            "The owner is not an engineer. Anything you write for them — "
+            "proposals, `why` arguments, the publish `explanation` — must "
+            "say in everyday language what went wrong and what the fix "
+            "does, and tie back to the failure that started this work. No "
+            "step ids, stack traces, or internal jargon in the summary; "
+            "technical detail belongs in the collapsed section of the card."
         ),
         "fix_publish": (
             "## Ops chat — mode: Fix & publish\n"
@@ -967,7 +973,13 @@ class PlaybooksPlugin(LunaPlugin):
             "since its last edit — run the test first "
             "(playbook_run_candidate) instead of arguing with the gate. "
             "Playbooks whose publish autonomy is 'ask' still wait for the "
-            "owner's approval even here."
+            "owner's approval even here.\n"
+            "The publish `explanation` is read by the owner, who is not an "
+            "engineer: say what problem was found, what the change does "
+            "about it, and how it was tested — in everyday language, tied "
+            "back to the failure that started this work. One fix, one "
+            "publish, ONE approval card: batch related edits into the "
+            "candidate and publish once, instead of asking per edit."
         ),
     }
 

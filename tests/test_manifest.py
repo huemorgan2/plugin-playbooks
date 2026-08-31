@@ -22,34 +22,21 @@ def test_identity():
     assert MANIFEST["category"] == "system"
 
 
-def test_tool_and_table_counts():
-    assert MANIFEST["requires"]["tools"] == 12
-    assert len(MANIFEST["tools"]) == 12
-    assert MANIFEST["requires"]["tables"] == 9
-    assert len(MANIFEST["db_tables"]) == 9
+# 0.30.0 (plans/018 phase 3): tool/table counts, names, and policies are no
+# longer frozen here — tests/test_manifest_drift.py pins the whole manifest
+# to the actual ToolDefs and Base.metadata, so the toml can't drift again
+# (this file's frozen copies were HOW it drifted from 0.26 to 0.29).
 
 
-def test_db_table_names():
-    assert set(MANIFEST["db_tables"]) == {
-        "playbooks",
-        "playbook_versions",
-        "playbook_edit_tickets",
-        "playbook_runs",
-        "playbook_step_runs",
-        "playbook_specs",
-        "playbook_probe_results",
-        "playbook_drafts",
-        "playbook_delegations",
-    }
+def test_tool_and_table_counts_are_internally_consistent():
+    assert MANIFEST["requires"]["tools"] == len(MANIFEST["tools"])
+    assert MANIFEST["requires"]["tables"] == len(MANIFEST["db_tables"])
 
 
 def test_tool_policies():
     tools = {t["name"]: t for t in MANIFEST["tools"]}
-    assert tools["playbook_run"]["risk_level"] == "medium"
-    assert tools["playbook_set_autonomy"]["policy"] == "ask"
+    assert tools["playbook_set_autonomy"]["policy"] == "prompt_always"
     assert tools["playbook_agent"]["risk_level"] == "medium"
-    low_auto = {n for n, t in tools.items() if t["policy"] == "auto_approve" and t["risk_level"] == "low"}
-    assert len(low_auto) == 9
 
 
 def test_no_core_imports():
