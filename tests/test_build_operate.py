@@ -449,3 +449,132 @@ def test_failure_signature_stable_across_volatile_details():
     c = failure_signature("pb", "say", "connection refused")
     assert a == b       # digits stripped — retries collapse
     assert a != c       # different failure, different proposal
+
+
+# --- fix proposals: owner-readable card + wake (plans/018 phase 2) ----------
+
+class _CardDecision:
+    def __init__(self, approved: bool) -> None:
+        self.approved = approved
+
+
+class _CardApprovals:
+    def __init__(self, approved: bool) -> None:
+        self.requests: list[dict] = []
+        self._approved = approved
+
+    async def request(self, **kw):
+        self.requests.append(kw)
+        return _CardDecision(self._approved)
+
+
+class _OpsCtx:
+    """Fake core with a wired approval engine and a muted-message surface."""
+
+    def __init__(self, approved: bool = True, ops=OPS) -> None:
+        self.approval = _CardApprovals(approved)
+        self.sent: list[tuple[str, str, dict]] = []
+        self._ops = ops
+
+    async def ops_conversation_id(self):
+        return self._ops
+
+    async def send_muted_message(self, title, body, **kw):
+        self.sent.append((title, body, kw))
+
+
+class _UnwiredApprovalCtx:
+    """`ctx.approval` is a PROPERTY on the real PluginContext and RAISES
+    RuntimeError when approvals are unwired — getattr's default never
+    applies. The service must degrade to the ledger row, not lose the
+    proposal."""
+
+    def __init__(self, ops=OPS) -> None:
+        self._ops = ops
+
+    @property
+    def approval(self):
+        raise RuntimeError("approvals engine not wired")
+
+    async def ops_conversation_id(self):
+        return self._ops
+
+
+async def _card_env(ctx):
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    pb = await _seed_playbook(sf)
+    return engine, sf, pb, FixProposalService(sf, _Bus(), ctx=ctx)
+
+
+@pytest.mark.asyncio
+async def test_fix_proposal_card_is_owner_readable_and_wakes_with_tools():
+    ctx = _OpsCtx(approved=True)
+    engine, sf, pb, svc = await _card_env(ctx)
+    try:
+        run = await _seed_failed_live_run(sf, pb)
+        await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
+
+        assert len(ctx.approval.requests) == 1
+        req = ctx.approval.requests[0]
+        assert req["kind"] == "playbook_fix_proposal"
+        assert req["conversation_id"] == OPS
+        assert req["summary"].count("\n") == 0          # one-line fallback
+        assert req["payload"]["playbook"] == "greeter"
+        assert req["payload"]["target_ref"] == "playbook:greeter"
+
+        pres = req["presentation"]
+        assert pres["eyebrow"] == "Playbook failing"
+        assert pres["headline"] == "'greeter' is failing — approve a fix attempt"
+        assert "says hi" in pres["explanation"]          # what the playbook does
+        assert "'say' step" in pres["explanation"]       # where it failed
+        assert "second approval" in pres["explanation"]  # publish still gated
+        # technical detail lives behind the fold, not in the explanation
+        assert "HTTP 500" not in pres["explanation"]
+        (change,) = pres["changes"]
+        assert change["kind"] == "text" and change["label"] == "Failure detail"
+        assert "HTTP 500 from mail server" in change["text"]
+        assert str(run.id) in change["text"]
+
+        # approval flips the ledger row and wakes the ops chat WITH tools
+        async with sf() as s:
+            row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
+        assert row.status == "approved"
+        ((title, body, kw),) = ctx.sent
+        assert kw["tools"] == "all"
+        assert kw["conversation_id"] == OPS
+        assert kw["channel"] == "moment"
+        assert "greeter" in body
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fix_proposal_denied_dismisses_without_wake():
+    ctx = _OpsCtx(approved=False)
+    engine, sf, pb, svc = await _card_env(ctx)
+    try:
+        run = await _seed_failed_live_run(sf, pb)
+        await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
+        async with sf() as s:
+            row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
+        assert row.status == "dismissed"
+        assert ctx.sent == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fix_proposal_unwired_approval_property_degrades_to_ledger():
+    engine, sf, pb, svc = await _card_env(_UnwiredApprovalCtx())
+    try:
+        run = await _seed_failed_live_run(sf, pb)
+        # must not raise, and the ledger row must survive as "open"
+        await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
+        async with sf() as s:
+            row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
+        assert row.status == "open"
+    finally:
+        await engine.dispose()

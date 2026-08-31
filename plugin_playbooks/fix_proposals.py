@@ -158,27 +158,84 @@ class FixProposalService:
             await session.refresh(proposal)
             proposal_id = proposal.id
             playbook_name = playbook.name
+            # plans/018 phase 2: everything the owner-facing card needs, read
+            # while the rows are in hand. "What the playbook does" = first
+            # manifest line, else its description.
+            purpose = (
+                (playbook.manifest or "").strip().splitlines()[:1]
+                or [(playbook.description or "").strip()]
+            )[0].lstrip("# ").strip()
+            card = {
+                "display": playbook.display_name or playbook.name,
+                "purpose": purpose,
+                "step_id": step_id,
+                "run_id": str(run.id),
+                "version": run.playbook_version,
+                "error": (error or "")[:400],
+            }
         log.info("fix_proposal.filed playbook=%s id=%s", playbook_name, proposal_id)
-        await self._post_card(proposal_id, playbook_name, title, diagnosis)
+        await self._post_card(proposal_id, playbook_name, title, diagnosis, card)
 
     async def _post_card(
-        self, proposal_id: Any, playbook_name: str, title: str, diagnosis: str,
+        self,
+        proposal_id: Any,
+        playbook_name: str,
+        title: str,
+        diagnosis: str,
+        card: dict[str, Any] | None = None,
     ) -> None:
         """Post the proposal as an approval card in the ops chat. Approval
         wakes the ops chat to do the fix; denial dismisses the proposal."""
         ctx = self._ctx
         ops = await ops_conversation_id(ctx)
-        approval = getattr(ctx, "approval", None) if ctx else None
+        # plans/018 phase 2: `ctx.approval` RAISES when the engine is unwired
+        # (it is a property, so getattr's default never applies) — and the
+        # outer catch-all used to eat the card silently.
+        approval = None
+        if ctx is not None:
+            try:
+                approval = ctx.approval
+            except Exception:  # noqa: BLE001 — unwired engine: ledger-only path
+                approval = None
         if ops is None or approval is None:
             # headless test ctx, or a broken ops lookup: ledger row only —
             # surfaced via the failure digest.
             return
+        card = card or {}
+        display = card.get("display") or playbook_name
+        purpose = card.get("purpose") or ""
+        step_id = card.get("step_id") or ""
+        explanation_bits = [
+            f"The **{display}** playbook"
+            + (f" ({purpose})" if purpose else "")
+            + " failed on a real run"
+            + (f" at the '{step_id}' step" if step_id else "")
+            + ".",
+            "Approving lets me work on a fix right away. Any fix is tested "
+            "first, and nothing goes live without a second approval from "
+            "you. Denying dismisses this proposal.",
+        ]
+        # dedup keeps the FIRST pending card's presentation — repeats bump
+        # the ledger count, so the card intentionally names no count.
+        presentation = {
+            "eyebrow": "Playbook failing",
+            "headline": f"'{display}' is failing — approve a fix attempt",
+            "explanation": "\n\n".join(explanation_bits),
+            "changes": [{
+                "label": "Failure detail",
+                "kind": "text",
+                "text": (
+                    f"Run: {card.get('run_id', '?')}\n"
+                    f"Version: {card.get('version', '?')}\n"
+                    + (f"Step: {step_id}\n" if step_id else "")
+                    + f"Error: {card.get('error') or 'not recorded'}"
+                ),
+            }],
+        }
         try:
             result = await approval.request(
                 kind="playbook_fix_proposal",
-                summary=f"{title}\n\n{diagnosis}\n\nApprove to have the fix "
-                        "worked on now (publishing still passes the test "
-                        "gate); deny to dismiss this proposal.",
+                summary=f"{title} — approve to have a fix worked on now.",
                 payload={
                     "proposal_id": str(proposal_id),
                     "playbook": playbook_name,
@@ -187,6 +244,7 @@ class FixProposalService:
                 requested_by_plugin="plugin-playbooks",
                 risk_level="medium",
                 conversation_id=ops,
+                presentation=presentation,
             )
         except Exception:  # noqa: BLE001
             log.exception("fix_proposal.card_failed playbook=%s", playbook_name)
@@ -217,6 +275,11 @@ class FixProposalService:
                     respond=True,
                     conversation_id=ops,
                     source="playbooks",
+                    # plans/018 phase 2: without tools the wake turn cannot
+                    # diagnose anything. "all" + the core's state gating
+                    # (kind/state ride into moment turns since luna 0.91)
+                    # scopes it to the ops chat's mode.
+                    tools="all",
                 )
             except Exception:  # noqa: BLE001
                 log.exception("fix_proposal.wake_failed playbook=%s", playbook_name)
