@@ -44,12 +44,41 @@ def test_playbook_edit_is_headless_callable():
     )
 
 
-def test_agent_step_and_dry_run_stay_chat_only():
+def test_no_mode_gated_tool_is_chat_only():
+    """0.31.1 (BUG #3 rule): modes are the sole gate. chat_only hides a tool
+    from EVERY headless turn — including muted ops wake turns, which is
+    exactly where the fix flow runs (plan 0001 execution failed on this).
+    Recursion protection for run-starting tools lives in
+    _nested_run_refusal(), not chat_only."""
     tools = _tools()
-    assert getattr(tools["playbook_dry_run"][0], "chat_only", False)
+    for name in (
+        "playbook_propose", "playbook_run", "playbook_set_autonomy",
+        "playbook_ack_failures", "playbook_dry_run", "playbook_run_candidate",
+    ):
+        assert not getattr(tools[name][0], "chat_only", False), (
+            f"{name} must stay visible to muted/headless turns"
+        )
 
 
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_run_tools_refuse_inside_a_playbook_run():
+    """The 006.707 substitute: with chat_only gone, the run-starting tools
+    refuse only the actually-recursive context (an agent_step inside a run),
+    with steering toward `subtask` composition."""
+    from plugin_playbooks import runner as runner_mod
+
+    tools = _tools()
+    token = runner_mod._active_run_id.set("run-123")
+    try:
+        for name in ("playbook_run", "playbook_run_candidate"):
+            out = json.loads(await tools[name][1](name="pb"))
+            assert out["gate"] == "nested_playbook_run", name
+            assert "subtask" in out["hint"]
+    finally:
+        runner_mod._active_run_id.reset(token)
 
 
 @pytest.mark.asyncio

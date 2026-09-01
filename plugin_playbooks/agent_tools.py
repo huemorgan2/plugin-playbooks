@@ -47,6 +47,7 @@ from .publish import (
     test_run_gate,
 )
 from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
+from .runner import active_run_id as _active_playbook_run
 from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 from .versioning import ensure_live_row, mint_version, spec_source_version
@@ -62,6 +63,30 @@ _EXPLANATION_HINT = (
     "is safe to go live (what was tested, what stays the same). No stack "
     "traces, no jargon. Then call the tool again."
 )
+
+
+def _nested_run_refusal() -> str | None:
+    """Refuse starting a playbook run from INSIDE a playbook run.
+
+    006.707: nested agent_step turns that could see the run tools recursively
+    self-triggered (8 stacked runs). chat_only used to hide the tools from
+    every headless turn, but 0.31.1 removed it so muted ops wake turns can
+    test candidates — this contextvar guard is the substitute, refusing only
+    the actually-recursive context instead of all headless turns.
+    """
+    rid = _active_playbook_run()
+    if rid is None:
+        return None
+    return json.dumps({
+        "gate": "nested_playbook_run",
+        "error": (
+            f"Refused: this turn is a step inside playbook run {rid} — "
+            "starting another playbook run from here would recurse."
+        ),
+        "hint": "To compose playbooks, use a `subtask` step in the "
+                "playbook definition instead of calling run tools "
+                "from an agent_step.",
+    })
 
 
 def _compile_code(code: str, *, name: str) -> tuple[PlaybookDef | None, str | None]:
@@ -319,7 +344,6 @@ def build_tools(
             name="playbook_propose",
             modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
-            chat_only=True,
             description=(
                 "Create a new playbook from its FULL source, written all at "
                 "once. Pass `code` — the playbook language "
@@ -422,6 +446,8 @@ def build_tools(
     _RUN_WAIT_MAX = 90.0
 
     async def _run(*, name: str, inputs: str = "{}", wait_seconds: float | None = None) -> str:
+        if nested := _nested_run_refusal():
+            return nested
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
         except json.JSONDecodeError:
@@ -512,11 +538,10 @@ def build_tools(
         ToolDef(
             name="playbook_run",
             modes=["building", "fix_publish"],
-            # chat_only: an agent_step INSIDE a playbook must never trigger
-            # playbooks (006.707: working prompt_sections made nested agents
-            # see the playbook list and recursively self-trigger — 8 stacked
-            # runs). Use a `subtask` step for playbook composition.
-            chat_only=True,
+            # NOT chat_only (0.31.1): muted ops wake turns need the run tools
+            # (modes are the sole gate — the BUG #3 rule). The 006.707
+            # nested-agent recursion this flag used to prevent is handled by
+            # _nested_run_refusal() in the handler instead.
             timeout_seconds=120,
             description=(
                 "Trigger a playbook run. The run executes in the BACKGROUND: "
@@ -715,7 +740,6 @@ def build_tools(
         ToolDef(
             name="playbook_set_autonomy",
             modes=["building", "fix_publish"],
-            chat_only=True,
             description=(
                 "Change per-playbook autonomy. agent_autonomy = who may RUN "
                 "it: 'agent_may_trigger' (agent runs freely), "
@@ -789,7 +813,6 @@ def build_tools(
         ToolDef(
             name="playbook_ack_failures",
             modes=["building", "identify", "fix_approve", "fix_publish"],
-            chat_only=True,
             description=(
                 "Dismiss the 'playbook failures needing your attention' notice "
                 "for one playbook. Call this ONLY after the owner has decided "
@@ -1143,7 +1166,6 @@ def build_tools(
         ToolDef(
             name="playbook_dry_run",
             modes=["building", "fix_approve", "fix_publish"],
-            chat_only=True,
             timeout_seconds=60,
             description=(
                 "Simulate a playbook run WITHOUT side effects — real loops, "
@@ -2254,6 +2276,8 @@ def build_tools(
     async def _run_candidate(
         *, name: str, inputs: str = "{}", wait_seconds: float | None = None,
     ) -> str:
+        if nested := _nested_run_refusal():
+            return nested
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
         except json.JSONDecodeError:
@@ -2331,7 +2355,6 @@ def build_tools(
             modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             artifact_verb="testing",
-            chat_only=True,
             timeout_seconds=120,
             description=(
                 "REAL, supervised test run of a playbook's CANDIDATE version "

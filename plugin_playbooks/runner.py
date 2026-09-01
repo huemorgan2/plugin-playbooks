@@ -95,6 +95,15 @@ _active_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def active_run_id() -> str | None:
+    """Run id when the current context is INSIDE a playbook run, else None.
+
+    Contextvars propagate through agent_step's run_turn into its tool calls,
+    so the run-starting tools use this to refuse nested runs (006.707).
+    """
+    return _active_run_id.get()
+
+
 def _normalize_tool_result(result: Any) -> Any:
     """Parse JSON-string tool results into structured data.
 
