@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import Playbook, PlaybookFixProposal, PlaybookRun, PlaybookStepRun
+from .ops_provider import report_problem
 from .publish import ops_conversation_id
 
 log = logging.getLogger("luna.playbooks.fix_proposals")
@@ -52,6 +53,8 @@ class FixProposalService:
         self._unsub: Any = None
         # keep spawned proposal tasks referenced (asyncio drops weak refs)
         self._tasks: set[asyncio.Task] = set()
+        # 0.31.0 (plans/019): degrade path announced once, not per failure
+        self._ops_fallback_logged = False
 
     def start(self) -> None:
         # background=True: the real work runs in its own task so a blocking
@@ -128,6 +131,12 @@ class FixProposalService:
                     PlaybookFixProposal.status == "open",
                 )
             )).scalars().first()
+            # plans/018 phase 2 / plans/019: "what the playbook does" =
+            # first manifest line, else its description.
+            purpose = (
+                (playbook.manifest or "").strip().splitlines()[:1]
+                or [(playbook.description or "").strip()]
+            )[0].lstrip("# ").strip()
             if existing is not None:
                 # dedupe: one open proposal per (playbook, signature) — a
                 # repeat bumps the count, no second card.
@@ -138,6 +147,20 @@ class FixProposalService:
                 log.info(
                     "fix_proposal.repeat playbook=%s count=%d",
                     playbook.name, existing.failure_count,
+                )
+                # 0.31.0 (plans/019): with plugin-ops installed, repeats are
+                # reported too — plugin-ops owns the counter and refreshes
+                # the evidence to the freshest failure. No-op without it.
+                await report_problem(
+                    self._ctx, self._events,
+                    name=playbook.name,
+                    signature=sig,
+                    display_name=playbook.display_name or playbook.name,
+                    purpose=purpose,
+                    run_id=str(run.id),
+                    version=run.playbook_version,
+                    step_id=step_id,
+                    error=error,
                 )
                 return
             title = f"Fix playbook '{playbook.name}': {step_id or 'run'} failing"
@@ -159,12 +182,7 @@ class FixProposalService:
             proposal_id = proposal.id
             playbook_name = playbook.name
             # plans/018 phase 2: everything the owner-facing card needs, read
-            # while the rows are in hand. "What the playbook does" = first
-            # manifest line, else its description.
-            purpose = (
-                (playbook.manifest or "").strip().splitlines()[:1]
-                or [(playbook.description or "").strip()]
-            )[0].lstrip("# ").strip()
+            # while the rows are in hand.
             card = {
                 "display": playbook.display_name or playbook.name,
                 "purpose": purpose,
@@ -174,6 +192,29 @@ class FixProposalService:
                 "error": (error or "")[:400],
             }
         log.info("fix_proposal.filed playbook=%s id=%s", playbook_name, proposal_id)
+        # 0.31.0 (plans/019): with plugin-ops installed, the problem is
+        # reported to the ops ledger — plugin-ops owns the diagnose wake, the
+        # plan card, and the ops-chat state. No fix-proposal card, no state
+        # flip, no wake from here.
+        reported = await report_problem(
+            self._ctx, self._events,
+            name=playbook_name,
+            signature=sig,
+            display_name=card.get("display") or playbook_name,
+            purpose=card.get("purpose") or "",
+            run_id=card.get("run_id") or "",
+            version=card.get("version"),
+            step_id=card.get("step_id") or "",
+            error=card.get("error") or "",
+        )
+        if reported:
+            return
+        if not self._ops_fallback_logged:
+            self._ops_fallback_logged = True
+            log.info(
+                "plugin-ops not installed — filing fix-proposal cards "
+                "(0.30.x behavior)"
+            )
         await self._post_card(proposal_id, playbook_name, title, diagnosis, card)
 
     async def _post_card(

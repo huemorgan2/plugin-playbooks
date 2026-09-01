@@ -37,6 +37,8 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
+from .ops_provider import report_outcome as _ops_report_outcome
+from .ops_provider import scope_refusal as _ops_scope_refusal
 from .publish import (
     announce_publish,
     conversation_state,
@@ -205,6 +207,10 @@ def build_tools(
         manifest: str = "",
         agent_autonomy: str = "agent_must_confirm",
     ) -> str:
+        # 0.31.0 (plans/019): plan-scope gate — a plan_only approval only
+        # covers the targets the owner saw on the card.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         # 0.14.0 (plans/002 phase 7): code is the ONLY authoring format.
         # definition_yaml is still a declared-nowhere kwarg so stale callers
         # get a steering hint instead of a TypeError.
@@ -1227,6 +1233,10 @@ def build_tools(
         forced: bool = False,
         why: str = "",
     ) -> str:
+        # 0.31.0 (plans/019): plan-scope gate before anything, the read
+        # stage included — an out-of-plan edit ticket is wasted work.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         # 0.14.0 (plans/002 phase 7): YAML input removed — steering hint for
         # stale callers instead of a TypeError.
         if definition_yaml:
@@ -1610,6 +1620,9 @@ def build_tools(
 
     # --- playbook_manifest_set (owner approval) ---
     async def _manifest_set(*, name: str, manifest: str, why: str = "") -> str:
+        # 0.31.0 (plans/019): plan-scope gate — the manifest is live content.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
@@ -1819,6 +1832,10 @@ def build_tools(
         only flips live once the owner approves. The gates run under the row
         lock; the wait does not (an owner decision can take hours), so the
         flip re-checks the approved target is still current."""
+        # 0.31.0 (plans/019): plan-scope gate — publishing an out-of-plan
+        # playbook is exactly what a plan_only approval does not cover.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         explanation = (explanation or "").strip()
         if len(explanation) < 80:
             return json.dumps({
@@ -2057,6 +2074,27 @@ def build_tools(
             actor="agent",
             action=action,
             summary=change_summary,
+        )
+        # 0.31.0 (plans/019): a gated publish from the ops chat is the fix
+        # landing — report the outcome so plugin-ops closes the plan and
+        # writes execution_summary.md from these facts. No-op outside an
+        # ops conversation or without plugin-ops.
+        await _ops_report_outcome(
+            ctx, events,
+            name=name,
+            facts={
+                "action": action,
+                "playbook": name,
+                "old_live_version": old_live,
+                "new_live_version": new_live,
+                "evidence_run_id": (
+                    str(evidence_ref.id) if evidence_ref is not None else None
+                ),
+                "gates": [
+                    {"gate": g.get("gate"), "ok": g.get("ok")} for g in gates
+                ],
+                "change_summary": change_summary,
+            },
         )
         rolled_back = action == "rollback"
         return json.dumps({
@@ -2361,6 +2399,9 @@ def build_tools(
         *, name: str, spec_name: str = "", spec_yaml: str = "", specs: str = "",
         version: str = "auto",
     ) -> str:
+        # 0.31.0 (plans/019): plan-scope gate — specs mutate the target too.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         # plans/012 phase 1: one call carries the whole suite. Two forms —
         # single (spec_name + spec_yaml, unchanged) or batch (specs= mapping
         # of spec-name → spec body). Batch upserts everything, then runs the
@@ -2573,6 +2614,9 @@ def build_tools(
     async def _spec_delete(
         *, name: str, spec_name: str, version: str = "auto", why: str = "",
     ) -> str:
+        # 0.31.0 (plans/019): plan-scope gate — specs mutate the target too.
+        if scope := await _ops_scope_refusal(ctx, name):
+            return scope
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
