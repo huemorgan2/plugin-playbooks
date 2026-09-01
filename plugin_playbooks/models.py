@@ -263,35 +263,6 @@ class PlaybookProbeResult(Base):
     )
 
 
-class PlaybookDelegation(Base):
-    """0.25.0 (plans/013): a delegated authoring job — one focused background
-    agent turn working on playbooks with its own context. `events` is the
-    live feed the progress card polls (list of {ts, phase, kind, label,
-    detail, ms}); `card_token` is the capability secret baked into the card
-    HTML so the sandboxed iframe (which can send no credentials) may read
-    THIS delegation's status and nothing else."""
-    __tablename__ = "playbook_delegations"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
-    task: Mapped[str] = mapped_column(Text, nullable=False)
-    playbook: Mapped[str] = mapped_column(String(128), default="", nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
-    card_token: Mapped[str] = mapped_column(String(64), nullable=False)
-    conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
-    # the chat card row posted for this delegation (phase 2) — kept so a
-    # follow-up phase can reference/replace it.
-    card_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    events: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    result: Mapped[str | None] = mapped_column(Text, nullable=True)
-    steps_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-
-
 class PlaybookFixProposal(Base):
     """0.26.0 (plans/015, 089 §4): dedupe ledger for production-failure fix
     proposals. One OPEN row per (playbook, failure signature); a repeated

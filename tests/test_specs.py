@@ -49,6 +49,16 @@ async def _noop(**_kw):
     return {"ok": True}
 
 
+class _ChatCtx:
+    """plans/016 phase 2: agent-invoked runs report to their origin chat —
+    real Luna always pins the conversation contextvar for chat turns, so the
+    fixture must too (a run with no chat now refuses implicit sends)."""
+
+    def __init__(self) -> None:
+        import uuid
+        self.current_conversation_id = uuid.uuid4()
+
+
 @pytest.fixture
 async def env():
     engine = create_async_engine("sqlite+aiosqlite://")
@@ -59,6 +69,7 @@ async def env():
         session_factory=sf,
         tool_registry=_Tools(send_chat_message=_Tool(_noop), t=_Tool(_noop)),
         events=_Bus(),
+        context=_ChatCtx(),
     )
     tools = {
         td.name: (td, handler) for td, handler in build_tools(sf, _Bus(), runner)

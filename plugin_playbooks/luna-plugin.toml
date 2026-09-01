@@ -5,7 +5,7 @@ entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_delegations", "playbook_fix_proposals", "playbook_plans", "playbook_app_settings"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_plans", "playbook_app_settings"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -22,7 +22,7 @@ agent edits stream in over the E12 `ui.plugin.event` bridge (`playbook.open`,
 `playbook.patch`, `navigate`), and run/step activity rides the `activity.*`
 SSE feed.
 
-Owns its **ten DB tables via the SDK** (E4 isolated metadata) and binds
+Owns its **DB tables via the SDK** (E4 isolated metadata) and binds
 external trigger sources (cron, webhooks, connector events) through the SDK
 `TriggerSourceRegistry`. Chat messages sent from playbook runs are tagged
 `source=playbook` (E11) for generic badging in core. Imports only `luna_sdk`
@@ -33,8 +33,8 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 28
-tables = 12
+tools = 26
+tables = 11
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
 # agent_tools.build_tools + delegation.build_delegation_tools and pinned by
@@ -194,17 +194,5 @@ risk_level = "low"
 [[tools]]
 name = "playbook_preflight"
 description = "Probe a playbook's external dependencies without side effects."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_agent"
-description = "Delegate a playbook authoring job to a focused background agent with a live progress card."
-policy = "auto_approve"
-risk_level = "medium"
-
-[[tools]]
-name = "playbook_agent_status"
-description = "Check a delegation started by playbook_agent."
 policy = "auto_approve"
 risk_level = "low"

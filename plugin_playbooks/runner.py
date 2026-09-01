@@ -285,21 +285,22 @@ class PlaybookRunner:
 
         # 0.26.0 (plans/015, 089 §1): stamp WHERE this run reports at
         # creation — delivery-time resolution is abolished. Test runs report
-        # to the chat that started them (fallback ops); background live runs
-        # report to ops even when they inherited an origin contextvar (bus
-        # dispatch inside a chat turn must not leak into that chat). The one
-        # deliberate exception: a live run the agent starts inside a chat
-        # ("agent"/subtask triggers) reports where it was asked for.
-        ops_id = await _ops_conversation_id(self._ctx)
+        # to the chat that started them (fallback ops); a live run the agent
+        # starts inside a chat ("agent"/subtask triggers) reports where it
+        # was asked for.
+        # plans/016 phase 2: the ops chat carries exceptions only. A
+        # background live run (trigger/cron) stamps NO report chat — its
+        # send_chat_message steps must name their own conversation (the
+        # runner refuses otherwise, see _run_tool_call).
         chat_invoked = trigger is not None and (
             trigger == "agent" or trigger.startswith("subtask:")
         )
         if is_test:
-            report_to = conversation_id or ops_id
+            report_to = conversation_id or await _ops_conversation_id(self._ctx)
         elif chat_invoked and conversation_id is not None:
             report_to = conversation_id
         else:
-            report_to = ops_id
+            report_to = None
 
         async with self._sf() as session:
             run = PlaybookRun(
@@ -360,13 +361,14 @@ class PlaybookRunner:
 
         definition = PlaybookDef.model_validate(playbook.definition)
         # 0.26.0 (plans/015, 089 §1): the stamped report_to is authoritative
-        # for chat delivery; origin conversation_id is the pre-0.26 fallback.
-        deliver_to = run.report_to or run.conversation_id
+        # for chat delivery. plans/016 phase 2: no origin fallback — a
+        # background live run stamps None and must NOT deliver to a leaked
+        # origin contextvar; _create_run stamps every run that may deliver.
         context = _RunContext(
             run_id=run.id,
             inputs=inputs,
             step_outputs={},
-            conversation_id=deliver_to,
+            conversation_id=run.report_to,
             is_test=run.is_test,
         )
 
@@ -668,6 +670,23 @@ class PlaybookRunner:
                 return {"tool": step.tool, "resolved_args": args, "result": scripted,
                         "stubbed": True, "_dry": True}
             return {"tool": step.tool, "resolved_args": args, "result": {"_dry": True}, "_dry": True}
+        # plans/016 phase 2: the stamped report_to is authoritative for tool
+        # steps too, not just agent steps. A chat send that names no
+        # conversation inherits the run's — and a background live run HAS
+        # none (the ops chat carries exceptions only), so the step must say
+        # where its message goes instead of leaning on core's ops fallback.
+        if step.tool == "send_chat_message" and not args.get("conversation_id"):
+            if ctx.conversation_id is not None:
+                args["conversation_id"] = str(ctx.conversation_id)
+                ctx.step_inputs[step.id] = args
+            elif not ctx.is_test:
+                raise ValueError(
+                    f"Step '{step.id}': this run has no chat to report to — "
+                    "scheduled/background runs no longer deliver to the ops "
+                    "chat. Give the send_chat_message step an explicit "
+                    "conversation_id, or deliver through another channel "
+                    "(email, slack, ...)."
+                )
         try:
             rt = self._tools.get(step.tool)
         except KeyError:
@@ -1070,6 +1089,7 @@ class PlaybookRunner:
                     inputs=ctx.inputs,
                     step_outputs=dict(ctx.step_outputs),
                     conversation_id=ctx.conversation_id,
+                    is_test=ctx.is_test,
                 )
                 child.dry = ctx.dry
                 child.stubs = ctx.stubs

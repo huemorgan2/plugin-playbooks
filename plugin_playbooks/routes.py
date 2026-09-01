@@ -149,64 +149,6 @@ async def serve_ui(path: str):
     return FileResponse(str(target), headers=_NO_CACHE)
 
 
-# ---- Delegation card status (plans/013 phase 2) ----
-# UNAUTHED by design: the chat card lives in an opaque-origin srcdoc iframe —
-# it can send neither the session cookie nor a bearer header. Access is
-# capability-scoped instead: the random per-delegation token minted at
-# creation, baked into that one card's HTML. Read-only, one delegation.
-_CARD_EVENTS_TAIL = 200
-
-
-@ui_router.get("/delegations/{delegation_id}/card")
-async def delegation_card_status(delegation_id: str, token: str = ""):
-    import secrets as _secrets
-
-    from .delegation import _LIVE_FEEDS, waiting_on_owner
-    from .models import PlaybookDelegation
-
-    try:
-        did = uuid.UUID(delegation_id)
-    except ValueError:
-        raise HTTPException(404, "Not found")
-    async with _sf()() as session:
-        row = await session.get(PlaybookDelegation, did)
-    # One 404 for unknown id AND bad token — no token-validity oracle.
-    if row is None or not _secrets.compare_digest(token or "", row.card_token):
-        raise HTTPException(404, "Not found")
-
-    events = row.events or []
-    steps_used = row.steps_used
-    feed = _LIVE_FEEDS.get(did)
-    if feed is not None and row.status == "running":
-        # The in-process feed is fresher than the 1/s-throttled DB flush.
-        events = list(feed.events)
-        steps_used = feed.steps_used
-    payload = {
-        "status": row.status,
-        "playbook": row.playbook or None,
-        "steps_used": steps_used,
-        "started_at": row.started_at.isoformat() if row.started_at else None,
-        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
-        "result": row.result if row.status != "running" else None,
-        "events": events[-_CARD_EVENTS_TAIL:],
-        # Phase 3: parked-on-approval is DERIVED from the feed (a gated call
-        # still unresolved after a few seconds), never a status value.
-        "waiting_for_approval": (
-            waiting_on_owner(events) if row.status == "running" else None
-        ),
-    }
-    return Response(
-        content=json.dumps(payload),
-        media_type="application/json",
-        headers={
-            # The srcdoc iframe fetches from origin "null" — same-origin CORS
-            # never applies. The token IS the access control.
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-store",
-        },
-    )
-
-
 def register_routes(app: Any, ctx: Any) -> None:
     app.include_router(router)
     app.include_router(ui_router)

@@ -1,16 +1,16 @@
 """0.26.0 (plans/015, 089 §4): fix proposals for production failures.
 
 A failed LIVE run (never a test run) produces ONE open fix proposal per
-(playbook, failure signature) — an approval-shaped card in the ops chat via
-the existing approvals machinery (089 contract #7). Repeated identical
-failures update the open proposal's count instead of filing another card.
-Approving the card wakes the ops chat to do the fix through its normal,
-state-gated tools; publishing still goes through the playbook_publish gate.
+(playbook, failure signature) — a ledger row that dedupes repeats and
+counts them. plans/016 phase 2: each new or bumped proposal sends ONE
+muted wake message directly to the ops chat (no bus contract, no approval
+card): what failed, the error, the count. The wake turn investigates and
+fixes right away; the owner's single approval happens at publish, where
+the card shows the plan together with the change (phase 1's plan gate).
 
-On cores without an ops chat or approvals surface the service still records
-proposals in `playbook_fix_proposals` (the ledger doubles as the dedupe
-key), so nothing is lost — the cards appear once the core provides a home
-for them.
+On cores without an ops chat the service still records proposals in
+`playbook_fix_proposals`, so nothing is lost — the failure digest keeps
+surfacing them in the agent's prompt sections.
 """
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import Playbook, PlaybookFixProposal, PlaybookRun, PlaybookStepRun
-from .ops_provider import report_problem
 from .publish import ops_conversation_id
 
 log = logging.getLogger("luna.playbooks.fix_proposals")
@@ -53,12 +52,10 @@ class FixProposalService:
         self._unsub: Any = None
         # keep spawned proposal tasks referenced (asyncio drops weak refs)
         self._tasks: set[asyncio.Task] = set()
-        # 0.31.0 (plans/019): degrade path announced once, not per failure
-        self._ops_fallback_logged = False
 
     def start(self) -> None:
         # background=True: the real work runs in its own task so a blocking
-        # approval card can never stall the emitting run's completion path.
+        # send can never stall the emitting run's completion path.
         self._unsub = self._events.subscribe(
             "playbook.run.completed", self._on_completed, background=True,
         )
@@ -132,56 +129,16 @@ class FixProposalService:
                 )
             )).scalars().first()
             # plans/018 phase 2 / plans/019: "what the playbook does" =
-            # first manifest line, else its description.
-            purpose = (
-                (playbook.manifest or "").strip().splitlines()[:1]
-                or [(playbook.description or "").strip()]
-            )[0].lstrip("# ").strip()
-            if existing is not None:
-                # dedupe: one open proposal per (playbook, signature) — a
-                # repeat bumps the count, no second card.
-                existing.failure_count += 1
-                existing.last_run_id = run.id
-                existing.updated_at = datetime.now(timezone.utc)
-                await session.commit()
-                log.info(
-                    "fix_proposal.repeat playbook=%s count=%d",
-                    playbook.name, existing.failure_count,
-                )
-                # 0.31.0 (plans/019): with plugin-ops installed, repeats are
-                # reported too — plugin-ops owns the counter and refreshes
-                # the evidence to the freshest failure. No-op without it.
-                await report_problem(
-                    self._ctx, self._events,
-                    name=playbook.name,
-                    signature=sig,
-                    display_name=playbook.display_name or playbook.name,
-                    purpose=purpose,
-                    run_id=str(run.id),
-                    version=run.playbook_version,
-                    step_id=step_id,
-                    error=error,
-                )
-                return
-            title = f"Fix playbook '{playbook.name}': {step_id or 'run'} failing"
-            diagnosis = (
-                f"Live run {run.id} of version {run.playbook_version} failed"
-                + (f" at step '{step_id}'" if step_id else "")
-                + (f": {error[:400]}" if error else ".")
-            )
-            proposal = PlaybookFixProposal(
-                playbook_id=playbook.id,
-                signature=sig,
-                title=title,
-                diagnosis=diagnosis,
-                last_run_id=run.id,
-            )
-            session.add(proposal)
-            await session.commit()
-            await session.refresh(proposal)
-            proposal_id = proposal.id
-            playbook_name = playbook.name
-            # plans/018 phase 2: everything the owner-facing card needs, read
+            # first manifest CONTENT line, else its description. A manifest
+            # usually opens with a bare "# Purpose" heading — that's a label,
+            # not the purpose; skip headings and take the first prose line.
+            purpose = (playbook.description or "").strip()
+            for line in (playbook.manifest or "").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    purpose = line
+                    break
+            # plans/016 phase 2: everything the wake message needs, read
             # while the rows are in hand.
             card = {
                 "display": playbook.display_name or playbook.name,
@@ -191,163 +148,112 @@ class FixProposalService:
                 "version": run.playbook_version,
                 "error": (error or "")[:400],
             }
-        log.info("fix_proposal.filed playbook=%s id=%s", playbook_name, proposal_id)
-        # 0.31.0 (plans/019): with plugin-ops installed, the problem is
-        # reported to the ops ledger — plugin-ops owns the diagnose wake, the
-        # plan card, and the ops-chat state. No fix-proposal card, no state
-        # flip, no wake from here.
-        reported = await report_problem(
-            self._ctx, self._events,
-            name=playbook_name,
-            signature=sig,
-            display_name=card.get("display") or playbook_name,
-            purpose=card.get("purpose") or "",
-            run_id=card.get("run_id") or "",
-            version=card.get("version"),
-            step_id=card.get("step_id") or "",
-            error=card.get("error") or "",
-        )
-        if reported:
-            return
-        if not self._ops_fallback_logged:
-            self._ops_fallback_logged = True
-            log.info(
-                "plugin-ops not installed — filing fix-proposal cards "
-                "(0.30.x behavior)"
-            )
-        await self._post_card(proposal_id, playbook_name, title, diagnosis, card)
+            playbook_name = playbook.name
+            if existing is not None:
+                # dedupe: one open proposal per (playbook, signature) — a
+                # repeat bumps the count, no second ledger row.
+                existing.failure_count += 1
+                existing.last_run_id = run.id
+                existing.updated_at = datetime.now(timezone.utc)
+                count = existing.failure_count
+                await session.commit()
+                log.info(
+                    "fix_proposal.repeat playbook=%s count=%d",
+                    playbook_name, count,
+                )
+            else:
+                title = (
+                    f"Fix playbook '{playbook_name}': {step_id or 'run'} failing"
+                )
+                diagnosis = (
+                    f"Live run {run.id} of version {run.playbook_version} failed"
+                    + (f" at step '{step_id}'" if step_id else "")
+                    + (f": {error[:400]}" if error else ".")
+                )
+                proposal = PlaybookFixProposal(
+                    playbook_id=playbook.id,
+                    signature=sig,
+                    title=title,
+                    diagnosis=diagnosis,
+                    last_run_id=run.id,
+                )
+                session.add(proposal)
+                await session.commit()
+                await session.refresh(proposal)
+                count = 1
+                log.info(
+                    "fix_proposal.filed playbook=%s id=%s",
+                    playbook_name, proposal.id,
+                )
+        await self._wake(playbook_name, card, count)
 
-    async def _post_card(
-        self,
-        proposal_id: Any,
-        playbook_name: str,
-        title: str,
-        diagnosis: str,
-        card: dict[str, Any] | None = None,
+    async def _wake(
+        self, playbook_name: str, card: dict[str, Any], count: int,
     ) -> None:
-        """Post the proposal as an approval card in the ops chat. Approval
-        wakes the ops chat to do the fix; denial dismisses the proposal."""
+        """plans/016 phase 2: one muted message to the ops chat per new or
+        bumped proposal — the failure wake. Direct send, no bus contract.
+
+        The wake turn is expected to investigate and fix immediately; the
+        owner's consent lives at the publish approval card (plan + change,
+        phase 1), so the old approve-a-fix-attempt card is gone. The ops
+        chat may still sit in the old diagnose-only 'identify' state from
+        the card era — advance it so the wake turn can actually work; the
+        machine-checked publish gates hold the one approval either way.
+        """
         ctx = self._ctx
+        if ctx is None:
+            return
         ops = await ops_conversation_id(ctx)
-        # plans/018 phase 2: `ctx.approval` RAISES when the engine is unwired
-        # (it is a property, so getattr's default never applies) — and the
-        # outer catch-all used to eat the card silently.
-        approval = None
-        if ctx is not None:
-            try:
-                approval = ctx.approval
-            except Exception:  # noqa: BLE001 — unwired engine: ledger-only path
-                approval = None
-        if ops is None or approval is None:
+        send = getattr(ctx, "send_muted_message", None)
+        if ops is None or send is None:
             # headless test ctx, or a broken ops lookup: ledger row only —
             # surfaced via the failure digest.
             return
-        card = card or {}
+        set_state = getattr(ctx, "set_conversation_state", None)
+        if set_state is not None:
+            try:
+                await set_state(ops, "fix_publish", only_from="identify")
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "fix_proposal.state_advance_failed playbook=%s",
+                    playbook_name,
+                )
         display = card.get("display") or playbook_name
         purpose = card.get("purpose") or ""
         step_id = card.get("step_id") or ""
-        explanation_bits = [
-            f"The **{display}** playbook"
+        times = "once" if count == 1 else f"{count} times"
+        body_lines = [
+            f"The '{display}' playbook"
             + (f" ({purpose})" if purpose else "")
             + " failed on a real run"
             + (f" at the '{step_id}' step" if step_id else "")
-            + ".",
-            "Approving lets me work on a fix right away. Any fix is tested "
-            "first, and nothing goes live without a second approval from "
-            "you. Denying dismisses this proposal.",
+            + f". It has now failed {times}.",
+            f"Run: {card.get('run_id', '?')} (version {card.get('version', '?')})",
+            f"Error: {card.get('error') or 'not recorded'}",
+            "",
+            "Investigate now: playbook_status(run_id) shows the failing "
+            "trace. If a change is needed, write a plan first "
+            "(playbook_plan_write — plain language for the owner), fix the "
+            "candidate, test it for real (playbook_run_candidate), and "
+            "publish — the publish approval card is where the owner decides. "
+            "If nothing should change, say so briefly here instead.",
         ]
-        # dedup keeps the FIRST pending card's presentation — repeats bump
-        # the ledger count, so the card intentionally names no count.
-        presentation = {
-            "eyebrow": "Playbook failing",
-            "headline": f"'{display}' is failing — approve a fix attempt",
-            "explanation": "\n\n".join(explanation_bits),
-            "changes": [{
-                "label": "Failure detail",
-                "kind": "text",
-                "text": (
-                    f"Run: {card.get('run_id', '?')}\n"
-                    f"Version: {card.get('version', '?')}\n"
-                    + (f"Step: {step_id}\n" if step_id else "")
-                    + f"Error: {card.get('error') or 'not recorded'}"
-                ),
-            }],
-        }
         try:
-            result = await approval.request(
-                kind="playbook_fix_proposal",
-                summary=f"{title} — approve to have a fix worked on now.",
-                payload={
-                    "proposal_id": str(proposal_id),
-                    "playbook": playbook_name,
-                    "target_ref": f"playbook:{playbook_name}",
-                },
-                requested_by_plugin="plugin-playbooks",
-                risk_level="medium",
+            await send(
+                f"Playbook failing: {playbook_name}",
+                "\n".join(body_lines),
+                channel="moment",
+                respond=True,
                 conversation_id=ops,
-                presentation=presentation,
+                source="playbooks",
+                # without tools the wake turn cannot diagnose anything.
+                # "all" + the core's state gating scopes it to the ops
+                # chat's mode.
+                tools="all",
+            )
+            log.info(
+                "fix_proposal.wake_sent playbook=%s count=%d",
+                playbook_name, count,
             )
         except Exception:  # noqa: BLE001
-            log.exception("fix_proposal.card_failed playbook=%s", playbook_name)
-            return
-        # 0.30.1: the real ApprovalDecision carries decision="approved" — it
-        # has no `approved` attribute, so the old attr-only read dismissed
-        # every approved card. Accept both shapes.
-        decision = (
-            getattr(result, "decision", None)
-            or (isinstance(result, dict) and result.get("decision"))
-        )
-        approved = bool(
-            decision == "approved"
-            or getattr(result, "approved", None)
-            or (isinstance(result, dict) and result.get("approved"))
-        )
-        async with self._sf() as session:
-            proposal = await session.get(PlaybookFixProposal, proposal_id)
-            if proposal is not None and proposal.status == "open":
-                proposal.status = "approved" if approved else "dismissed"
-                await session.commit()
-        if approved:
-            # 0.30.2 (luna 095): the wake turn inherits the ops chat's STORED
-            # state — in `identify` every mutation tool is absent by mode
-            # gating (tools="all" cannot override it), so the agent woke
-            # unable to fix anything. The owner's approval IS the consent to
-            # leave diagnose-only mode: advance identify → fix_publish, where
-            # the machine-checked publish gate + the playbook's publish
-            # autonomy still hold the promised second approval. only_from
-            # keeps us from downgrading a chat the owner already moved.
-            # Older cores (< 0.91.001) lack the API — degrade visible: the
-            # wake still fires and the agent reports what mode it needs.
-            set_state = getattr(ctx, "set_conversation_state", None)
-            if set_state is not None:
-                try:
-                    await set_state(ops, "fix_publish", only_from="identify")
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "fix_proposal.state_flip_failed playbook=%s",
-                        playbook_name,
-                    )
-            send = getattr(ctx, "send_muted_message", None)
-            if send is None:
-                return
-            try:
-                await send(
-                    f"Approved fix: {playbook_name}",
-                    f"The owner approved fixing playbook '{playbook_name}'.\n"
-                    f"{diagnosis}\n"
-                    "Diagnose and fix it now with the playbook tools "
-                    "available in this chat's current mode. Test the fix "
-                    "(playbook_run_candidate); publishing goes through "
-                    "playbook_publish's test gate.",
-                    channel="moment",
-                    respond=True,
-                    conversation_id=ops,
-                    source="playbooks",
-                    # plans/018 phase 2: without tools the wake turn cannot
-                    # diagnose anything. "all" + the core's state gating
-                    # (kind/state ride into moment turns since luna 0.91)
-                    # scopes it to the ops chat's mode.
-                    tools="all",
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("fix_proposal.wake_failed playbook=%s", playbook_name)
+            log.exception("fix_proposal.wake_failed playbook=%s", playbook_name)

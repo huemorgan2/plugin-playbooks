@@ -228,18 +228,20 @@ async def test_report_to_stamping_rules():
         pb, trigger="agent",
     )
     assert r.report_to == ORIGIN and r.is_test is False
-    # background live run (bus trigger) with a leaked origin → ops, never
-    # the origin chat
+    # plans/016 phase 2: background live runs NEVER report to the ops chat —
+    # a bus trigger with a leaked origin stamps nothing
     r = await _real_runner(sf, _Ctx(origin=ORIGIN))._create_run(
         pb, trigger="some.bus.event",
     )
-    assert r.report_to == OPS
-    # cron/live run, no origin → ops
-    r = await _real_runner(sf, _Ctx())._create_run(pb, trigger="schedule")
-    assert r.report_to == OPS
-    # pre-089 core (no ops chat): NULL — delivery behaves as before 0.26
-    r = await _real_runner(sf, _Ctx(ops=None))._create_run(pb, trigger="schedule")
     assert r.report_to is None
+    # cron/live run, no origin → nothing (send steps must name their chat)
+    r = await _real_runner(sf, _Ctx())._create_run(pb, trigger="schedule")
+    assert r.report_to is None
+    # subtask trigger inside a chat behaves like "agent"
+    r = await _real_runner(sf, _Ctx(origin=ORIGIN))._create_run(
+        pb, trigger="subtask:parent",
+    )
+    assert r.report_to == ORIGIN
     await engine.dispose()
 
 
@@ -454,33 +456,14 @@ def test_failure_signature_stable_across_volatile_details():
     assert a != c       # different failure, different proposal
 
 
-# --- fix proposals: owner-readable card + wake (plans/018 phase 2) ----------
-
-class _CardDecision:
-    """Mirrors the REAL luna ApprovalDecision: it carries decision="approved"
-    and has NO `approved` attribute. 0.30.1: the stub used to expose
-    `.approved`, which hid a live bug — the service read only that attribute
-    and dismissed every approved card on a real Luna."""
-
-    def __init__(self, approved: bool) -> None:
-        self.decision = "approved" if approved else "rejected"
-
-
-class _CardApprovals:
-    def __init__(self, approved: bool) -> None:
-        self.requests: list[dict] = []
-        self._approved = approved
-
-    async def request(self, **kw):
-        self.requests.append(kw)
-        return _CardDecision(self._approved)
-
+# --- fix proposals: failure wake, no card (plans/016 phase 2) ---------------
 
 class _OpsCtx:
-    """Fake core with a wired approval engine and a muted-message surface."""
+    """Fake core: ops chat discovery + muted-message surface + chat modes.
+    plans/016 phase 2: there is NO approval engine here on purpose — the
+    wake must never ask for approval (consent lives at the publish card)."""
 
-    def __init__(self, approved: bool = True, ops=OPS) -> None:
-        self.approval = _CardApprovals(approved)
+    def __init__(self, ops=OPS) -> None:
         self.sent: list[tuple[str, str, dict]] = []
         self.state_flips: list[tuple] = []
         self._ops = ops
@@ -492,36 +475,26 @@ class _OpsCtx:
         self.sent.append((title, body, kw))
 
     async def set_conversation_state(self, cid, state, *, only_from=None):
-        # 0.30.2 (luna 095): record the flip and its ordering vs the wake
         self.state_flips.append((cid, state, only_from, len(self.sent)))
         return True
 
 
 class _OldCoreOpsCtx(_OpsCtx):
-    """A pre-0.91.001 core: no set_conversation_state. The approved path must
-    still wake the ops chat (degrade visible, never break)."""
+    """A pre-0.91.001 core: no set_conversation_state. The wake must still
+    go out, in whatever mode the chat is in (degrade visible, never break)."""
 
     set_conversation_state = None
 
 
-class _UnwiredApprovalCtx:
-    """`ctx.approval` is a PROPERTY on the real PluginContext and RAISES
-    RuntimeError when approvals are unwired — getattr's default never
-    applies. The service must degrade to the ledger row, not lose the
-    proposal."""
-
-    def __init__(self, ops=OPS) -> None:
-        self._ops = ops
-
-    @property
-    def approval(self):
-        raise RuntimeError("approvals engine not wired")
+class _NoChatCtx:
+    """A core without a muted-message surface: the proposal must survive as
+    a ledger row (the failure digest surfaces it), nothing raises."""
 
     async def ops_conversation_id(self):
-        return self._ops
+        return OPS
 
 
-async def _card_env(ctx):
+async def _wake_env(ctx):
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -531,91 +504,89 @@ async def _card_env(ctx):
 
 
 @pytest.mark.asyncio
-async def test_fix_proposal_card_is_owner_readable_and_wakes_with_tools():
-    ctx = _OpsCtx(approved=True)
-    engine, sf, pb, svc = await _card_env(ctx)
+async def test_fix_proposal_wakes_ops_without_approval():
+    ctx = _OpsCtx()
+    engine, sf, pb, svc = await _wake_env(ctx)
     try:
+        # a manifest opening with a bare heading: the wake must show the
+        # first PROSE line as the purpose, never the heading label.
+        async with sf() as s:
+            row = await s.get(Playbook, pb.id)
+            row.manifest = "# Purpose\nGreets the owner.\n\n# Never\n- lie"
+            await s.commit()
         run = await _seed_failed_live_run(sf, pb)
         await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
 
-        assert len(ctx.approval.requests) == 1
-        req = ctx.approval.requests[0]
-        assert req["kind"] == "playbook_fix_proposal"
-        assert req["conversation_id"] == OPS
-        assert req["summary"].count("\n") == 0          # one-line fallback
-        assert req["payload"]["playbook"] == "greeter"
-        assert req["payload"]["target_ref"] == "playbook:greeter"
-
-        pres = req["presentation"]
-        assert pres["eyebrow"] == "Playbook failing"
-        assert pres["headline"] == "'greeter' is failing — approve a fix attempt"
-        assert "says hi" in pres["explanation"]          # what the playbook does
-        assert "'say' step" in pres["explanation"]       # where it failed
-        assert "second approval" in pres["explanation"]  # publish still gated
-        # technical detail lives behind the fold, not in the explanation
-        assert "HTTP 500" not in pres["explanation"]
-        (change,) = pres["changes"]
-        assert change["kind"] == "text" and change["label"] == "Failure detail"
-        assert "HTTP 500 from mail server" in change["text"]
-        assert str(run.id) in change["text"]
-
-        # approval flips the ledger row and wakes the ops chat WITH tools
+        # the ledger row stays OPEN — no card decided anything
         async with sf() as s:
             row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
-        assert row.status == "approved"
+        assert row.status == "open"
+        assert row.failure_count == 1
+
+        # exactly one muted wake, agentic, into the ops chat
         ((title, body, kw),) = ctx.sent
-        assert kw["tools"] == "all"
+        assert title == "Playbook failing: greeter"
         assert kw["conversation_id"] == OPS
         assert kw["channel"] == "moment"
-        assert "greeter" in body
+        assert kw["respond"] is True
+        assert kw["tools"] == "all"
+        assert kw["source"] == "playbooks"
+        # owner-readable: what failed, where, error, count, and steering
+        assert "'greeter'" in body and "Greets the owner." in body
+        assert "Purpose" not in body  # heading labels never leak
+        assert "'say' step" in body
+        assert "failed once" in body
+        assert "HTTP 500 from mail server" in body
+        assert str(run.id) in body
+        assert "playbook_plan_write" in body   # plan before any change
+        assert "publish approval card" in body  # where the owner decides
 
-        # 0.30.2 (luna 095): the approval advances the ops chat out of the
-        # diagnose-only mode BEFORE the wake, guarded so it never downgrades
-        # a chat the owner already moved (only_from="identify").
+        # the ops chat is advanced out of the old diagnose-only mode BEFORE
+        # the wake, guarded so an owner-moved chat is never downgraded.
         ((cid, state, only_from, sent_before),) = ctx.state_flips
         assert (cid, state, only_from) == (OPS, "fix_publish", "identify")
-        assert sent_before == 0  # flip happened before the wake was sent
+        assert sent_before == 0
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_fix_proposal_denied_dismisses_without_wake():
-    ctx = _OpsCtx(approved=False)
-    engine, sf, pb, svc = await _card_env(ctx)
+async def test_fix_proposal_repeat_bumps_count_and_wakes_again():
+    ctx = _OpsCtx()
+    engine, sf, pb, svc = await _wake_env(ctx)
     try:
-        run = await _seed_failed_live_run(sf, pb)
-        await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
+        run1 = await _seed_failed_live_run(sf, pb)
+        run2 = await _seed_failed_live_run(sf, pb)
+        await svc._file_proposal_inner({"run_id": str(run1.id), "status": "failed"})
+        await svc._file_proposal_inner({"run_id": str(run2.id), "status": "failed"})
         async with sf() as s:
             row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
-        assert row.status == "dismissed"
-        assert ctx.sent == []
-        assert ctx.state_flips == []  # denial never touches the chat's mode
+        assert row.status == "open"          # dedupe: still ONE row
+        assert row.failure_count == 2
+        assert row.last_run_id == run2.id
+        assert len(ctx.sent) == 2            # each failure wakes once
+        assert "failed 2 times" in ctx.sent[1][1]
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_fix_proposal_approved_on_old_core_still_wakes():
-    """Pre-0.91.001 cores have no set_conversation_state — the approved path
-    must degrade visible: wake anyway, in whatever mode the chat is in."""
-    ctx = _OldCoreOpsCtx(approved=True)
-    engine, sf, pb, svc = await _card_env(ctx)
+async def test_fix_proposal_wake_on_old_core_without_state_api():
+    ctx = _OldCoreOpsCtx()
+    engine, sf, pb, svc = await _wake_env(ctx)
     try:
         run = await _seed_failed_live_run(sf, pb)
         await svc._file_proposal_inner({"run_id": str(run.id), "status": "failed"})
-        async with sf() as s:
-            row = (await s.execute(select(PlaybookFixProposal))).scalar_one()
-        assert row.status == "approved"
         ((_, _, kw),) = ctx.sent
         assert kw["tools"] == "all"
+        assert ctx.state_flips == []
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_fix_proposal_unwired_approval_property_degrades_to_ledger():
-    engine, sf, pb, svc = await _card_env(_UnwiredApprovalCtx())
+async def test_fix_proposal_no_chat_surface_degrades_to_ledger():
+    engine, sf, pb, svc = await _wake_env(_NoChatCtx())
     try:
         run = await _seed_failed_live_run(sf, pb)
         # must not raise, and the ledger row must survive as "open"

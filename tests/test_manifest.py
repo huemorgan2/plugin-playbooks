@@ -36,7 +36,6 @@ def test_tool_and_table_counts_are_internally_consistent():
 def test_tool_policies():
     tools = {t["name"]: t for t in MANIFEST["tools"]}
     assert tools["playbook_set_autonomy"]["policy"] == "prompt_always"
-    assert tools["playbook_agent"]["risk_level"] == "medium"
 
 
 def test_no_core_imports():

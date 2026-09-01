@@ -203,7 +203,7 @@ step id. EXACT SYNTAX (signatures, loop kwargs, state ops, filters) is one
 call away: `playbook_language_reference` — never guess.
 
 ### THE LOOP — build a playbook like you write code
-Authoring a playbook IS coding. Never run blind:
+Never run blind:
 0. OUTLINE FIRST — write the decomposition as one line per step:
 `id -> kind -> the SINGLE operation`. Self-check: (a) any line with a
 quantifier (each/all/every) MUST be a `loop`; (b) no single step may carry
@@ -217,9 +217,8 @@ two-step ticket flow — see MANIFEST + THE EDIT FLOW below.
 steps STUBBED: proves loops iterate, branches branch, templates resolve — no
 side effects. Tests the CANDIDATE by default. Outputs are SIMULATED: NEVER
 report a dry-run value as a real result. Copy your `steps.<id>.<field>`
-paths from its `references` (the exact template namespace). The `trace`
-per-step `output` key is JUST a trace label — `steps.<id>.output.<field>`
-does not exist.
+paths from its `references`. The trace's per-step `output` key is JUST a
+label — `steps.<id>.output.<field>` does not exist.
 4. RUN: `playbook_run(name, inputs)` for real. Runs execute in the
 background: on status 'running', poll `playbook_status(run_id)` until
 'done'/'failed'. Never re-run a 'running' playbook, never invent results.
@@ -229,7 +228,7 @@ outputs (your stack trace). Fix and repeat.
 ### THE POINT: turn a prompt into a process
 A playbook's value is DECOMPOSITION — small, visible, reusable steps with
 structured data flowing between them. The whole task in ONE agent() prompt
-is a prompt wearing a playbook costume. Don't.
+is NOT a playbook.
 
 ### AGENT DECIDES, THE WORKFLOW WORKS
 An `agent()` step is a DECISION node — a judgment needing tools or memory
@@ -276,8 +275,8 @@ report = llm(
 )
 notify = tool('send_chat_message', message='{{ steps.report.report }}')
 ```
-Each step is inspectable, `classify` is reusable, the data between steps is
-typed. THAT is a playbook.
+Each step is inspectable and the data between steps is typed. THAT is a
+playbook.
 
 ### SYNTAX ESSENTIALS (full rules: playbook_language_reference)
 - FIRST statement: the `playbook(...)` header — `name=` (required),
@@ -301,8 +300,7 @@ never a Python method.
 The #1 way a playbook fails is dumping a big collection into ONE model call.
 To process N items: LOOP, judge ONE per iteration with `llm()`, emit a SMALL
 structured result, `collect=` it, operate on the reduced set. NEVER
-interpolate a whole collection into one prompt. The validator warns; treat
-it as a redesign signal.
+interpolate a whole collection into one prompt.
 
 ### REFERENCE SHAPES — or the run fails LOUD
 - `tool()` output is wrapped: `steps.<id>.result.<field>`.
@@ -345,7 +343,7 @@ crawl = loop(
     ],
 )
 ```
-Swap pop_front→pop_back for DFS. `visited` makes it cycle-safe;
+Swap pop_front→pop_back for DFS. `visited` is the cycle guard;
 `max_iterations` bounds it (ALWAYS set it on a while_ loop, and mutate a
 `vars.*` each iteration or it runs to the cap). PREFER `concurrency=4` on a
 side-effect-free `over=` loop body — but never mutate shared state in a
@@ -387,7 +385,6 @@ the spec updated.
 a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
 - BATCH: ALL the specs you intend to add go in ONE
 `playbook_spec_add(name, specs=...)` call (YAML mapping of name → body).
-One call per spec wastes the owner's time.
 - `playbook_spec_run` runs all specs; `playbook_spec_list` shows last
 results. No specs = no safety net — after meaningful changes, propose
 pinning one from a good run.
@@ -398,8 +395,8 @@ fail on harmless changes.
 Specs stub the outside world; `playbook_preflight(name)` probes every tool
 the playbook touches: `ok`, `unprobeable` (no probe declared — common, NOT
 an error), `failed` (missing tool, dead credential, gone resource — blocks
-publish). Run it when a playbook misbehaves despite passing specs, or before publishing external-service
-playbooks.
+publish). Run it when a playbook misbehaves despite passing specs, or before
+publishing external-service playbooks.
 
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
 A new requirement ('for EACH job role, first search LinkedIn') is almost
@@ -411,11 +408,14 @@ work) → validate → dry_run → fix any failed specs → publish. Never creat
 '-v2' copy — edit IN PLACE by name.
 
 ### Posting to the chat from a playbook:
-Steps CAN post live into the conversation the run started from:
-`tool('send_chat_message', message='...')`. An `llm()`/`agent()` output is
-only stored on the run record — if the owner should SEE it, a later
-send_chat_message must pass it on. NEVER invent tool names — unknown tools
-are rejected at authoring time.
+`tool('send_chat_message', message='...')` posts live into a chat. An
+`llm()`/`agent()` output is only stored on the run record — a later
+send_chat_message must pass it on for the owner to SEE it. Chat-started
+and test runs deliver to their own chat automatically; a TRIGGERED or
+SCHEDULED run has NO chat — its send must pass an explicit
+`conversation_id` (or deliver via email/slack), else the step fails. Never
+dump routine run output into the ops chat. NEVER invent tool names —
+unknown tools are rejected at authoring time.
 '''
 
 
@@ -551,66 +551,6 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
     return "\n".join(lines)
 
 
-# 0.25.0 (plans/013): the delegation tools get their OWN small skill — gating
-# them behind playbook-authoring would drag the ~12KB skill body into the MAIN
-# conversation just to unlock the tool, defeating the context-hygiene point.
-# The delegate itself receives the full authoring skill in ITS context.
-_DELEGATION_SKILL_BODY = '''\
-# Delegating playbook work
-
-`playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
-authoring job (create, fix, edit, add specs) to a focused background agent.
-It runs the full loop — read, edit, validate, dry-run, specs, publish — in
-its own context; your conversation keeps one tool call and one short result.
-
-## When to delegate vs. do it yourself
-
-Delegate the moment a job needs the authoring loop: creating a playbook,
-fixing a failing one, changing steps, adding or repairing specs. Load
-`playbook-authoring` and work inline only when the owner explicitly wants
-to build it together step by step, or the change is trivial and you already
-have the skill loaded this conversation.
-
-For an EDIT or FIX job, confirm the target exists first (`playbook_list`,
-one cheap call). If nothing matches the owner's name, say so and offer to
-create it — never delegate an edit against nothing.
-
-Two requests that are NOT authoring:
-- "never run it on your own" / "always ask me first" sets the RUN GATE,
-  it is not a fact to remember. BAD: memory_remember("must ask first") —
-  a note no gate ever reads. GOOD: playbook_set_autonomy(name,
-  "agent_must_confirm") — now the run itself asks.
-- "undo that change / put it back" is a rollback job — delegate it naming
-  the playbook; the delegate restores the previous live version.
-
-## Phrasing the task
-
-Write the task like a work order: goal + constraints + acceptance. Name the
-playbook for edit/fix jobs. Include what the owner told you (desired
-behavior, examples, the failing run's symptom). Good:
-"Fix the phone format in candidate-intake: numbers must normalize to
-E.164; all specs must pass; publish when green."
-Spell collection jobs as loops — "for each unread email ..." — so the
-delegate builds a loop.
-
-## After calling
-
-A live progress card appears in the chat. `running` means NOT done —
-nothing is created or published yet. Reply with ONE sentence naming the
-playbook and the change underway, then END YOUR TURN.
-BAD: "Playbook crm-import created and published — ready to use." (false —
-status was still running)
-GOOD: "The crm-import build is underway — the card tracks it; I'll
-confirm once it's live."
-Never poll after launching — but when a LATER owner message needs the
-result (they ask to change or run a playbook you were still building),
-check `playbook_agent_status` first instead of guessing. When the result
-carries a report (done / failed / needs_owner), relay it in owner words.
-Approval cards mid-delegation are the delegate asking — the owner just
-approves or declines.
-'''
-
-
 class PlaybooksPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-playbooks",
@@ -635,13 +575,10 @@ class PlaybooksPlugin(LunaPlugin):
             SkillDef(
                 name="playbook-authoring",
                 description=(
-                    "how to build, edit, and debug playbooks INLINE, in this "
-                    "conversation — load only when the owner asked to work "
-                    "through the playbook together step by step (or told you "
-                    "not to hand it off); for any other create/fix/change job "
-                    "load playbook-delegation instead. The authoring tools "
-                    "(propose, edit, validate, dry_run, …) unlock on your "
-                    "next turn"
+                    "how to build, edit, and debug playbooks — load it "
+                    "whenever the owner wants a playbook created, fixed, or "
+                    "changed. The authoring tools (propose, edit, validate, "
+                    "dry_run, …) unlock on your next turn"
                 ),
                 body=_AUTHORING_SKILL_BODY,
                 tools=[
@@ -664,25 +601,6 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_spec_from_run",
                     "playbook_preflight",
                     "playbook_language_reference",
-                ],
-            ),
-            # 0.25.0 (plans/013): small skill, big tool — see
-            # _DELEGATION_SKILL_BODY for why this is not in playbook-authoring.
-            SkillDef(
-                name="playbook-delegation",
-                description=(
-                    "hand playbook work to a focused background agent with a "
-                    "live progress card — the DEFAULT whenever the owner wants "
-                    "a playbook created, fixed, or changed (it keeps this "
-                    "conversation small); load playbook-authoring instead only "
-                    "when the owner asked to build it together step by step. "
-                    "playbook_agent unlocks on your next turn"
-                ),
-                body=_DELEGATION_SKILL_BODY,
-                tools=[
-                    "playbook_agent",
-                    "playbook_agent_status",
-                    "playbook_set_autonomy",
                 ],
             ),
         ],
@@ -797,19 +715,6 @@ class PlaybooksPlugin(LunaPlugin):
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: fix-proposal service failed to start: %s", e)
 
-        # 0.25.0 (plans/013): delegation tools + restart hygiene for rows a
-        # dead process left at "running". Never block the load on the sweep.
-        from .delegation import build_delegation_tools, sweep_orphaned_delegations
-
-        for tool_def, handler in build_delegation_tools(
-            ctx, ctx.db_session_factory, self.AUTHORING_TOOLS,
-        ):
-            self._register_tool(ctx, tool_def, handler)
-        try:
-            await sweep_orphaned_delegations(ctx.db_session_factory)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("playbooks: orphan-delegation sweep failed: %s", e)
-
         self._register_trigger_tools(ctx)
 
         self._trigger_service = PlaybookTriggerService(
@@ -874,21 +779,9 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_language_reference",
     )
 
-    # 0.25.0 (plans/013): gated by the playbook-delegation skill (its own
-    # small SkillDef, NOT playbook-authoring — see _DELEGATION_SKILL_BODY).
-    # Both are chat-only surfaces; the degrade-visible rule for muted turns
-    # does not apply.
-    DELEGATION_TOOLS = (
-        "playbook_agent",
-        "playbook_agent_status",
-    )
-
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:
         if (
-            (
-                tool_def.name in self.AUTHORING_TOOLS
-                or tool_def.name in self.DELEGATION_TOOLS
-            )
+            tool_def.name in self.AUTHORING_TOOLS
             and getattr(ctx, "skill_registry", None) is not None
         ):
             try:
@@ -1081,8 +974,10 @@ class PlaybooksPlugin(LunaPlugin):
             "**Chat delivery**: playbook steps run in the background; an "
             "llm_step/agent_step's output goes to the run record, not the user. "
             "To surface something in the chat, a step must call the "
-            "`send_chat_message` tool — live runs report into the ops chat, "
-            "test runs into the chat that started them.",
+            "`send_chat_message` tool — chat-started and test runs deliver "
+            "to the chat they started from; a triggered/scheduled run must "
+            "name its conversation_id explicitly or the step fails (the ops "
+            "chat carries exceptions only, never routine run output).",
         ]
 
         sections.append("\n".join(lines))
