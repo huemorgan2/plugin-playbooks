@@ -403,8 +403,11 @@ def test_delegation_tools_are_skill_gated_and_chat_only(env):
     assert set(PlaybooksPlugin.DELEGATION_TOOLS) == set(by_name)
     skill = next(s for s in PlaybooksPlugin.manifest.skills
                  if s.name == "playbook-delegation")
-    assert set(skill.tools) == set(by_name)
-    assert len(skill.body) < 2048  # the point: a SMALL unlock, not 12KB
+    # 0.31.2: the skill also unlocks playbook_set_autonomy (registered by
+    # the authoring module) — "never run it on your own" must land as an
+    # autonomy setting even when only the delegation skill is loaded.
+    assert set(skill.tools) == set(by_name) | {"playbook_set_autonomy"}
+    assert len(skill.body) < 2560  # the point: a SMALL unlock, not 12KB
 
 
 def test_skill_descriptions_steer_playbook_jobs_to_delegation():

@@ -435,8 +435,12 @@ def _delegation_payload(row: PlaybookDelegation, *, for_status_tool: bool) -> di
         else:
             payload["message"] = (
                 "The delegate is working in the background; a progress card in "
-                "the chat tracks it live. Tell the owner the card shows the "
-                "progress, then END YOUR TURN. Do not poll playbook_agent_status "
+                "the chat tracks it live. Status 'running' means NOTHING is "
+                "created, edited, or published yet — never tell the owner the "
+                "playbook is created/ready/live. Reply with ONE sentence that "
+                "names the playbook and the change underway (e.g. \"the "
+                "crm-import playbook build is underway — the card below tracks "
+                "it\"), then END YOUR TURN. Do not poll playbook_agent_status "
                 "unless the owner asks later."
             )
     elif row.status in ("done", "failed", "needs_owner"):
@@ -476,8 +480,10 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                 )).scalar_one_or_none()
             if pb is None:
                 return json.dumps({
-                    "error": f"Playbook '{playbook}' not found. Pass an "
-                    "existing name, or omit `playbook` for a from-scratch job."
+                    "error": f"Playbook '{playbook}' not found. Tell the "
+                    "owner it doesn't exist and offer to create it — only "
+                    "delegate a from-scratch job (omit `playbook`) after "
+                    "they say yes."
                 })
 
         conversation_id = ctx.current_conversation_id

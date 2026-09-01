@@ -571,6 +571,16 @@ fixing a failing one, changing steps, adding or repairing specs. Load
 to build it together step by step, or the change is trivial and you already
 have the skill loaded this conversation.
 
+For an EDIT or FIX job, confirm the target exists first (`playbook_list`,
+one cheap call). If nothing matches the owner's name, say so and offer to
+create it — never delegate an edit against nothing.
+
+Two requests that are NOT authoring: a rule about WHEN a playbook may run
+("never run it on your own", "always ask me first") is an autonomy
+setting — call `playbook_set_autonomy`, a memory note enforces nothing.
+"Undo that change / put it back" is a rollback job — delegate it naming
+the playbook; the delegate restores the previous live version.
+
 ## Phrasing the task
 
 Write the task like a work order: goal + constraints + acceptance. Name the
@@ -581,12 +591,19 @@ E.164; all specs must pass; publish when green."
 
 ## After calling
 
-A live progress card appears in the chat. If the result says `running`,
-tell the owner the card below tracks the work, then END YOUR TURN. Do not
-poll `playbook_agent_status` — use it only if the owner asks later. When
-the result carries a report (done / failed / needs_owner), relay it in
-owner words. Approval cards (e.g. publish) may appear mid-delegation —
-they are the delegate asking; the owner just approves or declines.
+A live progress card appears in the chat. `running` means NOT done —
+nothing is created or published yet. Reply with ONE sentence naming the
+playbook and the change underway, then END YOUR TURN.
+BAD: "Playbook crm-import created and published — ready to use." (false —
+status was still running)
+GOOD: "The crm-import build is underway — the card tracks it; I'll
+confirm once it's live."
+Never poll after launching — but when a LATER owner message needs the
+result (they ask to change or run a playbook you were still building),
+check `playbook_agent_status` first instead of guessing. When the result
+carries a report (done / failed / needs_owner), relay it in owner words.
+Approval cards mid-delegation are the delegate asking — the owner just
+approves or declines.
 '''
 
 
@@ -595,7 +612,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.31.1",
+        version="0.31.2",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -661,6 +678,7 @@ class PlaybooksPlugin(LunaPlugin):
                 tools=[
                     "playbook_agent",
                     "playbook_agent_status",
+                    "playbook_set_autonomy",
                 ],
             ),
         ],
