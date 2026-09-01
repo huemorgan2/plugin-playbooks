@@ -1076,6 +1076,11 @@ class PromoteBody(BaseModel):
     version: int | None = None
     # plans/016 phase 1: every playbook change runs under a plan.
     plan_id: str | None = None
+    # plans/016 phase 3: the owner's "Promote anyway" — their own click is
+    # the consent, so this skips ONLY the test-run gate for THIS call.
+    # Plan gate, static validation, specs and probes still hold. Recorded
+    # in the plan's outcome facts.
+    force_test_run: bool = False
 
 
 def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: bool) -> None:
@@ -1167,10 +1172,12 @@ async def promote_version(name: str, body: PromoteBody):
 
         # 0.26.0 (plans/015, 089 contract #8): test-run gate — same rule as
         # the playbook_publish tool, so no code path skips it. Restores accept
-        # the version's live history as evidence.
+        # the version's live history as evidence. plans/016 phase 3: the
+        # owner's "Promote anyway" click skips this one gate for this call.
         _gate, refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at,
-            include_live=not candidate, require=p.publish_require_run,
+            include_live=not candidate,
+            require=p.publish_require_run and not body.force_test_run,
         )
         if refusal is not None:
             raise HTTPException(422, json.loads(refusal))
@@ -1195,14 +1202,17 @@ async def promote_version(name: str, body: PromoteBody):
 
         await session.commit()
         # plans/016 phase 1: code-stamp the publish outcome onto the plan.
-        await _plan_stamp_outcome(session, plan_id, {
+        facts = {
             "action": "promote" if candidate else "restore",
             "playbook": name,
             "old_live_version": old_live,
             "new_live_version": target_n,
             "evidence_run_id": str(evidence.id) if evidence else None,
             "actor": "owner",
-        })
+        }
+        if body.force_test_run:
+            facts["test_run_forced"] = True
+        await _plan_stamp_outcome(session, plan_id, facts)
         result = {
             "name": name,
             "live_version": target_n,

@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { subscribePlaybookEvents } from '../lib/events'
-import { playbooksApi } from './api'
+import { playbooksApi, PUBLISHABLE_PLAN_STATUSES, type PlanBrief } from './api'
 import { applyPlaybookPatch, type PlaybookPatchEvt } from './livePatch'
 import { findStepById } from './explain/dataflow'
 import { VersionCanvas, CodeView, sourceFor } from './VersionCanvas'
@@ -61,6 +61,19 @@ export function promoteRefusalMessage(err: unknown): string {
     } catch { /* fall through */ }
   }
   return raw
+}
+
+/** Which gate refused, when the 422 body names one. */
+export function promoteRefusalGate(err: unknown): string | null {
+  const raw = err instanceof Error ? err.message : String(err)
+  const jsonStart = raw.indexOf('{')
+  if (jsonStart >= 0) {
+    try {
+      const body = JSON.parse(raw.slice(jsonStart))
+      return (body.detail ?? body)?.gate ?? null
+    } catch { /* fall through */ }
+  }
+  return null
 }
 
 function fmtAbsolute(iso: string): string {
@@ -138,6 +151,12 @@ export function VersionsTab({
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
   const [promoting, setPromoting] = useState(false)
   const [promoteError, setPromoteError] = useState<string | null>(null)
+  // plans/016 phase 3: every promote carries a plan. The Promote click opens
+  // a picker over publishable plans; a test_run refusal offers Promote anyway
+  // (the owner's own click is the consent).
+  const [planPickerOpen, setPlanPickerOpen] = useState(false)
+  const [planOptions, setPlanOptions] = useState<PlanBrief[] | null>(null)
+  const [forceOffer, setForceOffer] = useState<string | null>(null) // plan_id to retry with
   // Live agent edits applied on top of the fetched definition (with glow).
   const [patchedDef, setPatchedDef] = useState<PlaybookDef | null>(null)
   const [glow, setGlow] = useState<Map<string, number>>(new Map())
@@ -214,6 +233,8 @@ export function VersionsTab({
     setSelected(n)
     setRunDetail(null)
     setPromoteError(null)
+    setForceOffer(null)
+    setPlanPickerOpen(false)
   }, [selected])
 
   const loadRun = useCallback(async (runId: string, { switchView = true } = {}) => {
@@ -261,18 +282,38 @@ export function VersionsTab({
     return () => clearTimeout(t)
   }, [runDetail, refreshRunStatuses])
 
-  const handlePromote = async () => {
+  const openPlanPicker = () => {
+    if (!detail || promoting) return
+    setPromoteError(null)
+    setForceOffer(null)
+    setPlanPickerOpen(true)
+    setPlanOptions(null)
+    playbooksApi.listPlans()
+      .then((r) => {
+        const usable = r.plans.filter((p) => PUBLISHABLE_PLAN_STATUSES.includes(p.status))
+        // Plans naming THIS playbook first; the server already sorts newest first.
+        usable.sort((a, b) =>
+          Number(b.playbook_refs.includes(name)) - Number(a.playbook_refs.includes(name)))
+        setPlanOptions(usable)
+      })
+      .catch(() => setPlanOptions([]))
+  }
+
+  const promoteWithPlan = async (planId: string, forceTestRun = false) => {
     if (!detail || promoting) return
     setPromoting(true)
     setPromoteError(null)
+    setForceOffer(null)
+    setPlanPickerOpen(false)
     try {
       const n = detail.version
-      if (detail.candidate) await playbooksApi.promoteCandidate(name)
-      else await playbooksApi.promoteVersion(name, n)
+      if (detail.candidate) await playbooksApi.promoteCandidate(name, planId, forceTestRun)
+      else await playbooksApi.promoteVersion(name, n, planId, forceTestRun)
       setSelected(n)
       onPromoted(n)
     } catch (e) {
       setPromoteError(promoteRefusalMessage(e))
+      if (!forceTestRun && promoteRefusalGate(e) === 'test_run') setForceOffer(planId)
     } finally {
       setPromoting(false)
     }
@@ -307,20 +348,70 @@ export function VersionsTab({
             {isLive ? (
               <LiveBadge className="px-2.5 py-1 text-[11px]" />
             ) : (
-              <button
-                onClick={handlePromote}
-                disabled={promoting || redSpecs > 0}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium transition whitespace-nowrap"
-                title={redSpecs > 0
-                  ? `${redSpecs} of this version's tests ${redSpecs === 1 ? 'is' : 'are'} red — fix or re-run them first (Tests view)`
-                  : detail.candidate
-                    ? 'Run the gates (tests, tool checks) and make this candidate live'
-                    : 'Make this version live again'}
-                data-testid="promote-btn"
-              >
-                {promoting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
-                Promote to live
-              </button>
+              <div className="relative">
+                <button
+                  onClick={openPlanPicker}
+                  disabled={promoting || redSpecs > 0}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium transition whitespace-nowrap"
+                  title={redSpecs > 0
+                    ? `${redSpecs} of this version's tests ${redSpecs === 1 ? 'is' : 'are'} red — fix or re-run them first (Tests view)`
+                    : detail.candidate
+                      ? 'Run the gates (tests, tool checks) and make this candidate live'
+                      : 'Make this version live again'}
+                  data-testid="promote-btn"
+                >
+                  {promoting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
+                  Promote to live
+                </button>
+                {planPickerOpen && (
+                  <div
+                    className="absolute right-0 top-full mt-1.5 w-[320px] z-20 rounded-lg border border-white/10 bg-ink-900 shadow-xl p-3"
+                    data-testid="plan-picker"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] uppercase tracking-[0.16em] text-ink-500">
+                        Which plan is this for?
+                      </span>
+                      <button
+                        onClick={() => setPlanPickerOpen(false)}
+                        className="p-0.5 rounded hover:bg-white/10 text-ink-500 hover:text-ink-200 transition"
+                        title="Cancel"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                    {planOptions === null ? (
+                      <div className="flex justify-center py-4">
+                        <Loader2 className="w-4 h-4 animate-spin text-ink-500" />
+                      </div>
+                    ) : planOptions.length === 0 ? (
+                      <p className="text-xs text-ink-400" data-testid="plan-picker-empty">
+                        No open plan covers this change. Ask {agentName} in chat to
+                        write one — every playbook change needs a plan you can read.
+                      </p>
+                    ) : (
+                      <div className="space-y-1 max-h-64 overflow-y-auto">
+                        {planOptions.map((p) => (
+                          <button
+                            key={p.plan_id}
+                            onClick={() => void promoteWithPlan(p.plan_id)}
+                            className="w-full text-left rounded-md px-2.5 py-2 hover:bg-white/[.05] transition"
+                            data-testid={`plan-option-${p.plan_id}`}
+                          >
+                            <span className="text-xs font-medium text-ink-100 block truncate">
+                              {p.title}
+                            </span>
+                            <span className="text-[10px] text-ink-500">
+                              {p.playbook_refs.includes(name) ? `${name} · ` : ''}
+                              {p.created_at ? timeAgo(p.created_at) : ''}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
             </div>
             {/* Row 2: view tabs, left-aligned */}
@@ -350,8 +441,19 @@ export function VersionsTab({
             data-testid="promote-error"
           >
             <p className="text-xs text-rose-300 flex-1">{promoteError}</p>
+            {forceOffer && (
+              <button
+                onClick={() => void promoteWithPlan(forceOffer, true)}
+                disabled={promoting}
+                className="shrink-0 px-2.5 py-1 rounded-md border border-rose-400/40 text-rose-200 hover:bg-rose-500/15 disabled:opacity-40 text-[11px] font-medium transition whitespace-nowrap"
+                title="Skip the test-run check just this once — everything else was checked"
+                data-testid="promote-anyway-btn"
+              >
+                Promote anyway
+              </button>
+            )}
             <button
-              onClick={() => setPromoteError(null)}
+              onClick={() => { setPromoteError(null); setForceOffer(null) }}
               className="p-0.5 rounded hover:bg-white/10 text-rose-400/70 hover:text-rose-200 transition"
               title="Dismiss"
             >

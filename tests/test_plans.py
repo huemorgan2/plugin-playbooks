@@ -409,6 +409,97 @@ async def test_promote_route_requires_a_plan(route_env):
     assert row.outcome_facts[0]["actor"] == "owner"
 
 
+async def _seed_candidate(sf) -> None:
+    """v1 live, v2 pending candidate, NO runs of v2 (test_run gate red)."""
+    async with sf() as s:
+        pb = Playbook(
+            name="greeter", display_name="greeter", description="says hi",
+            definition=_defn(1), version=2, live_version=1,
+            candidate_version=2, status="enabled",
+        )
+        s.add(pb)
+        await s.flush()
+        for n in (1, 2):
+            s.add(PlaybookVersion(
+                playbook_id=pb.id, version=n, definition=_defn(n),
+                author="agent", message="edit",
+                created_at=NOW - timedelta(days=1),
+            ))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_promote_candidate_test_run_refusal_names_simulations(route_env):
+    sf, client = route_env
+    await _seed_candidate(sf)
+    pid = await seed_plan(sf)
+
+    r = await client.post(
+        f"{BASE}/playbooks/greeter/promote", json={"plan_id": pid},
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["gate"] == "test_run"
+    assert "simulations" in detail["error"]
+    assert "playbook_run_candidate" in detail["hint"]
+
+
+@pytest.mark.asyncio
+async def test_promote_anyway_skips_only_the_test_run_gate(route_env):
+    sf, client = route_env
+    await _seed_candidate(sf)
+
+    # force does NOT skip the plan gate
+    r = await client.post(
+        f"{BASE}/playbooks/greeter/promote", json={"force_test_run": True},
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["gate"] == "plan_required"
+
+    pid = await seed_plan(sf)
+    r = await client.post(
+        f"{BASE}/playbooks/greeter/promote",
+        json={"plan_id": pid, "force_test_run": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["live_version"] == 2
+
+    async with sf() as s:
+        row = (await s.execute(
+            select(PlaybookPlan).where(PlaybookPlan.id == uuid.UUID(pid))
+        )).scalar_one()
+    fact = row.outcome_facts[0]
+    assert fact["action"] == "promote"
+    assert fact["test_run_forced"] is True
+    assert fact["evidence_run_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_promote_anyway_still_refuses_invalid_candidate(route_env):
+    sf, client = route_env
+    await _seed_candidate(sf)
+    async with sf() as s:
+        pb = (await s.execute(select(Playbook))).scalar_one()
+        cand = (await s.execute(
+            select(PlaybookVersion).where(
+                PlaybookVersion.playbook_id == pb.id,
+                PlaybookVersion.version == 2,
+            )
+        )).scalar_one()
+        bad = dict(cand.definition)
+        bad["steps"] = [{"id": "say", "kind": "tool_call"}]  # no tool
+        cand.definition = bad
+        await s.commit()
+
+    pid = await seed_plan(sf)
+    r = await client.post(
+        f"{BASE}/playbooks/greeter/promote",
+        json={"plan_id": pid, "force_test_run": True},
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["gate"] == "static_validation"
+
+
 @pytest.mark.asyncio
 async def test_settings_routes_toggle_full_power(route_env):
     _, client = route_env

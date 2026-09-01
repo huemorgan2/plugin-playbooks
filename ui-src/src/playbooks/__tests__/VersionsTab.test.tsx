@@ -4,11 +4,13 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import type { PlaybookDef, VersionDetail } from '../types'
 
 vi.mock('../api', () => ({
+  PUBLISHABLE_PLAN_STATUSES: ['proposed', 'approved'],
   playbooksApi: {
     listVersions: vi.fn(),
     getVersion: vi.fn(),
     promoteVersion: vi.fn(),
     promoteCandidate: vi.fn(),
+    listPlans: vi.fn(),
     listRuns: vi.fn().mockResolvedValue([]),
     getRun: vi.fn(),
   },
@@ -22,9 +24,22 @@ vi.mock('../TestsTab', () => ({ TestsTab: () => <div data-testid="tests-tab" /> 
 vi.mock('../RunsTab', () => ({ RunsTab: () => <div data-testid="runs-tab" /> }))
 
 import { playbooksApi } from '../api'
-import { VersionsTab, promoteRefusalMessage } from '../VersionsTab'
+import { VersionsTab, promoteRefusalMessage, promoteRefusalGate } from '../VersionsTab'
 
 const api = playbooksApi as unknown as Record<string, ReturnType<typeof vi.fn>>
+
+// plans/016 phase 3: every promote goes through the plan picker.
+const PLAN = {
+  plan_id: 'p-1', title: 'Fix the greeter', status: 'proposed',
+  playbook_refs: ['greeter'], created_at: '2026-08-30T10:00:00Z',
+  updated_at: null, has_execution_summary: false,
+}
+
+async function promoteViaPicker() {
+  fireEvent.click(screen.getByTestId('promote-btn'))
+  await screen.findByTestId('plan-picker')
+  fireEvent.click(await screen.findByTestId('plan-option-p-1'))
+}
 
 beforeAll(() => {
   class RO { observe() {} unobserve() {} disconnect() {} }
@@ -83,6 +98,7 @@ function setup({ candidate = false, redV1 = false, requireSpecs = true }: { cand
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset?.()
   api.listRuns.mockResolvedValue([])
+  api.listPlans.mockResolvedValue({ plans: [PLAN] })
 })
 
 describe('VersionsTab', () => {
@@ -111,10 +127,10 @@ describe('VersionsTab', () => {
     expect(screen.getByTestId('version-row-1').getAttribute('aria-current')).toBe('true')
     const btn = screen.getByTestId('promote-btn')
     expect(btn.textContent).toContain('Promote to live')
-    api.promoteVersion.mockResolvedValue({ name: 'greeter', version: 1, promoted_from: 2, status: 'published' })
-    fireEvent.click(btn)
+    api.promoteVersion.mockResolvedValue({ name: 'greeter', live_version: 1, promoted_from: 2, status: 'promoted' })
+    await promoteViaPicker()
     await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(1))
-    expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1)
+    expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1, 'p-1', false)
     expect(api.promoteCandidate).not.toHaveBeenCalled()
   })
 
@@ -123,10 +139,22 @@ describe('VersionsTab', () => {
     await screen.findByTestId('version-toolbar')
     fireEvent.click(screen.getByTestId('version-row-3'))
     await waitFor(() => expect(screen.getByTestId('toolbar-version').textContent).toBe('v3'))
-    api.promoteCandidate.mockResolvedValue({ name: 'greeter', live_version: 3, promoted_from: 2, status: 'published' })
-    fireEvent.click(screen.getByTestId('promote-btn'))
+    api.promoteCandidate.mockResolvedValue({ name: 'greeter', live_version: 3, promoted_from: 2, status: 'promoted' })
+    await promoteViaPicker()
     await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(3))
-    expect(api.promoteCandidate).toHaveBeenCalledWith('greeter')
+    expect(api.promoteCandidate).toHaveBeenCalledWith('greeter', 'p-1', false)
+    expect(api.promoteVersion).not.toHaveBeenCalled()
+  })
+
+  it('with no publishable plan the picker says to ask the agent — no dead promote', async () => {
+    api.listPlans.mockResolvedValue({ plans: [{ ...PLAN, status: 'done' }] })
+    setup()
+    await screen.findByTestId('version-toolbar')
+    fireEvent.click(screen.getByTestId('version-row-1'))
+    await screen.findByTestId('promote-btn')
+    fireEvent.click(screen.getByTestId('promote-btn'))
+    const empty = await screen.findByTestId('plan-picker-empty')
+    expect(empty.textContent).toContain('Ask Luna')
     expect(api.promoteVersion).not.toHaveBeenCalled()
   })
 
@@ -138,10 +166,41 @@ describe('VersionsTab', () => {
     api.promoteVersion.mockRejectedValue(new Error(
       '422: {"detail":{"gate":"test_run","error":"version 1 has never completed a run"}}',
     ))
-    fireEvent.click(screen.getByTestId('promote-btn'))
+    await promoteViaPicker()
     const err = await screen.findByTestId('promote-error')
     expect(err.textContent).toContain('never completed a run')
     expect(onPromoted).not.toHaveBeenCalled()
+  })
+
+  // plans/016 phase 3: the owner's own click is the consent — a test_run
+  // refusal offers Promote anyway, which retries with force_test_run.
+  it('a test_run 422 offers Promote anyway; the retry forces only that gate', async () => {
+    const { onPromoted } = setup({ candidate: true })
+    await screen.findByTestId('version-toolbar')
+    fireEvent.click(screen.getByTestId('version-row-3'))
+    await screen.findByTestId('promote-btn')
+    api.promoteCandidate.mockRejectedValueOnce(new Error(
+      '422: {"detail":{"gate":"test_run","error":"specs are dry-run simulations"}}',
+    ))
+    await promoteViaPicker()
+    await screen.findByTestId('promote-error')
+    api.promoteCandidate.mockResolvedValueOnce({ name: 'greeter', live_version: 3, promoted_from: 2, status: 'promoted' })
+    fireEvent.click(screen.getByTestId('promote-anyway-btn'))
+    await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(3))
+    expect(api.promoteCandidate).toHaveBeenLastCalledWith('greeter', 'p-1', true)
+  })
+
+  it('a non-test_run 422 does NOT offer Promote anyway', async () => {
+    setup()
+    await screen.findByTestId('version-toolbar')
+    fireEvent.click(screen.getByTestId('version-row-1'))
+    await screen.findByTestId('promote-btn')
+    api.promoteVersion.mockRejectedValue(new Error(
+      '422: {"detail":{"gate":"plan_required","message":"needs a plan"}}',
+    ))
+    await promoteViaPicker()
+    await screen.findByTestId('promote-error')
+    expect(screen.queryByTestId('promote-anyway-btn')).toBeNull()
   })
 
   it('view switch: Code / Manifest / Tests / Runs render per version', async () => {
@@ -189,5 +248,12 @@ describe('promoteRefusalMessage', () => {
     expect(promoteRefusalMessage(new Error('422: {"detail":{"error":"e"}}'))).toBe('e')
     expect(promoteRefusalMessage(new Error('422: {"detail":{"gate":"specs"}}'))).toContain("'specs'")
     expect(promoteRefusalMessage(new Error('boom'))).toBe('boom')
+  })
+})
+
+describe('promoteRefusalGate', () => {
+  it('extracts the gate name, null otherwise', () => {
+    expect(promoteRefusalGate(new Error('422: {"detail":{"gate":"test_run"}}'))).toBe('test_run')
+    expect(promoteRefusalGate(new Error('boom'))).toBeNull()
   })
 })

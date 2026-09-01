@@ -144,14 +144,18 @@ async def test_run_gate(
             )
         else:
             note = f"version {version} has no test run since its last edit"
+            # plans/016 phase 3: green specs routinely precede this refusal
+            # and read as "all tests pass" — say why they are not enough.
             error = (
                 "Publish refused — gate 'test_run' failed: version "
-                f"{version} has not been tested since its last edit."
+                f"{version} has not had a REAL run since its last edit. "
+                "Passing specs are not run evidence — specs are dry-run "
+                "simulations with tools stubbed."
             )
             hint = (
-                "Run it as a test first — playbook_run_candidate for the "
-                "candidate (real run, real side effects) — and publish "
-                "again once it completes green."
+                "Run the candidate for real once — playbook_run_candidate "
+                "(real tools, real side effects) — and publish again when "
+                "it completes green."
             )
         gate = {"gate": "test_run", "ok": False, "note": note}
         if not require:

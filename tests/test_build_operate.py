@@ -127,7 +127,7 @@ async def test_publish_refused_without_test_run(env):
     await _make_candidate(tools)
     out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert out["gate"] == "test_run"
-    assert "not been tested" in out["error"]
+    assert "simulations" in out["error"]
     assert "playbook_run_candidate" in out["hint"]
     async with sf() as s:
         pb = (await s.execute(select(Playbook))).scalar_one()

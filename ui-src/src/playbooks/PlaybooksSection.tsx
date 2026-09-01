@@ -15,6 +15,7 @@ import { playbooksApi } from './api'
 import { useAgentName } from './agentIdentity'
 import type { PlaybookSummary } from './types'
 import { PlaybookEditor } from './PlaybookEditor'
+import { PlansTab } from './PlansTab'
 import { ToolsGuide } from './ToolsGuide'
 import { setPlaybookConsumerReady } from './liveBus'
 import { applyActivity, runningNames as computeRunning } from './activityPresence'
@@ -22,7 +23,8 @@ import { lastRunLabel, rateLabel } from './runStats'
 import { specsLabel, probesLabel, intentLabel, TONE_TEXT } from './trust'
 
 type SelectedItem = { kind: 'playbook'; name: string } | { kind: 'draft'; id: string }
-type Tab = 'active' | 'archived'
+type Tab = 'active' | 'archived' | 'plans'
+const TAB_LABEL: Record<Tab, string> = { active: 'Active', archived: 'Archived', plans: 'Plans' }
 
 export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (section: string) => void }) {
   const agentName = useAgentName()
@@ -57,6 +59,7 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
   }, [])
 
   const refresh = useCallback(() => {
+    if (tab === 'plans') return // PlansTab fetches its own data
     setLoading(true)
     playbooksApi
       .list(tab)
@@ -182,7 +185,7 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
 
       {/* Tabs */}
       <div className="flex gap-1 px-6 pt-3 pb-1 shrink-0">
-        {(['active', 'archived'] as const).map((t) => (
+        {(['active', 'archived', 'plans'] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -192,14 +195,17 @@ export function PlaybooksSection({ onNavigate: _onNavigate }: { onNavigate?: (se
                 ? 'bg-luna-600/20 text-luna-400'
                 : 'text-ink-500 hover:text-ink-300 hover:bg-white/5',
             )}
+            data-testid={`section-tab-${t}`}
           >
-            {t === 'active' ? 'Active' : 'Archived'}
+            {TAB_LABEL[t]}
           </button>
         ))}
       </div>
 
       {/* List */}
-      {loading ? (
+      {tab === 'plans' ? (
+        <PlansTab agentName={agentName} />
+      ) : loading ? (
         <div className="flex items-center justify-center flex-1 text-ink-400 gap-2">
           <Loader2 className="w-5 h-5 animate-spin" />
           Loading…
