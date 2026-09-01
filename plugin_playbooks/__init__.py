@@ -557,7 +557,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.32.1",
+        version="0.33.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -831,7 +831,7 @@ class PlaybooksPlugin(LunaPlugin):
             ctx,
             ToolDef(
                 name="playbook_list_available_triggers",
-                modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+                modes=["planning", "building"],
                 description=(
                     "List external event triggers a playbook can bind to (from "
                     "connected apps that expose triggers — gmail, slack, github...). "
@@ -855,49 +855,26 @@ class PlaybooksPlugin(LunaPlugin):
             _list_available_triggers,
         )
 
-    # 089 §5: the ops chat's mode, in plain words. Keys are the contract's
-    # state names; the text is what the agent reads.
-    _OPS_MODE_SECTIONS = {
-        "identify": (
-            "## Ops chat — mode: Identify\n"
-            "You are operating, not building. Monitor production playbook "
-            "activity, diagnose failures, and LIST the fixes to be made as "
-            "proposals for the owner to approve — a triage inbox, not a "
-            "passive log. Editing, running, and publishing tools are off in "
-            "this mode; suggest the owner switch the chat to a fix mode "
-            "when they want changes made."
-        ),
-        "fix_approve": (
-            "## Ops chat — mode: Fix & wait for approval\n"
-            "You may edit and test fixes in a playbook's DRAFT (candidate) "
-            "— production is never touched here. When a fix's test run is "
-            "green, post 'fix ready — tests green, publish?' with the "
-            "evidence and WAIT for the owner. The publish tool is absent in "
-            "this mode on purpose: publishing happens only through the "
-            "owner approving your proposal.\n"
-            "The owner is not an engineer. Anything you write for them — "
-            "proposals, `why` arguments, the publish `explanation` — must "
-            "say in everyday language what went wrong and what the fix "
-            "does, and tie back to the failure that started this work. No "
-            "step ids, stack traces, or internal jargon in the summary; "
-            "technical detail belongs in the collapsed section of the card."
-        ),
-        "fix_publish": (
-            "## Ops chat — mode: Fix & publish\n"
-            "You may fix and publish yourself. The publish gate is "
-            "machine-checked and WILL refuse a draft with no green test run "
-            "since its last edit — run the test first "
-            "(playbook_run_candidate) instead of arguing with the gate. "
-            "Playbooks whose publish autonomy is 'ask' still wait for the "
-            "owner's approval even here.\n"
-            "The publish `explanation` is read by the owner, who is not an "
-            "engineer: say what problem was found, what the change does "
-            "about it, and how it was tested — in everyday language, tied "
-            "back to the failure that started this work. One fix, one "
-            "publish, ONE approval card: batch related edits into the "
-            "candidate and publish once, instead of asking per edit."
-        ),
-    }
+    # luna 098: the ops chat has no modes — one section, shown whenever the
+    # current chat is the ops chat. Enforcement lives in the publish gates
+    # (016: plan + green test + one approval card), not in tool hiding.
+    _OPS_SECTION = (
+        "## Ops chat\n"
+        "You are operating, not building: monitor production playbook "
+        "activity, diagnose failures, and fix them. The full toolset is "
+        "available; the machine-checked publish gates do the enforcing — a "
+        "publish needs a plan, a green test run since the draft's last edit "
+        "(playbook_run_candidate), and the owner's approval. Run the test "
+        "first instead of arguing with the gate.\n"
+        "The owner is not an engineer. Anything you write for them — plans, "
+        "`why` arguments, the publish `explanation` — must say in everyday "
+        "language what went wrong, what the change does about it, and how "
+        "it was tested, tied back to the failure that started this work. No "
+        "step ids, stack traces, or internal jargon in the summary; "
+        "technical detail belongs in the collapsed section of the card. One "
+        "fix, one publish, ONE approval card: batch related edits into the "
+        "candidate and publish once, instead of asking per edit."
+    )
 
     async def prompt_sections(self) -> list[str]:
         # 089 contract #6: the shipped base calls this with no args — the
@@ -932,8 +909,8 @@ class PlaybooksPlugin(LunaPlugin):
                 digest = []
 
         sections: list[str] = []
-        if kind == "ops" and (mode := self._OPS_MODE_SECTIONS.get(state or "")):
-            sections.append(mode)
+        if kind == "ops":
+            sections.append(self._OPS_SECTION)
 
         if not rows:
             return sections

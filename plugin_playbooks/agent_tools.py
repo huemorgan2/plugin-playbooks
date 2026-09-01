@@ -344,7 +344,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_propose",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             description=(
                 "Create a new playbook from its FULL source, written all at "
@@ -404,7 +403,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_list",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description="List available playbooks.",
             parameters={
                 "type": "object",
@@ -539,7 +538,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_run",
-            modes=["building", "fix_publish"],
             # NOT chat_only (0.31.1): muted ops wake turns need the run tools
             # (modes are the sole gate — the BUG #3 rule). The 006.707
             # nested-agent recursion this flag used to prevent is handled by
@@ -628,7 +626,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_status",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "Get the live state of a playbook run: overall status "
                 "(running/done/failed/cancelled), timing, and the full "
@@ -654,7 +652,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_cancel",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description="Cancel a running playbook.",
             parameters={
                 "type": "object",
@@ -730,26 +728,28 @@ def build_tools(
             "status": "updated",
         }
         if publish_autonomy == "auto":
-            # plans/015 (089 §3): chat state gates broadly, this refines —
-            # 'auto' is only honored when the ops chat is in fix_publish.
+            # luna 098 removed the ops modes that once honored 'auto'; the
+            # publish gates (plan + green test + approval card, or the
+            # owner's 'Plans full power' setting) decide, not this flag.
             result["note"] = (
-                "publish_autonomy=auto is honored only in the ops chat's "
-                "'fix & publish' mode; elsewhere publishing still asks."
+                "publish_autonomy no longer changes publishing: every "
+                "publish needs a plan, a green test run, and the owner's "
+                "approval card (the owner's 'Plans full power' setting is "
+                "the only way to skip the card)."
             )
         return json.dumps(result)
 
     tools.append((
         ToolDef(
             name="playbook_set_autonomy",
-            modes=["building", "fix_publish"],
             description=(
                 "Change per-playbook autonomy. agent_autonomy = who may RUN "
                 "it: 'agent_may_trigger' (agent runs freely), "
                 "'agent_must_confirm' (agent must ask first), 'manual_only' "
-                "(agent cannot run it at all). publish_autonomy = may the "
-                "agent PUBLISH fixes to it without asking: 'ask' (default) "
-                "or 'auto' — 'auto' is honored only in the ops chat's "
-                "fix & publish mode. require_specs / require_run switch the "
+                "(agent cannot run it at all). publish_autonomy is legacy "
+                "and no longer changes publishing — every publish needs a "
+                "plan, a green test run, and the owner's approval card. "
+                "require_specs / require_run switch the "
                 "publish gates (Settings → Publish): off = the gate is still "
                 "run and reported but never refuses a publish. Lead with "
                 "`why` — the owner reads it on the approval card."
@@ -814,7 +814,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_ack_failures",
-            modes=["building", "identify", "fix_approve", "fix_publish"],
             description=(
                 "Dismiss the 'playbook failures needing your attention' notice "
                 "for one playbook. Call this ONLY after the owner has decided "
@@ -953,7 +952,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_get_definition",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "Get a playbook's full source so you can edit it. Returns the "
                 "playbook CODE (the Python-like playbook language) by default — "
@@ -1053,7 +1052,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_validate",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "Statically check a playbook WITHOUT running it (the compiler). "
                 "Returns ALL issues at once: compile errors, schema errors, unknown "
@@ -1084,7 +1083,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_language_reference",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "The complete playbook-language quick reference: every "
                 "combinator with its exact kwargs, value assignment "
@@ -1167,7 +1166,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_dry_run",
-            modes=["building", "fix_approve", "fix_publish"],
             timeout_seconds=60,
             description=(
                 "Simulate a playbook run WITHOUT side effects — real loops, "
@@ -1565,7 +1563,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             # 0.6.0 (luna 074/phase4): no longer chat_only. Headless turns
             # (scheduled fires, playbook agent_steps) could only reach
@@ -1616,7 +1613,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit_force",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             description=(
                 "Save a playbook edit even though it conflicts with the "
@@ -1672,7 +1668,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_manifest_set",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             description=(
                 "Set or replace a playbook's MANIFEST — the owner-stated "
@@ -1707,9 +1702,7 @@ def build_tools(
     # available everywhere, no mode gating; the ONLY enforcement anywhere
     # is that playbook_publish/playbook_rollback require a plan_id.
 
-    _ALL_MODES = [
-        "planning", "building", "identify", "fix_approve", "fix_publish",
-    ]
+    _ALL_MODES = ["planning", "building"]  # every state that exists (luna 098)
 
     _PLAN_BODY_HINT = (
         "Write the plan FOR THE OWNER, not for engineers: plain words, a "
@@ -2596,7 +2589,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_run_candidate",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             artifact_verb="testing",
             timeout_seconds=120,
@@ -2768,7 +2760,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_add",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             description=(
                 "Add or update (upsert by name) SPECS — stored tests for a "
@@ -2855,7 +2846,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_list",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "List one version's specs (its tests) with each spec's last "
                 "result and when it last ran. Specs belong to a version."
@@ -2908,7 +2899,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_delete",
-            modes=["building", "fix_approve", "fix_publish"],
             artifact_ref="playbook:{name}",
             description=(
                 "Delete one spec by name from one version's test set. This "
@@ -2971,7 +2961,6 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_run",
-            modes=["building", "fix_approve", "fix_publish"],
             description=(
                 "Run a playbook's specs (all, or one via spec_name=) as "
                 "dry-runs with the spec's fixture inputs and stubs — no side "
@@ -3062,7 +3051,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_spec_from_run",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "Record & replay: build a spec PROPOSAL from a real "
                 "finished run — recorded tool outputs become stubs, the "
@@ -3131,7 +3120,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_preflight",
-            modes=["planning", "building", "identify", "fix_approve", "fix_publish"],
+            modes=["planning", "building"],
             description=(
                 "Check that every tool a playbook touches would work RIGHT "
                 "NOW (credentials alive, resources reachable) — the check "

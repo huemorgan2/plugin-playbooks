@@ -195,10 +195,9 @@ class FixProposalService:
 
         The wake turn is expected to investigate and fix immediately; the
         owner's consent lives at the publish approval card (plan + change,
-        phase 1), so the old approve-a-fix-attempt card is gone. The ops
-        chat may still sit in the old diagnose-only 'identify' state from
-        the card era — advance it so the wake turn can actually work; the
-        machine-checked publish gates hold the one approval either way.
+        phase 1), so the old approve-a-fix-attempt card is gone. Since luna
+        098 the ops chat always runs in the ordinary 'building' state, so
+        the wake turn has the full toolset without any state juggling.
         """
         ctx = self._ctx
         if ctx is None:
@@ -209,15 +208,6 @@ class FixProposalService:
             # headless test ctx, or a broken ops lookup: ledger row only —
             # surfaced via the failure digest.
             return
-        set_state = getattr(ctx, "set_conversation_state", None)
-        if set_state is not None:
-            try:
-                await set_state(ops, "fix_publish", only_from="identify")
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "fix_proposal.state_advance_failed playbook=%s",
-                    playbook_name,
-                )
         display = card.get("display") or playbook_name
         purpose = card.get("purpose") or ""
         step_id = card.get("step_id") or ""

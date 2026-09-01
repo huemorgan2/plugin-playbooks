@@ -330,30 +330,37 @@ async def test_identical_concurrent_trigger_deliveries_dedupe():
 
 def test_mode_declarations():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
-    # 089 §5: EVERY tool declares modes — an undeclared tool falls back to
-    # core's DEFAULT_TOOL_MODES, which silently drops it from planning and
-    # identify without this plugin ever having decided that.
-    undeclared = [n for n, td in tds.items() if getattr(td, "modes", None) is None]
-    assert undeclared == [], undeclared
-    # plans/016 phase 1: "do everything everywhere" — publish/rollback are
-    # available in every mode; the plan gate is the enforcement, not modes.
-    all_modes = ["planning", "building", "identify", "fix_approve", "fix_publish"]
-    assert tds["playbook_publish"].modes == all_modes
-    assert tds["playbook_rollback"].modes == all_modes
-    assert tds["playbook_run"].modes == ["building", "fix_publish"]
-    assert tds["playbook_set_autonomy"].modes == ["building", "fix_publish"]
-    all_five = {"planning", "building", "identify", "fix_approve", "fix_publish"}
-    for name in ("playbook_list", "playbook_status", "playbook_get_definition",
-                 "playbook_spec_from_run"):
-        assert set(tds[name].modes) == all_five, name
-    assert "planning" not in tds["playbook_ack_failures"].modes
-    # draft-authoring tools: absent in planning (nothing may change the
-    # system there) and in identify (triage is read-only).
+    # luna 098: the ops mode machine is gone — the only states are planning
+    # and building. A tool either opts into planning (["planning",
+    # "building"]) or leaves modes undeclared (= building only). No tool may
+    # reference a dead ops state.
+    planning_and_building = ["planning", "building"]
+    for name, td in tds.items():
+        modes = getattr(td, "modes", None)
+        assert modes in (None, planning_and_building), (name, modes)
+    # plans/016: publish/rollback and the plan tools are available even in
+    # planning — the plan gate is the enforcement, not modes.
+    planning_ok = {
+        n for n, td in tds.items()
+        if getattr(td, "modes", None) == planning_and_building
+    }
+    assert planning_ok == {
+        "playbook_list", "playbook_status", "playbook_cancel",
+        "playbook_get_definition", "playbook_validate",
+        "playbook_language_reference", "playbook_spec_list",
+        "playbook_spec_from_run", "playbook_preflight",
+        "playbook_plan_write", "playbook_plan_read", "playbook_plan_finish",
+        "playbook_publish", "playbook_rollback",
+    }
+    # everything else (draft authoring, runs, autonomy, acks) is
+    # building-only by default — absent while the owner is planning.
     for name in ("playbook_propose", "playbook_edit", "playbook_edit_force",
                  "playbook_manifest_set", "playbook_spec_add",
                  "playbook_spec_delete", "playbook_spec_run",
-                 "playbook_dry_run", "playbook_run_candidate"):
-        assert tds[name].modes == ["building", "fix_approve", "fix_publish"], name
+                 "playbook_dry_run", "playbook_run_candidate",
+                 "playbook_run", "playbook_set_autonomy",
+                 "playbook_ack_failures"):
+        assert getattr(tds[name], "modes", None) is None, name
 
 
 def test_artifact_ref_declarations():
@@ -481,7 +488,8 @@ class _OpsCtx:
 
 class _OldCoreOpsCtx(_OpsCtx):
     """A pre-0.91.001 core: no set_conversation_state. The wake must still
-    go out, in whatever mode the chat is in (degrade visible, never break)."""
+    go out (degrade visible, never break); since luna 098 the plugin never
+    calls it on any core."""
 
     set_conversation_state = None
 
@@ -541,11 +549,9 @@ async def test_fix_proposal_wakes_ops_without_approval():
         assert "playbook_plan_write" in body   # plan before any change
         assert "publish approval card" in body  # where the owner decides
 
-        # the ops chat is advanced out of the old diagnose-only mode BEFORE
-        # the wake, guarded so an owner-moved chat is never downgraded.
-        ((cid, state, only_from, sent_before),) = ctx.state_flips
-        assert (cid, state, only_from) == (OPS, "fix_publish", "identify")
-        assert sent_before == 0
+        # luna 098: no state juggling — the ops chat is always 'building',
+        # the wake never touches conversation state.
+        assert ctx.state_flips == []
     finally:
         await engine.dispose()
 

@@ -53,7 +53,8 @@ def conversation_kind(ctx: Any) -> str | None:
 
 
 def conversation_state(ctx: Any) -> str | None:
-    """planning/building/identify/fix_approve/fix_publish; None headless."""
+    """planning/building (ops chats are always building since luna 098);
+    None headless."""
     if ctx is None:
         return None
     return ctx.conversation_state()

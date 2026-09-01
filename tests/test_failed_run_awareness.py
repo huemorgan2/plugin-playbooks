@@ -289,20 +289,16 @@ class TestPromptSectionPerState:
         assert "Prefer running an existing playbook" in text
         assert "you MUST use it" not in text
 
-    async def test_ops_renders_mode_section_and_digest(self, db):
+    async def test_ops_renders_ops_section_and_digest(self, db):
+        # luna 098: one static ops section, no mode variants.
         pid = await _playbook(db, name="mailer", live_version=1)
         await _run(db, pid, version=1, status="failed")
-        plugin = await self._plugin(db, "ops", "identify")
+        plugin = await self._plugin(db, "ops", "building")
         sections = await plugin.prompt_sections()
-        assert "Ops chat — mode: Identify" in sections[0]
-        assert any("failures needing your attention" in s for s in sections)
-
-    async def test_ops_fix_publish_mentions_gate(self, db):
-        await _playbook(db, name="mailer", live_version=1)
-        plugin = await self._plugin(db, "ops", "fix_publish")
-        sections = await plugin.prompt_sections()
-        assert "Fix & publish" in sections[0]
+        assert "Ops chat" in sections[0]
         assert "playbook_run_candidate" in sections[0]
+        assert "mode" not in sections[0].lower()
+        assert any("failures needing your attention" in s for s in sections)
 
     async def test_building_chat_omits_digest(self, db):
         pid = await _playbook(db, name="mailer", live_version=1)

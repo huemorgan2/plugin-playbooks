@@ -61,10 +61,10 @@ class Playbook(Base):
     # (new live version) re-arms it with no write here. NULL = never acked.
     failures_acked_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
-    # 0.26.0 (plans/015, 089 §3): may the agent PUBLISH fixes to this playbook
-    # without asking? 'ask' (default) | 'auto'. Distinct from agent_autonomy,
-    # which governs who may RUN it. 'auto' is only honored in the ops chat's
-    # fix_publish state — chat state gates broadly, this refines.
+    # 0.26.0 (plans/015, 089 §3): legacy. 'ask' (default) | 'auto'. The ops
+    # mode that honored 'auto' was removed (luna 098); publishing is governed
+    # by the 016 gates (plan + green test + approval card / plans_full_power).
+    # Kept only so old rows keep loading.
     publish_autonomy: Mapped[str] = mapped_column(String(16), default="ask", nullable=False)
     # 0.28.0 (plans/016 phase 6): owner-switchable publish gates (Settings →
     # Publish). Off = the gate still runs and is reported, but never refuses.
