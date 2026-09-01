@@ -1258,17 +1258,27 @@ class PlaybookRunner:
             # sqlite returns naive datetimes; stored values are UTC
             started_at = started_at.replace(tzinfo=timezone.utc)
         duration_ms = int((completed_at - started_at).total_seconds() * 1000) if started_at else 0
-        await self._events.emit("playbook.run.completed", {
-            "run_id": str(run_id),
-            "status": status,
-            "duration_ms": duration_ms,
-            "error": error,
-            # 0.26.0 (plans/015, 089 §4): identity for the fix-proposal
-            # service — it must skip test runs and dedupe per playbook.
-            "playbook_id": str(playbook_id) if playbook_id else None,
-            "playbook_version": playbook_version,
-            "is_test": is_test,
-        })
+        # plans/016 phase 4: this event announces a FINISHED run, but it is
+        # emitted while _active_run_id is still set (the finally in _drive_run
+        # resets it later). Background subscribers copy the emit-time context
+        # into their tasks, so the leaked var made the ops wake turn's
+        # run tools refuse as "nested" — the very tools 0.31.1 un-hid for it.
+        # Neutralize it for the emit: nothing downstream is inside this run.
+        token = _active_run_id.set(None)
+        try:
+            await self._events.emit("playbook.run.completed", {
+                "run_id": str(run_id),
+                "status": status,
+                "duration_ms": duration_ms,
+                "error": error,
+                # 0.26.0 (plans/015, 089 §4): identity for the fix-proposal
+                # service — it must skip test runs and dedupe per playbook.
+                "playbook_id": str(playbook_id) if playbook_id else None,
+                "playbook_version": playbook_version,
+                "is_test": is_test,
+            })
+        finally:
+            _active_run_id.reset(token)
 
 
 class _RunContext:

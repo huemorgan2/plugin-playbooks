@@ -152,6 +152,58 @@ async def test_background_run_with_explicit_conversation_still_delivers():
 
 
 @pytest.mark.asyncio
+async def test_completion_event_subscribers_see_no_active_run():
+    # plans/016 phase 4: `playbook.run.completed` fires while the run's
+    # _active_run_id contextvar is still set, and background subscribers copy
+    # the emit-time context into their tasks. The leak made the ops wake
+    # turn's run tools refuse as "nested" — the run is over, subscribers must
+    # see no active run.
+    import asyncio
+
+    from plugin_playbooks.runner import active_run_id
+
+    seen: list[str | None] = []
+
+    class _RecordingBus(_Bus):
+        async def emit(self, name, payload):
+            if name != "playbook.run.completed":
+                return
+            # mimic subscribe(background=True): handler runs in a new task
+            # that copies the current context.
+            task = asyncio.create_task(self._handler())
+            await task
+
+        async def _handler(self):
+            seen.append(active_run_id())
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def send(**kw):
+        return {"ok": True}
+
+    runner = PlaybookRunner(
+        session_factory=sf,
+        tool_registry=_Tools(send_chat_message=_Tool(send)),
+        events=_RecordingBus(),
+        context=_Ctx(),
+    )
+    pb = _greeter({"message": "hi"})
+    async with sf() as s:
+        s.add(pb)
+        await s.commit()
+        await s.refresh(pb)
+    try:
+        run = await runner.start_run(pb, trigger="cron:daily")
+        assert run.status == "failed"  # live background run, implicit send
+        assert seen == [None]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_headless_test_run_reports_to_ops():
     # test runs keep their pre-016 delivery: origin chat, else ops.
     engine, _, runner, pb, sent = await _env(_Ctx(), {"message": "hi"})
