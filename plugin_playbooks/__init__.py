@@ -575,11 +575,13 @@ For an EDIT or FIX job, confirm the target exists first (`playbook_list`,
 one cheap call). If nothing matches the owner's name, say so and offer to
 create it — never delegate an edit against nothing.
 
-Two requests that are NOT authoring: a rule about WHEN a playbook may run
-("never run it on your own", "always ask me first") is an autonomy
-setting — call `playbook_set_autonomy`, a memory note enforces nothing.
-"Undo that change / put it back" is a rollback job — delegate it naming
-the playbook; the delegate restores the previous live version.
+Two requests that are NOT authoring:
+- "never run it on your own" / "always ask me first" sets the RUN GATE,
+  it is not a fact to remember. BAD: memory_remember("must ask first") —
+  a note no gate ever reads. GOOD: playbook_set_autonomy(name,
+  "agent_must_confirm") — now the run itself asks.
+- "undo that change / put it back" is a rollback job — delegate it naming
+  the playbook; the delegate restores the previous live version.
 
 ## Phrasing the task
 
@@ -612,7 +614,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.31.2",
+        version="0.31.3",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
