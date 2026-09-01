@@ -434,14 +434,14 @@ def _delegation_payload(row: PlaybookDelegation, *, for_status_tool: bool) -> di
             )
         else:
             payload["message"] = (
-                "The delegate is working in the background; a progress card in "
-                "the chat tracks it live. Status 'running' means NOTHING is "
-                "created, edited, or published yet — never tell the owner the "
-                "playbook is created/ready/live. Reply with ONE sentence that "
-                "names the playbook and the change underway (e.g. \"the "
-                "crm-import playbook build is underway — the card below tracks "
-                "it\"), then END YOUR TURN. Do not poll playbook_agent_status "
-                "unless the owner asks later."
+                "The build is in progress — not created or published yet; "
+                "saying it is underway is correct, saying it is created/ready/"
+                "live is false. A progress card in the chat tracks it live. "
+                "Reply with ONE sentence that names the playbook and the "
+                "change underway (e.g. \"the crm-import playbook build is "
+                "underway — the card below tracks it\"), then END YOUR TURN. "
+                "Do not poll playbook_agent_status unless the owner asks "
+                "later."
             )
     elif row.status in ("done", "failed", "needs_owner"):
         if row.result:

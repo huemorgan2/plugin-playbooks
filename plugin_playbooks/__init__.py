@@ -590,6 +590,8 @@ playbook for edit/fix jobs. Include what the owner told you (desired
 behavior, examples, the failing run's symptom). Good:
 "Fix the phone format in candidate-intake: numbers must normalize to
 E.164; all specs must pass; publish when green."
+Spell collection jobs as loops — "for each unread email ..." — so the
+delegate builds a loop.
 
 ## After calling
 
@@ -614,7 +616,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.31.3",
+        version="0.31.4",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
