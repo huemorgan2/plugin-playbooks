@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Eye, FileCode, FileText, FlaskConical, Play, Rocket, Loader2, X, History,
+  PanelRightClose,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { subscribePlaybookEvents } from '../lib/events'
@@ -45,6 +46,97 @@ const VIEWS: { view: VersionView; label: string; icon: React.ComponentType<{ cla
   { view: 'tests', label: 'Tests', icon: FlaskConical },
   { view: 'runs', label: 'Runs', icon: Play },
 ]
+
+// The view tabs adapt to the width they actually get (the version list eats
+// 300px): icons + text when both fit, text only when icons would overflow,
+// icons only in the tightest squeeze. Never clipped under the version list —
+// two invisible measuring copies decide which variant fits.
+type TabFit = 'full' | 'text' | 'icon'
+
+function ViewTabsBar({
+  mode,
+  view,
+  onSelect,
+  interactive,
+  measureRef,
+}: {
+  mode: TabFit
+  view: VersionView
+  onSelect?: (v: VersionView) => void
+  interactive: boolean
+  measureRef?: React.Ref<HTMLDivElement>
+}) {
+  return (
+    <div
+      ref={measureRef}
+      className={cn(
+        'flex items-center gap-1 bg-ink-900/60 rounded-lg p-0.5 w-fit',
+        interactive
+          // last resort in the very tightest squeeze: wrap to a second line,
+          // never slide under the version list.
+          ? 'flex-wrap max-w-full'
+          : 'absolute left-0 top-0 w-max invisible pointer-events-none',
+      )}
+      aria-hidden={interactive ? undefined : true}
+    >
+      {VIEWS.map(({ view: v, label, icon: Icon }) => (
+        <button
+          key={v}
+          onClick={interactive ? () => onSelect?.(v) : undefined}
+          tabIndex={interactive ? undefined : -1}
+          className={cn(
+            'flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition whitespace-nowrap',
+            interactive && view === v
+              ? 'bg-luna-600/30 text-luna-200'
+              : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
+          )}
+          data-testid={interactive ? `view-${v}` : undefined}
+          title={mode === 'icon' ? label : undefined}
+          aria-label={label}
+        >
+          {mode !== 'text' && <Icon className="w-3.5 h-3.5" />}
+          {mode !== 'icon' && label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function AdaptiveViewTabs({
+  view,
+  onSelect,
+}: {
+  view: VersionView
+  onSelect: (v: VersionView) => void
+}) {
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  const fullRef = useRef<HTMLDivElement | null>(null)
+  const textRef = useRef<HTMLDivElement | null>(null)
+  const [fit, setFit] = useState<TabFit>('full')
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const measure = () => {
+      const avail = el.clientWidth
+      const fullW = fullRef.current?.scrollWidth ?? 0
+      const textW = textRef.current?.scrollWidth ?? 0
+      setFit(fullW <= avail ? 'full' : textW <= avail ? 'text' : 'icon')
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  return (
+    <div ref={wrapRef} className="relative w-full min-w-0" data-testid="view-tabs">
+      <ViewTabsBar mode={fit} view={view} onSelect={onSelect} interactive />
+      <ViewTabsBar mode="full" view={view} interactive={false} measureRef={fullRef} />
+      <ViewTabsBar mode="text" view={view} interactive={false} measureRef={textRef} />
+    </div>
+  )
+}
 
 // The promote REST path refuses with a 422 whose body names the failing gate.
 // apiFetch surfaces it as "422: {json}" — dig the human message out.
@@ -157,6 +249,8 @@ export function VersionsTab({
   const [planPickerOpen, setPlanPickerOpen] = useState(false)
   const [planOptions, setPlanOptions] = useState<PlanBrief[] | null>(null)
   const [forceOffer, setForceOffer] = useState<string | null>(null) // plan_id to retry with
+  // The version list folds away to a slim rail when the owner wants the room.
+  const [listOpen, setListOpen] = useState(true)
   // Live agent edits applied on top of the fetched definition (with glow).
   const [patchedDef, setPatchedDef] = useState<PlaybookDef | null>(null)
   const [glow, setGlow] = useState<Map<string, number>>(new Map())
@@ -336,8 +430,9 @@ export function VersionsTab({
             className="px-4 pt-2.5 pb-2 border-b border-white/5 shrink-0 space-y-2"
             data-testid="version-toolbar"
           >
-            {/* Row 1: version · date · (badge | promote) */}
-            <div className="flex items-center gap-3">
+            {/* Row 1: version · date · (badge | promote) — wraps downward
+                rather than sliding under the version list. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <span className="text-lg font-bold text-ink-50 leading-none" data-testid="toolbar-version">
               v{detail.version}
             </span>
@@ -414,24 +509,8 @@ export function VersionsTab({
               </div>
             )}
             </div>
-            {/* Row 2: view tabs, left-aligned */}
-            <div className="flex items-center gap-1 bg-ink-900/60 rounded-lg p-0.5 w-fit">
-              {VIEWS.map(({ view: v, label, icon: Icon }) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  className={cn(
-                    'flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition',
-                    view === v
-                      ? 'bg-luna-600/30 text-luna-200'
-                      : 'text-ink-400 hover:text-ink-200 hover:bg-white/5',
-                  )}
-                  data-testid={`view-${v}`}
-                >
-                  <Icon className="w-3.5 h-3.5" /> {label}
-                </button>
-              ))}
-            </div>
+            {/* Row 2: view tabs, left-aligned, adapting to the room they get */}
+            <AdaptiveViewTabs view={view} onSelect={setView} />
           </div>
         )}
 
@@ -530,7 +609,25 @@ export function VersionsTab({
         </div>
       </div>
 
-      {/* Right: the version list */}
+      {/* Right: the version list — folds to a slim rail on demand */}
+      {!listOpen ? (
+        <div
+          className="w-10 shrink-0 border-l border-white/5 bg-ink-950/60 flex flex-col items-center pt-2 gap-1"
+          data-testid="version-list-collapsed"
+        >
+          <button
+            onClick={() => setListOpen(true)}
+            className="p-1.5 rounded-lg hover:bg-white/5 text-ink-400 hover:text-ink-100 transition"
+            title="Show versions"
+            data-testid="versions-expand"
+          >
+            <History className="w-4 h-4" />
+          </button>
+          {versions && (
+            <span className="text-[10px] text-ink-500">{versions.length}</span>
+          )}
+        </div>
+      ) : (
       <div
         className="w-[300px] shrink-0 border-l border-white/5 bg-ink-950/60 overflow-y-auto"
         data-testid="version-list"
@@ -541,6 +638,14 @@ export function VersionsTab({
           {versions && (
             <span className="text-[11px] text-ink-500 ml-auto">{versions.length}</span>
           )}
+          <button
+            onClick={() => setListOpen(false)}
+            className="p-1 rounded-md hover:bg-white/5 text-ink-500 hover:text-ink-200 transition"
+            title="Hide versions"
+            data-testid="versions-collapse"
+          >
+            <PanelRightClose className="w-4 h-4" />
+          </button>
         </div>
         <div className="px-2 py-2">
           {versions === null ? (
@@ -612,6 +717,7 @@ export function VersionsTab({
           )}
         </div>
       </div>
+      )}
     </div>
   )
 }

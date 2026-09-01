@@ -240,6 +240,21 @@ describe('VersionsTab — per-version tests (phase 5)', () => {
     const btn = await screen.findByTestId('promote-btn')
     expect((btn as HTMLButtonElement).disabled).toBe(false)
   })
+
+  it('version list folds to a slim rail and back; toolbar tabs stay present', async () => {
+    setup()
+    await screen.findByTestId('version-toolbar')
+    fireEvent.click(screen.getByTestId('versions-collapse'))
+    expect(screen.queryByTestId('version-list')).toBeNull()
+    expect(screen.getByTestId('version-list-collapsed')).toBeTruthy()
+    // the view tabs never disappear with the list open or closed
+    for (const v of ['canvas', 'code', 'manifest', 'tests', 'runs']) {
+      expect(screen.getByTestId(`view-${v}`)).toBeTruthy()
+    }
+    fireEvent.click(screen.getByTestId('versions-expand'))
+    expect(screen.getByTestId('version-list')).toBeTruthy()
+    expect(screen.queryByTestId('version-list-collapsed')).toBeNull()
+  })
 })
 
 describe('promoteRefusalMessage', () => {
