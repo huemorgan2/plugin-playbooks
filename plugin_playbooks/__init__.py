@@ -194,8 +194,8 @@ _AUTHORING_SKILL_BODY = '''\
 ## Playbook Authoring
 
 A playbook is written in playbook CODE — a restricted Python dialect. You
-WRITE code; Luna PARSES and COMPILES it into a step graph. It is NEVER
-executed as Python: no imports, no class, no Python for/while/if, no
+WRITE code; Luna PARSES and COMPILES it into a step graph. It NEVER runs
+as Python: no imports, no class, no Python for/while/if, no
 comprehensions; the only callables are the combinators, range(), and your
 top-level `def` functions (compile-time macros). Each
 statement is ONE step: `<id> = combinator(...)` — the variable name is the
@@ -212,7 +212,7 @@ Only then write code.
 1. WRITE: `playbook_propose(name, code=...)` to create; edit via the
 two-step ticket flow — see MANIFEST + THE EDIT FLOW below.
 2. COMPILE: `playbook_validate(code=... | name=...)` — ALL errors at once
-(line numbers, undefined references, unknown tools, bad loops, cycles).
+(line numbers, undefined refs, unknown tools, bad loops, cycles).
 3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with tool/LLM
 steps STUBBED: proves loops iterate, branches branch, templates resolve — no
 side effects. Tests the CANDIDATE by default. Outputs are SIMULATED: NEVER
@@ -220,14 +220,14 @@ report a dry-run value as a real result. Copy your `steps.<id>.<field>`
 paths from its `references`. The trace's per-step `output` key is JUST a
 label — `steps.<id>.output.<field>` does not exist.
 4. RUN: `playbook_run(name, inputs)` for real. Runs execute in the
-background: on status 'running', poll `playbook_status(run_id)` until
-'done'/'failed'. Never re-run a 'running' playbook, never invent results.
+background: on 'running', poll `playbook_status(run_id)` until
+'done'/'failed'; never re-run a 'running' playbook or invent results.
 5. INSPECT: `playbook_status(run_id)` — each step's resolved inputs +
 outputs (your stack trace). Fix and repeat.
 
 ### THE POINT: turn a prompt into a process
 A playbook's value is DECOMPOSITION — small, visible, reusable steps with
-structured data flowing between them. The whole task in ONE agent() prompt
+structured data between them. The whole task in ONE agent() prompt
 is NOT a playbook.
 
 ### AGENT DECIDES, THE WORKFLOW WORKS
@@ -358,10 +358,9 @@ within the manifest; copy `old=` snippets verbatim from the code frame.
 2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`
 or `old=`/`new=` (the `old` snippet must match exactly one place). The
 ticket is single-use and expires; no valid ticket, no save.
-On a manifest conflict: fix the code and retry with the SAME ticket (a
-refusal does not burn it); or `playbook_manifest_set` (asks the owner); or
-`playbook_edit_force` when the owner explicitly wants the change (also
-asks). NEVER work around a refusal any other way. Pass `manifest=` to
+On a manifest conflict: fix the code, retry with the SAME ticket (refusals
+don't burn it); or `playbook_manifest_set` (asks the owner); or
+`playbook_edit_force` when the owner wants the change (also asks). NEVER work around a refusal any other way. Pass `manifest=` to
 `playbook_propose` on create; if a playbook has none, propose one.
 
 ### CANDIDATE → PUBLISH (a save never changes the running playbook)
@@ -383,13 +382,13 @@ GATE — a failing spec blocks `playbook_publish` until the code is fixed or
 the spec updated.
 - Write stubs from recorded reality, not memory: after ANY real run — even
 a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
-- BATCH: ALL the specs you intend to add go in ONE
-`playbook_spec_add(name, specs=...)` call (YAML mapping of name → body).
+- BATCH all new specs into ONE `playbook_spec_add(name, specs=...)` call
+(YAML mapping name → body).
 - `playbook_spec_run` runs all specs; `playbook_spec_list` shows last
 results. No specs = no safety net — after meaningful changes, propose
 pinning one from a good run.
-- Keep specs SMALL — assert the few things that matter. Over-tight specs
-fail on harmless changes.
+- Keep specs SMALL — assert only what matters; over-tight specs fail on
+harmless changes.
 
 ### PREFLIGHT (are the tools alive?)
 Specs stub the outside world; `playbook_preflight(name)` probes every tool
@@ -411,11 +410,13 @@ work) → validate → dry_run → fix any failed specs → publish. Never creat
 `tool('send_chat_message', message='...')` posts live into a chat. An
 `llm()`/`agent()` output is only stored on the run record — a later
 send_chat_message must pass it on for the owner to SEE it. Chat-started
-and test runs deliver to their own chat automatically; a TRIGGERED or
-SCHEDULED run has NO chat — its send must pass an explicit
-`conversation_id` (or deliver via email/slack), else the step fails. Never
-dump routine run output into the ops chat. NEVER invent tool names —
-unknown tools are rejected at authoring time.
+and test runs deliver to their own chat; a triggered/scheduled run has NO
+chat — its send must pass an explicit `conversation_id` (or deliver via
+email/slack), else the step fails. Never dump routine run output into the
+ops chat. NEVER invent tool names — unknown tools are rejected.
+
+'Never run it on your own' = `playbook_set_autonomy` — a memory
+note enforces nothing. 'Put it back' = `playbook_rollback`.
 '''
 
 
