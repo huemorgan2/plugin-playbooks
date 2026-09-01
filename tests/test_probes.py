@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from evidence import EXPLANATION, green_run
+from evidence import EXPLANATION, green_run, make_plan
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -348,7 +348,7 @@ async def test_promote_passes_with_unprobeable_tools_and_notes_it(env):
         old="says hi", new="says hello",
     )
     await green_run(sf, 2)
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(handlers)))
     assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["probes"]["ok"] is True
@@ -371,7 +371,7 @@ async def test_promote_refused_on_failed_probe_then_passes(env):
     tool.definition = _Def(probe=_Probe(handler=dead))
 
     await green_run(sf, 2)
-    refused = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    refused = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(handlers)))
     assert refused["gate"] == "probes"
     assert refused["failing_tools"][0]["tool"] == "send_chat_message"
     assert refused["failing_tools"][0]["failure_class"] == "credential_dead"
@@ -390,7 +390,7 @@ async def test_promote_refused_on_failed_probe_then_passes(env):
     async def alive():
         return {"ok": True}
     tool.definition = _Def(probe=_Probe(handler=alive))
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(handlers)))
     assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["probes"]["note"] == "1 ok"

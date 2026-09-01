@@ -25,11 +25,21 @@ from .definition import PlaybookDef, parse_yaml
 from .models import (
     Playbook,
     PlaybookDraft,
+    PlaybookPlan,
     PlaybookProbeResult,
     PlaybookRun,
     PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
+)
+from .plans import (
+    full_power as _plans_full_power,
+    load_plan as _load_plan,
+    plan_brief as _plan_brief,
+    plan_detail as _plan_detail,
+    plan_gate as _plan_gate,
+    set_full_power as _set_full_power,
+    stamp_outcome as _plan_stamp_outcome,
 )
 from .probes import run_preflight
 from .publish import announce_publish, test_run_gate, specs_gate
@@ -1122,6 +1132,8 @@ class PromoteBody(BaseModel):
     # None → promote the CANDIDATE through the gate; a number → owner-restore
     # that stored version to live (pointer move, no gate beyond existence).
     version: int | None = None
+    # plans/016 phase 1: every playbook change runs under a plan.
+    plan_id: str | None = None
 
 
 def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: bool) -> None:
@@ -1153,6 +1165,18 @@ async def promote_version(name: str, body: PromoteBody):
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
+
+        # plans/016 phase 1: the plan gate — same rule as the
+        # playbook_publish tool, so no code path skips it.
+        plan_row, plan_refusal = await _plan_gate(session, body.plan_id or "")
+        if plan_refusal is not None:
+            detail = json.loads(plan_refusal)
+            detail["message"] = (
+                "Promote refused — every playbook change requires a plan. "
+                "Ask Luna to write one, or pick one in the Plans tab."
+            )
+            raise HTTPException(422, detail)
+        plan_id = str(plan_row.id)
 
         target_n = body.version
         candidate = target_n is None
@@ -1228,12 +1252,22 @@ async def promote_version(name: str, body: PromoteBody):
             p.candidate_version = None
 
         await session.commit()
+        # plans/016 phase 1: code-stamp the publish outcome onto the plan.
+        await _plan_stamp_outcome(session, plan_id, {
+            "action": "promote" if candidate else "restore",
+            "playbook": name,
+            "old_live_version": old_live,
+            "new_live_version": target_n,
+            "evidence_run_id": str(evidence.id) if evidence else None,
+            "actor": "owner",
+        })
         result = {
             "name": name,
             "live_version": target_n,
             "version": p.version,
             "promoted_from": old_live,
             "status": "promoted",
+            "plan_id": plan_id,
         }
     await _notify_changed(name)
     if _events is not None:
@@ -1596,3 +1630,46 @@ async def delete_draft(draft_id: str):
         await session.delete(d)
         await session.commit()
         return {"id": draft_id, "status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# plans/016 phase 1: plugin-global settings + change plans (Plans tab reads
+# these; the phase-3 UI supplies the panel).
+
+
+class PlaybooksSettingsPatch(BaseModel):
+    plans_full_power: bool | None = None
+
+
+@router.get("/playbooks-settings")
+async def get_playbooks_settings():
+    async with _sf()() as session:
+        return {"plans_full_power": await _plans_full_power(session)}
+
+
+@router.patch("/playbooks-settings")
+async def patch_playbooks_settings(body: PlaybooksSettingsPatch):
+    async with _sf()() as session:
+        if body.plans_full_power is not None:
+            await _set_full_power(session, body.plans_full_power)
+        return {"plans_full_power": await _plans_full_power(session)}
+
+
+@router.get("/plans")
+async def list_plans(status: str | None = None, limit: int = 100):
+    async with _sf()() as session:
+        q = select(PlaybookPlan).order_by(PlaybookPlan.created_at.desc())
+        if status:
+            q = q.where(PlaybookPlan.status == status)
+        rows = (await session.execute(q.limit(max(1, min(limit, 500))))
+                ).scalars().all()
+        return {"plans": [_plan_brief(r) for r in rows]}
+
+
+@router.get("/plans/{plan_id}")
+async def get_plan(plan_id: str):
+    async with _sf()() as session:
+        plan = await _load_plan(session, plan_id)
+        if plan is None:
+            raise HTTPException(404, f"No plan with id '{plan_id}'")
+        return _plan_detail(plan)

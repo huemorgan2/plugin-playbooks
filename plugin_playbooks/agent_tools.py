@@ -30,18 +30,26 @@ from .definition import AgentAutonomy, PlaybookDef
 from .models import (
     Playbook,
     PlaybookEditTicket,
+    PlaybookPlan,
     PlaybookRun,
     PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
+from .plans import (
+    full_power as _plans_full_power,
+    plan_brief as _plan_brief,
+    plan_detail as _plan_detail,
+    plan_gate as _plan_gate,
+    record_rejection as _plan_record_rejection,
+    stamp_outcome as _plan_stamp_outcome,
+)
 from .probes import preflight_note, run_preflight
 from .ops_provider import report_outcome as _ops_report_outcome
 from .ops_provider import scope_refusal as _ops_scope_refusal
 from .publish import (
     announce_publish,
-    conversation_state,
     ops_conversation_id,
     specs_gate,
     test_run_gate,
@@ -1707,6 +1715,212 @@ def build_tools(
         _manifest_set,
     ))
 
+    # --- playbook plans (luna-plugins plans/016) -------------------------
+    # A plan is one row of plain text the owner can read. Three tools,
+    # available everywhere, no mode gating; the ONLY enforcement anywhere
+    # is that playbook_publish/playbook_rollback require a plan_id.
+
+    _ALL_MODES = [
+        "planning", "building", "identify", "fix_approve", "fix_publish",
+    ]
+
+    _PLAN_BODY_HINT = (
+        "Write the plan FOR THE OWNER, not for engineers: plain words, a "
+        "few short paragraphs — what is wrong (tie it to the failure or "
+        "request that started this), what you will change, and why it is "
+        "safe. No stack traces, no jargon."
+    )
+
+    async def _plan_write(
+        *, title: str, body: str, playbook_refs: list | None = None,
+    ) -> str:
+        title = (title or "").strip()
+        body = (body or "").strip()
+        if not title or len(body) < 100:
+            return json.dumps({
+                "error": "Plan refused — `title` or `body` is missing or "
+                         "too short. Nothing was saved.",
+                "hint": _PLAN_BODY_HINT,
+            })
+        refs = [str(r).strip() for r in (playbook_refs or []) if str(r).strip()]
+        conversation_id = getattr(ctx, "current_conversation_id", None)
+        async with session_factory() as session:
+            plan = PlaybookPlan(
+                title=title, body=body, playbook_refs=refs or None,
+                conversation_id=conversation_id,
+            )
+            session.add(plan)
+            await session.commit()
+            plan_id = str(plan.id)
+        return json.dumps({
+            "plan_id": plan_id,
+            "status": "proposed",
+            "note": (
+                "Plan saved. Make the change (edit → test), then "
+                f"playbook_publish(name, explanation, plan_id='{plan_id}') "
+                "— the owner sees this plan and the change on one approval "
+                "card. After the publish lands, write the wrap-up with "
+                "playbook_plan_finish."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_plan_write",
+            description=(
+                "Write a change plan for one or more playbooks — plain "
+                "words the owner can read: what is wrong, what you will "
+                "change, why it is safe. Required before any "
+                "playbook_publish/playbook_rollback (they refuse without a "
+                "plan_id). A rejected plan is never edited — write a new "
+                "one that addresses the owner's rejection note."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "One plain-words sentence naming the "
+                                       "change.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": (
+                            "The plan, markdown. FOR THE OWNER: what is "
+                            "wrong, what you will change, why it is safe. "
+                            "No jargon, no stack traces."
+                        ),
+                    },
+                    "playbook_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Playbook names this plan touches.",
+                    },
+                },
+                "required": ["title", "body"],
+            },
+            modes=_ALL_MODES,
+        ),
+        _plan_write,
+    ))
+
+    async def _plan_read(*, plan_id: str = "") -> str:
+        async with session_factory() as session:
+            if plan_id:
+                plan = (await session.execute(
+                    select(PlaybookPlan).where(
+                        PlaybookPlan.id == uuid.UUID(plan_id)
+                    )
+                )).scalar_one_or_none()
+                if plan is None:
+                    return json.dumps({
+                        "error": f"No plan with id '{plan_id}'.",
+                    })
+                return json.dumps({"plan": _plan_detail(plan)})
+            rows = (await session.execute(
+                select(PlaybookPlan)
+                .order_by(PlaybookPlan.created_at.desc())
+                .limit(50)
+            )).scalars().all()
+            return json.dumps({
+                "plans": [_plan_brief(p) for p in rows],
+                "count": len(rows),
+            })
+
+    tools.append((
+        ToolDef(
+            name="playbook_plan_read",
+            description=(
+                "List playbook change plans (newest first), or read one in "
+                "full with plan_id — body, owner rejection note, "
+                "code-stamped outcome facts, execution summary."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Read this plan in full; omit to list.",
+                    },
+                },
+            },
+            modes=_ALL_MODES,
+        ),
+        _plan_read,
+    ))
+
+    async def _plan_finish(*, plan_id: str, summary: str) -> str:
+        summary = (summary or "").strip()
+        if len(summary) < 40:
+            return json.dumps({
+                "error": "Refused — `summary` is missing or too short. "
+                         "Nothing was changed.",
+                "hint": (
+                    "2-6 plain sentences FOR THE OWNER: what actually "
+                    "happened — what changed, what was verified, anything "
+                    "that surprised you. The published-version facts are "
+                    "recorded by code; this is your narrative next to them."
+                ),
+            })
+        async with session_factory() as session:
+            plan = (await session.execute(
+                select(PlaybookPlan).where(
+                    PlaybookPlan.id == uuid.UUID(plan_id)
+                )
+            )).scalar_one_or_none()
+            if plan is None:
+                return json.dumps({"error": f"No plan with id '{plan_id}'."})
+            if plan.status in ("rejected", "abandoned"):
+                return json.dumps({
+                    "error": (
+                        f"Plan '{plan.title}' is {plan.status} — it has no "
+                        "execution to summarize. Nothing was changed."
+                    ),
+                    "rejection_note": plan.rejection_note,
+                })
+            if plan.status == "done":
+                return json.dumps({
+                    "error": f"Plan '{plan.title}' is already done — its "
+                             "summary is written.",
+                })
+            plan.execution_summary = summary
+            plan.status = "done"
+            await session.commit()
+            payload = _plan_brief(plan)
+        return json.dumps({
+            "plan": payload,
+            "note": "Execution summary recorded; the plan is done.",
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_plan_finish",
+            description=(
+                "Close a plan after its change landed: write the execution "
+                "summary (plain words for the owner — what happened, what "
+                "was verified) and mark the plan done. The published "
+                "version/time facts are stamped by code; this adds your "
+                "narrative."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "2-6 plain sentences FOR THE OWNER: what "
+                            "changed, what was verified, any surprises."
+                        ),
+                    },
+                },
+                "required": ["plan_id", "summary"],
+            },
+            modes=_ALL_MODES,
+        ),
+        _plan_finish,
+    ))
+
     # --- playbook_publish (the gate: nothing goes live except through here) ---
     # 0.10.0 (plans/002 phase 3): promotion runs an extensible gate list —
     # static validation and manifest drift today; specs (phase 4) and probes
@@ -1719,7 +1933,8 @@ def build_tools(
         target_version: int,
         explanation: str,
         evidence: Any,
-        autonomy: str,
+        plan: dict[str, Any] | None,
+        full_power: bool,
         before_code: str,
         after_code: str,
         manifest_before: str,
@@ -1733,6 +1948,12 @@ def build_tools(
         when the owner rejected, None to proceed. Contexts without an
         approval engine (unit tests, headless cores) proceed ungated — the
         old prompt_always card did not exist there either.
+
+        luna-plugins plans/016: the card leads with the change PLAN (the
+        agent's plain-words reasoning) so the owner reads plan + change
+        together and decides once. `full_power` (the plans_full_power
+        setting) skips the card entirely — audited auto-approval — but the
+        plan row was already required to get here.
         """
         approvals = None
         if ctx is not None:
@@ -1760,6 +1981,11 @@ def build_tools(
                 "restores a proven version."
             )
         changes: list[dict[str, Any]] = []
+        if plan is not None:
+            changes.append({
+                "label": "Plan", "kind": "text",
+                "text": f"{plan['title']}\n\n{plan['body']}",
+            })
         if before_code != after_code:
             changes.append({
                 "label": "Playbook code", "kind": "diff",
@@ -1793,14 +2019,11 @@ def build_tools(
             f"{verb} playbook '{name}' version {target_version}: {headline}"
         )
         ops = await ops_conversation_id(ctx)
-        try:
-            state = conversation_state(ctx)
-        except Exception:  # noqa: BLE001 — pre-089 cores lack the accessor
-            state = None
-        if autonomy == "auto" and state == "fix_publish":
-            # The 0.26.0 model contract, honored for real now: the owner
-            # pre-authorized fix-flow publishes of this playbook. Audited
-            # with the same presentation so History reads the same way.
+        if full_power:
+            # plans/016: the owner granted standing full power (playbooks
+            # settings). No card — but the decision is audited with the same
+            # presentation so History reads the same way, and the plan row
+            # was already required to get here.
             try:
                 await approvals.record_auto_approval(
                     kind="playbook_change",
@@ -1809,8 +2032,7 @@ def build_tools(
                     requested_by_plugin="plugin-playbooks",
                     decided_by="policy",
                     decision_reason=(
-                        "publish_autonomy='auto' for this playbook in the "
-                        "ops fix flow"
+                        "plans_full_power granted in playbooks settings"
                     ),
                     conversation_id=ops,
                     presentation=presentation,
@@ -1840,6 +2062,7 @@ def build_tools(
         })
     async def _do_publish(
         name: str, version: int | None, *, action: str, explanation: str = "",
+        plan_id: str = "",
     ) -> str:
         """0.26.0 (plans/015, 089 contract #8): THE publish function — the
         only way any version becomes live. version=None publishes the
@@ -1867,6 +2090,16 @@ def build_tools(
                 ),
                 "hint": _EXPLANATION_HINT,
             })
+        # luna-plugins plans/016: THE plan gate — every publish and rollback
+        # runs under a plan the owner can read. The single point of
+        # enforcement in the plans design.
+        async with session_factory() as session:
+            plan_row, plan_refusal = await _plan_gate(session, plan_id)
+            if plan_refusal is not None:
+                return plan_refusal
+            plan_card = {"id": str(plan_row.id), "title": plan_row.title,
+                         "body": plan_row.body}
+            grant_full_power = await _plans_full_power(session)
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
@@ -1994,7 +2227,6 @@ def build_tools(
             old_live = _live_version_of(playbook)
             target_version = row.version
             playbook_name = playbook.name
-            autonomy = getattr(playbook, "publish_autonomy", "ask")
             try:
                 before_code = _derive_code(playbook)
             except Exception:  # noqa: BLE001 — legacy defs may not codegen
@@ -2024,13 +2256,22 @@ def build_tools(
         refusal = await _request_publish_decision(
             name=playbook_name, action=action,
             target_version=target_version, explanation=explanation,
-            evidence=evidence_ref, autonomy=autonomy,
+            evidence=evidence_ref, plan=plan_card,
+            full_power=grant_full_power,
             before_code=before_code, after_code=after_code,
             manifest_before=manifest_before, manifest_after=manifest_after,
             specs_added=sorted(spec_names_after - spec_names_before),
             specs_removed=sorted(spec_names_before - spec_names_after),
         )
         if refusal is not None:
+            # plans/016: the owner said no to this plan+change — the plan
+            # row keeps their words.
+            try:
+                reason = json.loads(refusal).get("owner_reason")
+            except Exception:  # noqa: BLE001
+                reason = None
+            async with session_factory() as session:
+                await _plan_record_rejection(session, plan_card["id"], reason)
             return refusal
 
         # Re-lock and flip: the approved target must still be current.
@@ -2118,29 +2359,49 @@ def build_tools(
                 "change_summary": change_summary,
             },
         )
+        # plans/016: code stamps the outcome facts into the plan row — the
+        # agent's narrative comes separately via playbook_plan_finish.
+        async with session_factory() as session:
+            await _plan_stamp_outcome(session, plan_card["id"], {
+                "action": action,
+                "playbook": name,
+                "old_live_version": old_live,
+                "new_live_version": new_live,
+                "evidence_run_id": (
+                    str(evidence_ref.id) if evidence_ref is not None else None
+                ),
+            })
         rolled_back = action == "rollback"
         return json.dumps({
             "playbook": name,
             "status": "rolled_back" if rolled_back else "published",
             "live_version": new_live,
             "previous_live_version": old_live,
+            "plan_id": plan_card["id"],
             "gates": gates,
             "note": (
-                f"Version {new_live} is live again (manifest included). "
-                f"Version {old_live} stays in history — publish a new "
-                "candidate to move forward."
-                if rolled_back else
-                f"Version {new_live} is now LIVE — triggers and playbook_run "
-                f"execute it. playbook_rollback(name) restores version "
-                f"{old_live} if it misbehaves. Announced in the ops chat."
+                (
+                    f"Version {new_live} is live again (manifest included). "
+                    f"Version {old_live} stays in history — publish a new "
+                    "candidate to move forward."
+                    if rolled_back else
+                    f"Version {new_live} is now LIVE — triggers and "
+                    f"playbook_run execute it. playbook_rollback(name) "
+                    f"restores version {old_live} if it misbehaves."
+                )
+                + " Now write the wrap-up: playbook_plan_finish(plan_id="
+                + f"'{plan_card['id']}', summary=…) — 2-6 plain sentences "
+                "for the owner on what happened."
             ),
         })
 
     async def _publish(
         *, name: str, explanation: str = "", version: int | None = None,
+        plan_id: str = "",
     ) -> str:
         return await _do_publish(
             name, version, action="publish", explanation=explanation,
+            plan_id=plan_id,
         )
 
     tools.append((
@@ -2159,7 +2420,9 @@ def build_tools(
                 "the gates pass, the owner gets ONE approval card for the "
                 "whole change: your `explanation` in plain language up "
                 "front, the technical diff collapsed behind it. Every "
-                "publish is announced in the ops chat with its evidence."
+                "publish is announced in the ops chat with its evidence. "
+                "Requires `plan_id` — every playbook change runs under a "
+                "plan (playbook_plan_write)."
             ),
             parameters={
                 "type": "object",
@@ -2175,6 +2438,14 @@ def build_tools(
                             "stack traces."
                         ),
                     },
+                    "plan_id": {
+                        "type": "string",
+                        "description": (
+                            "The change plan this publish runs under "
+                            "(playbook_plan_write). The owner sees the plan "
+                            "and the change on one card."
+                        ),
+                    },
                     "version": {
                         "type": "integer",
                         "description": (
@@ -2183,7 +2454,7 @@ def build_tools(
                         ),
                     },
                 },
-                "required": ["name", "explanation"],
+                "required": ["name", "explanation", "plan_id"],
             },
             # plans/018 phase 1: the owner approval is raised by the handler
             # AFTER the gates pass (one rich card per change) — the core
@@ -2195,13 +2466,15 @@ def build_tools(
             # a late approval resumed nothing and the card was orphaned).
             timeout_seconds=900,
             risk_level="medium",
-            modes=["building", "fix_publish"],
+            modes=_ALL_MODES,
         ),
         _publish,
     ))
 
     # --- playbook_rollback (live ← previous live, via the publish path) ---
-    async def _rollback(*, name: str, explanation: str = "") -> str:
+    async def _rollback(
+        *, name: str, explanation: str = "", plan_id: str = "",
+    ) -> str:
         # 0.26.0 (plans/015, 089 contract #8): rollback resolves the target
         # version, then publishes it through the SAME gated function.
         async with session_factory() as session:
@@ -2229,6 +2502,7 @@ def build_tools(
                 })
         return await _do_publish(
             name, target_n, action="rollback", explanation=explanation,
+            plan_id=plan_id,
         )
 
     tools.append((
@@ -2242,7 +2516,8 @@ def build_tools(
                 "change misbehaves. Runs through the same publish gate "
                 "(the prior version's live history is its test evidence), "
                 "asks the owner with ONE plain-language approval card, and "
-                "announces in the ops chat."
+                "announces in the ops chat. Requires `plan_id` — every "
+                "playbook change runs under a plan (playbook_plan_write)."
             ),
             parameters={
                 "type": "object",
@@ -2258,8 +2533,15 @@ def build_tools(
                             "stack traces."
                         ),
                     },
+                    "plan_id": {
+                        "type": "string",
+                        "description": (
+                            "UUID of the plan this rollback runs under "
+                            "(from playbook_plan_write)."
+                        ),
+                    },
                 },
-                "required": ["name", "explanation"],
+                "required": ["name", "explanation", "plan_id"],
             },
             # plans/018 phase 1: owner approval raised handler-side (see
             # playbook_publish).
@@ -2267,7 +2549,7 @@ def build_tools(
             # 0.30.3: parks on the owner card, same as playbook_publish.
             timeout_seconds=900,
             risk_level="medium",
-            modes=["building", "fix_publish"],
+            modes=_ALL_MODES,
         ),
         _rollback,
     ))

@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from readstage import parse_read_stage
-from evidence import EXPLANATION
+from evidence import EXPLANATION, make_plan
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -247,7 +247,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
     await _save_candidate(tools)
     await _green_run(sf, 2)
     bus.events.clear()
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert out["status"] == "published"
     assert out["live_version"] == 2
     assert out["previous_live_version"] == 1
@@ -268,7 +268,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
 async def test_promote_without_candidate_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert "no candidate" in out["error"]
 
 
@@ -289,7 +289,7 @@ async def test_promote_gate_names_static_validation_failure(env):
         }]
         row.definition = bad
         await s.commit()
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert "static_validation" in out["error"]
     assert out["gate"] == "static_validation"
     assert out["issues"]
@@ -306,7 +306,7 @@ async def test_promote_keeps_live_manifest(env):
     )
     await _save_candidate(tools)
     await _green_run(sf, 2)
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert out["status"] == "published"
     pb = await _get(sf)
     assert pb.manifest == "## Purpose\nGreets.\n"
@@ -320,11 +320,11 @@ async def test_rollback_restores_previous_live(env):
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _save_candidate(tools)
     await _green_run(sf, 2)
-    await tools["playbook_publish"](explanation=EXPLANATION, name="greeter")
+    await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools))
     # rollback publishes v1 through the same gate — its live history is
     # the evidence.
     await _green_run(sf, 1, is_test=False)
-    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert out["status"] == "rolled_back"
     assert out["live_version"] == 1
     assert out["previous_live_version"] == 2
@@ -339,7 +339,7 @@ async def test_rollback_restores_previous_live(env):
 async def test_rollback_without_history_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
-    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
     assert "no previous version" in out["error"]
 
 

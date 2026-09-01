@@ -5,7 +5,7 @@ entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_delegations", "playbook_fix_proposals"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_delegations", "playbook_fix_proposals", "playbook_plans", "playbook_app_settings"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -33,8 +33,8 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 25
-tables = 10
+tools = 28
+tables = 12
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
 # agent_tools.build_tools + delegation.build_delegation_tools and pinned by
@@ -124,6 +124,24 @@ name = "playbook_manifest_set"
 description = "Set or replace a playbook's intent manifest (owner approval; lead with why)."
 policy = "prompt_always"
 risk_level = "medium"
+
+[[tools]]
+name = "playbook_plan_write"
+description = "Write a change plan (owner-readable text) — required before any publish."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_plan_read"
+description = "List change plans or read one in full."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_plan_finish"
+description = "Close a plan with a plain-language execution summary."
+policy = "auto_approve"
+risk_level = "low"
 
 [[tools]]
 name = "playbook_publish"

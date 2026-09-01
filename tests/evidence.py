@@ -5,6 +5,7 @@ version row was created, so the gate sees fresh evidence.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -19,6 +20,35 @@ EXPLANATION = (
     "version fixes the reported problem and was tested with a green run "
     "before publishing. Nothing else about the playbook changes."
 )
+
+# plans/016 phase 1: every publish/rollback runs under a plan. Shared valid
+# body (>= 100 chars, owner language) for every test that is not itself
+# about the plan gate.
+PLAN_BODY = (
+    "The greeter playbook greets people by the wrong field. I will change "
+    "it to use the person's name, test the candidate with a real run, and "
+    "publish once the run is green. Nothing else changes."
+)
+
+
+async def make_plan(tools, *, title: str = "Fix the greeter playbook") -> str:
+    """Write a valid plan through the real tool; returns its plan_id."""
+    out = json.loads(await tools["playbook_plan_write"](
+        title=title, body=PLAN_BODY, playbook_refs=["greeter"],
+    ))
+    assert "plan_id" in out, out
+    return out["plan_id"]
+
+
+async def seed_plan(sf, *, title: str = "Fix the greeter playbook") -> str:
+    """Insert a plan row directly (for route tests without the tool dict)."""
+    from plugin_playbooks.models import PlaybookPlan
+    async with sf() as s:
+        p = PlaybookPlan(title=title, body=PLAN_BODY, playbook_refs=["greeter"])
+        s.add(p)
+        await s.commit()
+        await s.refresh(p)
+        return str(p.id)
 
 
 async def green_run(

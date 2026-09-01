@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
-from evidence import EXPLANATION
+from evidence import EXPLANATION, make_plan, seed_plan
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -274,13 +274,13 @@ async def test_restore_runs_the_restored_versions_own_specs(env):
     assert set(await _specs(sf, 1)) == {"s1"}
 
     await _green_run(sf, 1)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
     assert r.status_code == 200, r.text            # v1's own spec is green
     assert (await _pb(sf)).live_version == 1
 
     # and the other way: v2's set is red → refused, naming the gate
     await _green_run(sf, 2)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 2})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 2, "plan_id": await seed_plan(sf)})
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["gate"] == "specs"
     assert "v2" in r.json()["detail"]["message"]
@@ -303,7 +303,7 @@ async def test_tool_publish_restore_uses_the_same_gate(env):
             "send_chat_message": {"args_contain": {"message": "Slartibartfast"}}}}}
         await s.commit()
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(handlers)))
     assert out["gate"] == "specs"
     assert (await _pb(sf)).live_version == 2
 

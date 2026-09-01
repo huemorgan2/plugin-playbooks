@@ -13,13 +13,14 @@ import uuid
 
 import pytest
 
-from evidence import EXPLANATION, green_run
+from evidence import EXPLANATION, green_run, make_plan
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import Base, Playbook
+from plugin_playbooks.plans import set_full_power
 
 
 class _Bus:
@@ -134,6 +135,7 @@ async def test_publish_files_one_rich_approval_then_flips():
         await _green_candidate(sf, tools)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
         ))
         assert out["status"] == "published"
         assert out["live_version"] == 2
@@ -168,6 +170,7 @@ async def test_rejected_publish_leaves_live_untouched():
         await _green_candidate(sf, tools)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
         ))
         assert "did not approve" in out["error"]
         assert out["owner_reason"] == "not this week"
@@ -195,6 +198,7 @@ async def test_candidate_changed_during_approval_wait_refuses_flip():
         approvals.on_request = edit_while_pending
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
         ))
         assert "candidate changed" in out["error"]
         pb = await _live_state(sf)
@@ -204,17 +208,18 @@ async def test_candidate_changed_during_approval_wait_refuses_flip():
 
 
 @pytest.mark.asyncio
-async def test_publish_autonomy_auto_in_fix_publish_records_audit_only():
+async def test_full_power_records_audit_only():
+    # plans/016 phase 1: `plans_full_power` replaces the old per-playbook
+    # publish_autonomy=='auto' + fix_publish branch.
     approvals = _Approvals()
-    engine, sf, tools = await _env(_Ctx(approvals, state="fix_publish"))
+    engine, sf, tools = await _env(_Ctx(approvals))
     try:
         await _green_candidate(sf, tools)
         async with sf() as s:
-            pb = (await s.execute(select(Playbook))).scalar_one()
-            pb.publish_autonomy = "auto"
-            await s.commit()
+            await set_full_power(s, True)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
         ))
         assert out["status"] == "published"
         assert approvals.requests == []  # no blocking ask
@@ -231,10 +236,14 @@ async def test_rollback_carries_explanation_and_reverse_diff():
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
         await _green_candidate(sf, tools)
-        await tools["playbook_publish"](name="greeter", explanation=EXPLANATION)
+        await tools["playbook_publish"](
+            name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
+        )
         await green_run(sf, 1)  # restore evidence: v1 has a completed run
         out = json.loads(await tools["playbook_rollback"](
             name="greeter", explanation=EXPLANATION,
+            plan_id=await make_plan(tools),
         ))
         assert out["status"] == "rolled_back"
         req = approvals.requests[-1]

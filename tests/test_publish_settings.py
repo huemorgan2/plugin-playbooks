@@ -16,7 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
-from evidence import EXPLANATION
+from evidence import EXPLANATION, make_plan, seed_plan
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -143,7 +143,7 @@ async def test_restore_red_specs_refused_when_required_names_setting(env):
     # v2 via owner PUT so v1 is restorable; v2 inherits the red spec.
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
     assert r.status_code == 422, r.text
     body = r.json()["detail"]
     assert body["gate"] == "specs"
@@ -156,7 +156,7 @@ async def test_restore_red_specs_allowed_when_specs_gate_off(env):
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
     await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_specs": False})
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
     assert r.status_code == 200, r.text
     p = await _pb(sf)
     assert p.live_version == 1
@@ -174,7 +174,7 @@ async def test_tool_publish_reports_unenforced_specs_gate(env):
     await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_specs": False})
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(handlers)))
     assert out.get("status") == "published", out
     specs_gate = next(g for g in out["gates"] if g["gate"] == "specs")
     assert specs_gate["ok"] is False
@@ -188,7 +188,7 @@ async def test_restore_without_run_refused_when_required_names_setting(env):
     sf, handlers, client = env
     await _seed(handlers, specs={"ok": SPEC_OK})
     await _owner_edit(sf, client)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
     assert r.status_code == 422, r.text
     body = r.json()["detail"]
     assert body["gate"] == "test_run"
@@ -200,7 +200,7 @@ async def test_restore_without_run_allowed_when_run_gate_off(env):
     await _seed(handlers, specs={"ok": SPEC_OK})
     await _owner_edit(sf, client)
     await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_run": False})
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
     assert r.status_code == 200, r.text
     assert (await _pb(sf)).live_version == 1
 
@@ -230,7 +230,7 @@ async def test_candidate_tool_publish_run_gate_off(env):
     ))
     assert "error" not in out, out
     assert (await _pb(sf)).candidate_version == 2
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(handlers)))
     assert out.get("status") == "published", out
     run_gate = next(g for g in out["gates"] if g["gate"] == "test_run")
     assert run_gate["ok"] is False and run_gate["enforced"] is False
