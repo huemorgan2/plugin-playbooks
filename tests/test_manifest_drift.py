@@ -11,7 +11,9 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from plugin_playbooks import PlaybooksPlugin
 from plugin_playbooks.agent_tools import build_tools
+from plugin_playbooks.delegation import build_delegation_tools
 from plugin_playbooks.models import Base
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +39,11 @@ def _toml() -> dict:
 
 def _code_tooldefs():
     tds = [td for td, _ in build_tools(None, _Bus(), _StubRunner())]
+    # plans/020: the delegation tools ship in the manifest too. Building the
+    # defs needs no ctx/session — those are only touched inside the handlers.
+    tds += [td for td, _ in build_delegation_tools(
+        None, None, PlaybooksPlugin.AUTHORING_TOOLS,
+    )]
     return {td.name: td for td in tds}
 
 
