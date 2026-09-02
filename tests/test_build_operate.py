@@ -350,6 +350,9 @@ def test_mode_declarations():
         "playbook_language_reference", "playbook_spec_list",
         "playbook_spec_from_run", "playbook_preflight",
         "playbook_publish", "playbook_rollback",
+        # plans/022 P4: coding-agent-grade reads are mode-free
+        "playbook_versions", "playbook_version_read",
+        "playbook_version_diff", "playbook_runs",
     }
     # everything else (draft authoring, runs, autonomy, acks) is
     # building-only by default — absent while the owner is planning.

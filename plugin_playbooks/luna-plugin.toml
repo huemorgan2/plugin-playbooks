@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.38.0"
+version = "0.39.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -33,7 +33,7 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 24
+tools = 28
 tables = 10
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
@@ -86,6 +86,30 @@ risk_level = "low"
 [[tools]]
 name = "playbook_get_definition"
 description = "Get the pblang source of a playbook version."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_versions"
+description = "List every stored version of a playbook with content/spec/run summary."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_version_read"
+description = "Full read of any stored version: code, manifest, specs, recent runs."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_version_diff"
+description = "Unified diff of code + manifest between two stored versions."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_runs"
+description = "List a playbook's runs with full failure output; filter by version/status."
 policy = "auto_approve"
 risk_level = "low"
 

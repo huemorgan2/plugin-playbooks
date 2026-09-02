@@ -66,7 +66,10 @@ def _gate_owner_line(gate: dict[str, Any]) -> str:
     if g == "test_run":
         if ok:
             return "Test run: green"
-        return "No green test run of this version"
+        # plans/022 P1: a FAILED run and a MISSING run are different truths.
+        if "FAILED" in note:
+            return "Test run: latest run of this version FAILED"
+        return "No test run of this version"
     if g == "probes":
         return (
             "Tools it uses are reachable" if ok
@@ -879,7 +882,8 @@ def build_tools(
         defn["name"] = playbook.name  # never rename via promote/rollback
         playbook.definition = defn
         playbook.code = row.code
-        if restore_manifest:
+        # plans/022 P6: a row with NO manifest never NULLs the live manifest.
+        if restore_manifest and row.manifest:
             playbook.manifest = row.manifest
         playbook.description = defn.get("description") or playbook.description
         playbook.when_to_use = defn.get("when_to_use") or playbook.when_to_use
@@ -954,6 +958,355 @@ def build_tools(
             },
         ),
         _playbook_get_definition,
+    ))
+
+    # --- plans/022 P4: coding-agent-grade reads -------------------------
+    # The agent reads a playbook's history the way a coding agent reads
+    # files: every version's code, specs, manifest, and runs, plus diffs.
+    # All read tools are planning+building (identify inherits planning since
+    # core plan 100) — during the meltdown the agent diagnosed blind.
+
+    async def _versions(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            rows = (await session.execute(
+                select(PlaybookVersion)
+                .where(PlaybookVersion.playbook_id == playbook.id)
+                .order_by(PlaybookVersion.version)
+            )).scalars().all()
+            spec_counts: dict[int, int] = {}
+            for v, in (await session.execute(
+                select(PlaybookSpec.playbook_version).where(
+                    PlaybookSpec.playbook_id == playbook.id,
+                )
+            )).all():
+                spec_counts[v] = spec_counts.get(v, 0) + 1
+            run_counts: dict[int, dict[str, int]] = {}
+            for v, status in (await session.execute(
+                select(PlaybookRun.playbook_version, PlaybookRun.status).where(
+                    PlaybookRun.playbook_id == playbook.id,
+                )
+            )).all():
+                c = run_counts.setdefault(v, {})
+                c[status] = c.get(status, 0) + 1
+            live_n = _live_version_of(playbook)
+            return json.dumps({
+                "playbook": name,
+                "live_version": live_n,
+                "candidate_version": playbook.candidate_version,
+                "count": len(rows),
+                "versions": [
+                    {
+                        "version": r.version,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "author": r.author,
+                        "message": r.message,
+                        "promoted_from": r.promoted_from,
+                        "has_code": bool(r.code),
+                        "has_manifest": bool(r.manifest),
+                        "spec_count": spec_counts.get(r.version, 0),
+                        "runs": run_counts.get(r.version, {}),
+                        "live": r.version == live_n,
+                        "candidate": r.version == playbook.candidate_version,
+                    }
+                    for r in rows
+                ],
+            })
+
+    tools.append((
+        ToolDef(
+            name="playbook_versions",
+            modes=["planning", "building"],
+            description=(
+                "List EVERY stored version of a playbook — like a file "
+                "listing of its history: version number, when and by whom, "
+                "commit message, lineage (promoted_from), whether it has "
+                "code/manifest, its spec (test) count, run counts by "
+                "status, and which is live / candidate. Read any of them "
+                "with playbook_version_read; compare with "
+                "playbook_version_diff."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _versions,
+    ))
+
+    async def _version_read(
+        *, name: str, version: int, include_specs: bool = True,
+        include_runs: bool = True,
+    ) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            row = await _get_version_row(session, playbook, version)
+            if row is None:
+                return json.dumps({
+                    "error": f"'{name}' has no stored version {version}.",
+                    "hint": "playbook_versions lists what exists.",
+                })
+            try:
+                code = _version_code(row)
+            except Exception as e:  # noqa: BLE001 — legacy defs stay readable
+                code = f"# (code could not be rendered: {e})"
+            out: dict[str, Any] = {
+                "playbook": name,
+                "version": row.version,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "author": row.author,
+                "message": row.message,
+                "promoted_from": row.promoted_from,
+                "live": row.version == _live_version_of(playbook),
+                "candidate": row.version == playbook.candidate_version,
+                "code": code,
+                "manifest": row.manifest,
+                "definition_yaml": yaml.dump(
+                    row.definition, default_flow_style=False, sort_keys=False,
+                ),
+            }
+            if include_specs:
+                specs = (await session.execute(
+                    select(PlaybookSpec).where(
+                        PlaybookSpec.playbook_id == playbook.id,
+                        PlaybookSpec.playbook_version == row.version,
+                    ).order_by(PlaybookSpec.name)
+                )).scalars().all()
+                out["specs"] = [
+                    {
+                        "name": s.name,
+                        "carried_from": (s.spec or {}).get("carried_from"),
+                        "last_result": s.last_result,
+                        "spec": s.spec,
+                    }
+                    for s in specs
+                ]
+            if include_runs:
+                runs = (await session.execute(
+                    select(PlaybookRun).where(
+                        PlaybookRun.playbook_id == playbook.id,
+                        PlaybookRun.playbook_version == row.version,
+                    ).order_by(PlaybookRun.started_at.desc()).limit(10)
+                )).scalars().all()
+                out["recent_runs"] = [
+                    {
+                        "run_id": str(r.id),
+                        "status": r.status,
+                        "trigger": r.trigger,
+                        "is_test": bool(r.is_test),
+                        "started_at": r.started_at.isoformat() if r.started_at else None,
+                    }
+                    for r in runs
+                ]
+            return json.dumps(out)
+
+    tools.append((
+        ToolDef(
+            name="playbook_version_read",
+            modes=["planning", "building"],
+            description=(
+                "Full read of ANY stored playbook version — the equivalent "
+                "of `cat` on an old file: its code, YAML definition, "
+                "manifest, specs (tests, with carried-from provenance and "
+                "last results), and its 10 most recent runs. Use "
+                "playbook_runs for a run's full failure output."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "version": {"type": "integer", "description": "Version number to read"},
+                    "include_specs": {"type": "boolean", "default": True},
+                    "include_runs": {"type": "boolean", "default": True},
+                },
+                "required": ["name", "version"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _version_read,
+    ))
+
+    async def _version_diff(
+        *, name: str, from_version: int, to_version: int,
+    ) -> str:
+        import difflib
+
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            row_a = await _get_version_row(session, playbook, from_version)
+            row_b = await _get_version_row(session, playbook, to_version)
+            missing = [
+                str(n) for n, r in ((from_version, row_a), (to_version, row_b))
+                if r is None
+            ]
+            if missing:
+                return json.dumps({
+                    "error": (
+                        f"'{name}' has no stored version "
+                        f"{' or '.join(missing)}."
+                    ),
+                    "hint": "playbook_versions lists what exists.",
+                })
+
+            def _safe_code(row: PlaybookVersion) -> str:
+                try:
+                    return _version_code(row)
+                except Exception as e:  # noqa: BLE001
+                    return f"# (code could not be rendered: {e})"
+
+            code_diff = "\n".join(difflib.unified_diff(
+                _safe_code(row_a).splitlines(),
+                _safe_code(row_b).splitlines(),
+                fromfile=f"{name}@v{from_version}",
+                tofile=f"{name}@v{to_version}",
+                lineterm="",
+            ))
+            manifest_diff = "\n".join(difflib.unified_diff(
+                (row_a.manifest or "").splitlines(),
+                (row_b.manifest or "").splitlines(),
+                fromfile=f"manifest@v{from_version}",
+                tofile=f"manifest@v{to_version}",
+                lineterm="",
+            ))
+            return json.dumps({
+                "playbook": name,
+                "from_version": from_version,
+                "to_version": to_version,
+                "code_diff": code_diff or "(identical)",
+                "manifest_diff": manifest_diff or "(identical)",
+            })
+
+    tools.append((
+        ToolDef(
+            name="playbook_version_diff",
+            modes=["planning", "building"],
+            description=(
+                "Unified diff of playbook code + manifest between any two "
+                "stored versions — how a coding agent compares two "
+                "revisions of a file."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "from_version": {"type": "integer"},
+                    "to_version": {"type": "integer"},
+                },
+                "required": ["name", "from_version", "to_version"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _version_diff,
+    ))
+
+    async def _runs_read(
+        *, name: str, version: int | None = None, status: str = "",
+        limit: int = 10,
+    ) -> str:
+        limit = max(1, min(int(limit), 50))
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            q = (
+                select(PlaybookRun)
+                .where(PlaybookRun.playbook_id == playbook.id)
+                .order_by(PlaybookRun.started_at.desc())
+                .limit(limit)
+            )
+            if version is not None:
+                q = q.where(PlaybookRun.playbook_version == version)
+            if status:
+                q = q.where(PlaybookRun.status == status)
+            runs = (await session.execute(q)).scalars().all()
+            out_runs: list[dict[str, Any]] = []
+            for r in runs:
+                entry: dict[str, Any] = {
+                    "run_id": str(r.id),
+                    "version": r.playbook_version,
+                    "status": r.status,
+                    "trigger": r.trigger,
+                    "is_test": bool(r.is_test),
+                    "inputs": r.inputs,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                }
+                if r.status == "failed":
+                    # plans/022 P4: reading a failing run must be as good as
+                    # reading a CI log — FULL error text, never truncated.
+                    failed_steps = (await session.execute(
+                        select(PlaybookStepRun).where(
+                            PlaybookStepRun.run_id == r.id,
+                            PlaybookStepRun.status == "failed",
+                        ).order_by(PlaybookStepRun.started_at)
+                    )).scalars().all()
+                    entry["failures"] = [
+                        {
+                            "step_id": s.step_id,
+                            "step_kind": s.step_kind,
+                            "error": s.error,
+                            "inputs": s.inputs,
+                        }
+                        for s in failed_steps
+                    ]
+                out_runs.append(entry)
+            return json.dumps({
+                "playbook": name,
+                "count": len(out_runs),
+                "filters": {"version": version, "status": status or None},
+                "runs": out_runs,
+                **({"note": "No runs match these filters."} if not out_runs else {}),
+            })
+
+    tools.append((
+        ToolDef(
+            name="playbook_runs",
+            modes=["planning", "building"],
+            description=(
+                "List a playbook's runs, newest first — filter by version= "
+                "and/or status= (running/done/failed/cancelled). Failed "
+                "runs include every failed step's FULL error text and "
+                "resolved inputs (read it like a CI log). Use "
+                "playbook_status for one run's complete step-by-step trace."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "version": {"type": "integer", "description": "Only runs of this version"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["running", "done", "failed", "cancelled"],
+                    },
+                    "limit": {"type": "integer", "default": 10, "maximum": 50},
+                },
+                "required": ["name"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _runs_read,
     ))
 
     # --- playbook_validate (the compiler) ---
@@ -1572,6 +1925,7 @@ def build_tools(
         target_version: int,
         explanation: str,
         evidence: Any,
+        failed_run: Any = None,
         gates: list[dict[str, Any]],
         before_code: str,
         after_code: str,
@@ -1591,33 +1945,54 @@ def build_tools(
         so the owner sees the picture (tests green? test run done?) before
         deciding. Every agent publish raises the card — no standing skip.
         """
-        approvals = None
-        if ctx is not None:
-            try:
-                approvals = ctx.approval
-            except Exception:  # noqa: BLE001 — unwired engine: degrade, don't die
-                approvals = None
-        if approvals is None:
+        # plans/022 P2: approvals fail CLOSED. Only a truly headless context
+        # (no ctx at all — unit tests, headless cores) proceeds ungated; a
+        # live context whose approval engine is broken/unwired ABORTS —
+        # "approval infrastructure failed" must never read as "approved".
+        if ctx is None:
             _log.warning(
-                "publish proceeding without owner approval (no approval "
-                "engine) playbook=%s action=%s", name, action,
+                "publish proceeding without owner approval (headless, no "
+                "ctx) playbook=%s action=%s", name, action,
             )
             return None
+        try:
+            approvals = ctx.approval
+        except Exception:  # noqa: BLE001
+            approvals = None
+        if approvals is None:
+            return json.dumps({
+                "error": (
+                    "Approval not obtained — nothing was published. The "
+                    "approval engine is unavailable in this context."
+                ),
+                "hint": (
+                    "Retry when the approval system is back, or the owner "
+                    "can publish from the playbook page."
+                ),
+            })
 
         verb = "Restore" if action == "rollback" else "Publish"
         headline = (
             explanation.splitlines()[0].strip()[:90] if explanation
             else f"{verb} version {target_version} of '{name}'"
         )
+        # plans/022 P1: the evidence line states the REAL run status — "green"
+        # only when a run actually passed.
         if evidence is not None:
             evidence_line = (
                 f"Evidence: green run of version {target_version} "
                 f"(run {evidence.id})."
             )
+        elif failed_run is not None:
+            evidence_line = (
+                f"Evidence: NONE — the latest run of version "
+                f"{target_version} FAILED (run {failed_run.id}). The run "
+                "gate is not enforced (Settings → Publish)."
+            )
         else:
             evidence_line = (
-                f"Evidence: version {target_version} ran live before — this "
-                "restores a proven version."
+                f"Evidence: none — no completed run of version "
+                f"{target_version}."
             )
         changes: list[dict[str, Any]] = []
         # 021: ✓/✗ status bullets — the gate picture in owner words.
@@ -1663,15 +2038,33 @@ def build_tools(
             f"{verb} playbook '{name}' version {target_version}: {headline}"
         )
         ops = await ops_conversation_id(ctx)
-        decision = await approvals.request(
-            kind="playbook_change",
-            summary=summary,
-            payload=payload,
-            requested_by_plugin="plugin-playbooks",
-            risk_level="medium",
-            conversation_id=ops,
-            presentation=presentation,
-        )
+        try:
+            decision = await approvals.request(
+                kind="playbook_change",
+                summary=summary,
+                payload=payload,
+                requested_by_plugin="plugin-playbooks",
+                risk_level="medium",
+                conversation_id=ops,
+                presentation=presentation,
+            )
+        except Exception as e:  # noqa: BLE001 — plans/022 P2: fail CLOSED
+            _log.exception(
+                "publish approval wait failed playbook=%s action=%s",
+                name, action,
+            )
+            return json.dumps({
+                "error": (
+                    "Approval not obtained — nothing was published. The "
+                    f"approval wait failed ({type(e).__name__}); the owner "
+                    "never decided."
+                ),
+                "hint": (
+                    "Do NOT retry in a loop. Tell the owner an approval "
+                    "card may be pending, and retry the publish once they "
+                    "confirm the card is gone."
+                ),
+            })
         if getattr(decision, "decision", None) == "approved":
             return None
         return json.dumps({
@@ -1767,7 +2160,7 @@ def build_tools(
             # run of this EXACT version recorded after the version row was
             # created (rows are immutable, so that is "since its last edit").
             # For restores the version's live history counts as evidence.
-            test_gate, refusal, evidence = await test_run_gate(
+            test_gate, refusal, evidence, failed_run = await test_run_gate(
                 session, playbook.id, row.version, row.created_at,
                 include_live=not is_candidate,
                 require=playbook.publish_require_run,
@@ -1780,6 +2173,9 @@ def build_tools(
             evidence_ref = SimpleNamespace(
                 id=evidence.id, completed_at=evidence.completed_at,
             ) if evidence is not None else None
+            failed_run_ref = SimpleNamespace(
+                id=failed_run.id, completed_at=failed_run.completed_at,
+            ) if failed_run is not None else None
             # gate 4 (0.12.0): probes — every tool the version touches must
             # not be KNOWN-broken. Only `failed` probes block; `unprobeable`
             # (no probe declared) passes with a note. Results are cached on
@@ -1844,7 +2240,7 @@ def build_tools(
         refusal = await _request_publish_decision(
             name=playbook_name, action=action,
             target_version=target_version, explanation=explanation,
-            evidence=evidence_ref, gates=gates,
+            evidence=evidence_ref, failed_run=failed_run_ref, gates=gates,
             before_code=before_code, after_code=after_code,
             manifest_before=manifest_before, manifest_after=manifest_after,
             specs_added=sorted(spec_names_after - spec_names_before),
@@ -1916,14 +2312,35 @@ def build_tools(
             actor="agent",
             action=action,
             summary=change_summary,
+            failed_run=failed_run_ref,
         )
         rolled_back = action == "rollback"
+        # plans/022 P1: machine-readable evidence truth for downstream chats
+        # and the ops inbox.
+        spec_gate_entry = next(
+            (g for g in gates if g.get("gate") == "specs"), {},
+        )
+        evidence_block = {
+            "run_id": (
+                str(evidence_ref.id) if evidence_ref is not None
+                else str(failed_run_ref.id) if failed_run_ref is not None
+                else None
+            ),
+            "status": (
+                "passed" if evidence_ref is not None
+                else "failed" if failed_run_ref is not None
+                else "none"
+            ),
+            "spec_count": spec_gate_entry.get("total", 0),
+            "specs_passed": spec_gate_entry.get("passed", 0),
+        }
         return json.dumps({
             "playbook": name,
             "status": "rolled_back" if rolled_back else "published",
             "live_version": new_live,
             "previous_live_version": old_live,
             "gates": gates,
+            "evidence": evidence_block,
             "note": (
                 f"Version {new_live} is live again (manifest included). "
                 f"Version {old_live} stays in history — publish a new "
@@ -2392,6 +2809,7 @@ def build_tools(
                 {
                     "name": r.name,
                     "description": (r.spec or {}).get("description", ""),
+                    "carried_from": (r.spec or {}).get("carried_from"),
                     "created_by": r.created_by,
                     "last_result": r.last_result,
                     "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
@@ -2453,10 +2871,24 @@ def build_tools(
                 return json.dumps({
                     "error": f"'{name}' v{version_n} has no spec named '{spec_name}'.",
                 })
+            # plans/022 P3: a CARRIED spec is inherited coverage — deleting
+            # it needs a stated reason (visibility, not a gate: any reason
+            # passes, but "silently vanished" is no longer possible).
+            carried = (row.spec or {}).get("carried_from")
+            if carried is not None and not why.strip():
+                return json.dumps({
+                    "error": (
+                        f"Spec '{spec_name}' was carried forward from "
+                        f"version {carried} — deleting inherited coverage "
+                        "requires a reason. Pass why= (one sentence: why "
+                        "this test no longer applies)."
+                    ),
+                })
             await session.delete(row)
             await session.commit()
         return json.dumps({
             "playbook": name, "version": version_n, "spec": spec_name, "status": "deleted",
+            **({"carried_from": carried, "reason": why} if carried is not None else {}),
         })
 
     tools.append((

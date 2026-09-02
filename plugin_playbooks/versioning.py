@@ -21,13 +21,28 @@ def live_version_of(p: Playbook) -> int:
     return p.live_version or p.version
 
 
+def _dup_keep_key(r: PlaybookVersion) -> tuple:
+    """plans/022 P6: ONE ordering for picking among duplicate version rows,
+    shared by get_version_row and the healer (they must never disagree on
+    which row survives). Content wins before lineage before age — during the
+    meltdown the healer kept "the oldest" and only luck made that the row
+    with content."""
+    return (
+        not (r.definition and (r.definition.get("steps") or ())),  # has steps
+        not r.code,          # then non-empty code
+        not r.manifest,      # then non-empty manifest
+        r.promoted_from is None,  # then real lineage
+        r.created_at,        # then oldest
+    )
+
+
 async def get_version_row(
     session: AsyncSession, p: Playbook, n: int,
 ) -> PlaybookVersion | None:
     # Legacy DBs can hold DUPLICATE rows for one number (the pre-0.32 edit
     # path snapshotted at the counter even when a row existed) — pick
-    # deterministically instead of scalar_one_or_none() 500ing: real lineage
-    # (promoted_from set) beats a plain snapshot, then oldest wins.
+    # deterministically instead of scalar_one_or_none() 500ing, preferring
+    # rows with real content (_dup_keep_key).
     rows = (await session.execute(
         select(PlaybookVersion).where(
             PlaybookVersion.playbook_id == p.id,
@@ -36,7 +51,7 @@ async def get_version_row(
     )).scalars().all()
     if not rows:
         return None
-    return min(rows, key=lambda r: (r.promoted_from is None, r.created_at))
+    return min(rows, key=_dup_keep_key)
 
 
 async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
@@ -85,11 +100,16 @@ async def copy_specs(
     for s in src:
         if s.name in existing:
             continue
+        # plans/022 P3: carried specs carry provenance — `carried_from`
+        # names the ORIGINAL version the spec was authored on (not just the
+        # previous hop), so a spec that outlives many mints stays traceable.
+        spec_doc = dict(s.spec or {})
+        spec_doc.setdefault("carried_from", from_version)
         session.add(PlaybookSpec(
             playbook_id=playbook_id,
             playbook_version=to_version,
             name=s.name,
-            spec=s.spec,
+            spec=spec_doc,
             created_by=s.created_by,
             last_result=None,
             last_run_at=None,
@@ -135,6 +155,16 @@ async def mint_version(
         promoted_from=promoted_from,
     )
     session.add(row)
+    # plans/022 P6: assert the snapshot row actually reached the DB — the
+    # incident's "rowless v39" was a bumped counter with no content row,
+    # reported as success. Flush surfaces constraint/write errors HERE.
+    await session.flush()
+    if row.id is None:
+        raise RuntimeError(
+            f"version mint failed: counter moved to {p.version} but the "
+            "snapshot row was not written — aborting instead of leaving a "
+            "rowless version"
+        )
     await copy_specs(session, p.id, source_version, p.version)
     return row
 
@@ -145,8 +175,10 @@ async def heal_duplicate_version_rows(session_factory) -> int:
     The pre-0.32 whole-YAML edit path snapshotted at the current counter even
     when that number already had a row, leaving e.g. two v33s — the Versions
     list showed both and version reads 500ed (MultipleResultsFound). Keeps
-    the same row `get_version_row` prefers (real lineage first, then oldest)
-    and drops the rest. Idempotent; returns rows deleted."""
+    the same row `get_version_row` prefers (plans/022 P6: content first —
+    steps, then code, then manifest — then lineage, then oldest; see
+    _dup_keep_key) and drops the rest, logging what was dropped and why.
+    Idempotent; returns rows deleted."""
     import logging
 
     log = logging.getLogger("luna.plugin.playbooks")
@@ -163,15 +195,18 @@ async def heal_duplicate_version_rows(session_factory) -> int:
         for (pid, n), group in by_number.items():
             if len(group) < 2:
                 continue
-            keep = min(group, key=lambda r: (r.promoted_from is None, r.created_at))
+            keep = min(group, key=_dup_keep_key)
             for r in group:
                 if r.id != keep.id:
                     await session.delete(r)
                     deleted += 1
-            log.info(
-                "playbooks: healed %d duplicate row(s) of version %d "
-                "(playbook %s)", len(group) - 1, n, pid,
-            )
+                    log.info(
+                        "playbooks: healing dropped duplicate v%d row %s "
+                        "(playbook %s): steps=%s code=%s manifest=%s "
+                        "created=%s — kept %s", n, r.id, pid,
+                        bool(r.definition and r.definition.get("steps")),
+                        bool(r.code), bool(r.manifest), r.created_at, keep.id,
+                    )
         if deleted:
             await session.commit()
     return deleted

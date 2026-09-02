@@ -175,7 +175,9 @@ async def test_mint_resets_the_copied_result_cache(env):
     v2 = await _specs(sf, 2)
     assert v2["s1"].last_result is None and v2["s1"].last_run_at is None
     assert v2["s1"].last_version is None
-    assert v2["s1"].spec == (await _specs(sf, 1))["s1"].spec
+    # plans/022 P3: the copy is the original spec plus provenance
+    v1_spec = (await _specs(sf, 1))["s1"].spec
+    assert v2["s1"].spec == {**v1_spec, "carried_from": 1}
     # idempotent: names already on the target are not duplicated
     async with sf() as s:
         assert await copy_specs(s, pb.id, 1, 2) == 0
@@ -198,8 +200,10 @@ async def test_spec_added_on_candidate_does_not_touch_live(env):
     assert set(await _specs(sf, 2)) == {"s1", "s2"}
     listed = json.loads(await handlers["playbook_spec_list"](name="greeter", version="live"))
     assert listed["version"] == 1 and listed["count"] == 1
-    # delete on the candidate only
-    json.loads(await handlers["playbook_spec_delete"](name="greeter", spec_name="s1"))
+    # delete on the candidate only (plans/022 P3: s1 is carried — needs why=)
+    json.loads(await handlers["playbook_spec_delete"](
+        name="greeter", spec_name="s1", why="superseded by s2",
+    ))
     assert set(await _specs(sf, 1)) == {"s1"}
     assert set(await _specs(sf, 2)) == {"s2"}
 

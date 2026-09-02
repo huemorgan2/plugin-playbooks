@@ -126,7 +126,7 @@ async def test_restore_accepts_runs_older_than_the_version_row(env):
         row = (await s.execute(
             select(PlaybookVersion).where(PlaybookVersion.version == 1)
         )).scalar_one()
-        gate, refusal, run = await publish.test_run_gate(
+        gate, refusal, run, _failed = await publish.test_run_gate(
             s, pb.id, 1, row.created_at, include_live=True,
         )
     assert refusal is None
@@ -141,7 +141,7 @@ async def test_candidate_gate_still_requires_a_run_after_the_row(env):
         row = (await s.execute(
             select(PlaybookVersion).where(PlaybookVersion.version == 1)
         )).scalar_one()
-        _, refusal, _ = await publish.test_run_gate(
+        _, refusal, _, _failed = await publish.test_run_gate(
             s, pb.id, 1, row.created_at, include_live=False,
         )
     assert refusal is not None

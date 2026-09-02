@@ -1186,7 +1186,10 @@ def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: b
     defn["name"] = p.name
     p.definition = defn
     p.code = row.code
-    if restore_manifest:
+    # plans/022 P6: a row with NO manifest never NULLs the live manifest —
+    # during the meltdown a restore promoted a NULL-manifest row and wiped
+    # the live manifest.
+    if restore_manifest and row.manifest:
         p.manifest = row.manifest
     p.description = defn.get("description") or p.description
     p.when_to_use = defn.get("when_to_use") or p.when_to_use
@@ -1265,7 +1268,9 @@ async def promote_version(name: str, body: PromoteBody):
 
         # 021: test-run evidence is looked up for the announce message but
         # never blocks the owner. Restores accept live history as evidence.
-        _gate, _refusal, ev_run = await test_run_gate(
+        # plans/022 P1: a failed latest run is announced as a failure, never
+        # in the evidence slot.
+        _gate, _refusal, ev_run, failed_run = await test_run_gate(
             session, p.id, row.version, row.created_at,
             include_live=not candidate,
             require=False,
@@ -1273,6 +1278,10 @@ async def promote_version(name: str, body: PromoteBody):
         evidence = (
             SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
             if ev_run is not None else None
+        )
+        failed_ref = (
+            SimpleNamespace(id=failed_run.id, completed_at=failed_run.completed_at)
+            if failed_run is not None else None
         )
 
         if not candidate:
@@ -1302,6 +1311,7 @@ async def promote_version(name: str, body: PromoteBody):
         await announce_publish(
             _ctx, _events, name=name, old_version=old_live,
             new_version=target_n, evidence=evidence, actor="owner",
+            failed_run=failed_ref,
         )
     return result
 
@@ -1336,13 +1346,17 @@ async def rollback_playbook(name: str):
         # 021: rollback is the owner's escape hatch — specs refresh and
         # test-run evidence are recorded but never block.
         await _refresh_specs(session, p, row)
-        _gate, _refusal, ev_run = await test_run_gate(
+        _gate, _refusal, ev_run, failed_run = await test_run_gate(
             session, p.id, row.version, row.created_at, include_live=True,
             require=False,
         )
         evidence = (
             SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
             if ev_run is not None else None
+        )
+        failed_ref = (
+            SimpleNamespace(id=failed_run.id, completed_at=failed_run.completed_at)
+            if failed_run is not None else None
         )
 
         await _ensure_live_row(session, p)
@@ -1359,7 +1373,7 @@ async def rollback_playbook(name: str):
         await announce_publish(
             _ctx, _events, name=name, old_version=live_n,
             new_version=target_n, evidence=evidence, actor="owner",
-            action="rollback",
+            action="rollback", failed_run=failed_ref,
         )
     return result
 

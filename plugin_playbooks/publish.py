@@ -112,12 +112,16 @@ async def test_run_gate(
     *,
     include_live: bool = False,
     require: bool = True,
-) -> tuple[dict[str, Any], str | None, PlaybookRun | None]:
+) -> tuple[dict[str, Any], str | None, PlaybookRun | None, PlaybookRun | None]:
     """Machine-checked precondition #2 of the publish contract.
 
-    Returns (gate_entry, refusal_json_or_None, evidence_run). The refusal
-    states exactly what's missing so the agent can go do it instead of
-    arguing with the gate.
+    Returns (gate_entry, refusal_json_or_None, evidence_run, failed_run).
+    plans/022 P1: the evidence position holds ONLY a PASSED run — during the
+    meltdown a FAILED run returned here was announced as "green evidence".
+    A failed latest run travels in the fourth slot so ungated publishes
+    (`require=False`) can report it honestly. The refusal states exactly
+    what's missing so the agent can go do it instead of arguing with the
+    gate.
     """
     # 0.27.1 (plans/016 phase 1): for restores/rollbacks the `since` bound
     # is dropped. Version rows are immutable, so ANY completed run of exactly
@@ -163,10 +167,10 @@ async def test_run_gate(
             # plans/016 phase 6: reported, never refused (Settings → Publish)
             gate["enforced"] = False
             gate["note"] += " — not enforced (Settings → Publish)"
-            return gate, None, None
+            return gate, None, None, None
         error += " " + _RELAX
         refusal = json.dumps({"error": error, "gate": "test_run", "hint": hint})
-        return gate, refusal, None
+        return gate, refusal, None, None
     if run.status != "done":
         # run rows carry no error text — the failed step does.
         step_error = (await session.execute(
@@ -180,9 +184,11 @@ async def test_run_gate(
             "note": f"latest test of version {version} FAILED (run {run.id})",
         }
         if not require:
+            # plans/022 P1: the failed run is NOT evidence — it rides in the
+            # failed slot so the announce can say what actually happened.
             gate["enforced"] = False
             gate["note"] += " — not enforced (Settings → Publish)"
-            return gate, None, run
+            return gate, None, None, run
         refusal = json.dumps({
             "error": (
                 "Publish refused — gate 'test_run' failed: the latest test "
@@ -196,7 +202,7 @@ async def test_run_gate(
                 "the test again, and publish once it's green."
             ),
         })
-        return gate, refusal, run
+        return gate, refusal, None, run
     gate = {
         "gate": "test_run", "ok": True,
         "note": (
@@ -205,7 +211,7 @@ async def test_run_gate(
         ),
         "run_id": str(run.id),
     }
-    return gate, None, run
+    return gate, None, run, None
 
 
 # --- announcement + bus event -----------------------------------------------
@@ -221,10 +227,16 @@ async def announce_publish(
     actor: str,
     action: str = "publish",
     summary: str = "",
+    failed_run: Any = None,
 ) -> None:
     """Contract #8: every publish (and rollback) is announced in the ops
     chat with version + test evidence, and emits `playbook.published`.
-    Never raises — announcement failure must not undo a publish."""
+    Never raises — announcement failure must not undo a publish.
+
+    plans/022 P1: `evidence` is only ever a PASSED run (test_run_gate no
+    longer returns failures in that slot); a failed latest run arrives as
+    `failed_run` and is announced as the failure it is. The word "green"
+    appears only when a run actually passed."""
     payload: dict[str, Any] = {
         "name": name,
         "action": action,
@@ -234,6 +246,12 @@ async def announce_publish(
     }
     if evidence is not None:
         payload["evidence_run_id"] = str(evidence.id)
+        payload["evidence_status"] = "passed"
+    elif failed_run is not None:
+        payload["latest_run_id"] = str(failed_run.id)
+        payload["evidence_status"] = "failed"
+    else:
+        payload["evidence_status"] = "none"
     try:
         await events.emit("playbook.published", payload)
     except Exception:  # noqa: BLE001
@@ -266,8 +284,16 @@ async def announce_publish(
             f"Test evidence: green run {evidence.id} of version "
             f"{new_version} at {when}."
         )
+    elif failed_run is not None:
+        lines.append(
+            f"Test evidence: NONE — the latest run of version {new_version} "
+            f"FAILED (run {failed_run.id}); published ungated "
+            "(Settings → Publish)."
+        )
     else:
-        lines.append("Test evidence: prior live history of this version.")
+        lines.append(
+            "Test evidence: none — no completed run of this version."
+        )
     try:
         await send(
             f"Playbook {verb}: {name}",
@@ -309,6 +335,10 @@ async def specs_gate(
             "no specs defined" if summary["total"] == 0
             else f"{summary['passed']}/{summary['total']} passed"
         ),
+        # plans/022 P1: machine-readable counts for the publish payload's
+        # evidence block.
+        "total": summary["total"],
+        "passed": summary["passed"],
     }
     if not summary["failed"]:
         return gate, None

@@ -141,6 +141,45 @@ def _playbook_origin_scope(playbook: Any):
     )
 
 
+def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
+    """plans/022 P5b: coerce run inputs through the playbook's declared
+    input schema BEFORE the run starts — stored inputs and runtime inputs
+    are the same coerced objects.
+
+    During the meltdown a trigger mapping ({{ event.payload.itemId }})
+    delivered Monday's numeric itemId as an int while the schema declared
+    string; conditions then compared str != int and misbranched — while the
+    stored run inputs showed the string, making the run unreproducible from
+    its own record. Best-effort per property: scalar type mismatches are
+    coerced (int/float/bool → str; numeric str → int/float; bool-ish str →
+    bool); anything un-coercible passes through unchanged (the run, not the
+    intake, owns that failure)."""
+    schema = getattr(playbook, "inputs_schema", None) or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not props or not inputs:
+        return inputs
+    out = dict(inputs)
+    for key, prop in props.items():
+        if key not in out or not isinstance(prop, dict):
+            continue
+        val = out[key]
+        declared = prop.get("type")
+        try:
+            if declared == "string" and isinstance(val, (int, float, bool)):
+                out[key] = str(val)
+            elif declared == "integer" and isinstance(val, str) and val.strip().lstrip("+-").isdigit():
+                out[key] = int(val.strip())
+            elif declared == "number" and isinstance(val, str):
+                out[key] = float(val.strip())
+            elif declared == "boolean" and isinstance(val, str):
+                low = val.strip().lower()
+                if low in ("true", "1", "yes"):
+                    out[key] = True
+                elif low in ("false", "0", "no"):
+                    out[key] = False
+        except (ValueError, TypeError):
+            pass  # un-coercible — leave as delivered
+    return out
 
 
 class PlaybookRunner:
@@ -181,11 +220,12 @@ class PlaybookRunner:
         must wait for its child. Chat/HTTP/trigger entry points use
         `start_run_background` instead (plans/009).
         """
+        inputs = _coerce_inputs(playbook, inputs or {})
         run = await self._create_run(
             playbook, inputs=inputs, trigger=trigger,
             parent_run_id=parent_run_id, is_test=is_test,
         )
-        await self._drive_run(run, playbook, inputs or {})
+        await self._drive_run(run, playbook, inputs)
         return run
 
     async def start_run_background(
@@ -203,12 +243,13 @@ class PlaybookRunner:
         a tool/HTTP timeout again. Pair with `wait_for_run` for a bounded
         wait, `playbook_status` for polling, `cancel_run` to stop it.
         """
+        inputs = _coerce_inputs(playbook, inputs or {})
         run = await self._create_run(
             playbook, inputs=inputs, trigger=trigger,
             parent_run_id=parent_run_id, is_test=is_test,
         )
         task = asyncio.create_task(
-            self._drive_run(run, playbook, inputs or {}),
+            self._drive_run(run, playbook, inputs),
             name=f"playbook-run-{run.id}",
         )
         self._tasks[run.id] = task
@@ -466,7 +507,7 @@ class PlaybookRunner:
         definition = PlaybookDef.model_validate(playbook.definition)
         ctx = _RunContext(
             run_id=uuid.uuid4(),
-            inputs=inputs or {},
+            inputs=_coerce_inputs(playbook, inputs or {}),
             step_outputs={},
         )
         ctx.dry = True
@@ -661,6 +702,19 @@ class PlaybookRunner:
         args = _render_template_dict(step.args or {}, ctx, step_id=step.id)
         ctx.step_inputs[step.id] = args
         if ctx.dry:
+            # plans/022 P5 (RC4): dry runs perform the SAME tool-existence
+            # check as the live path — a playbook naming a nonexistent tool
+            # used to dry-run green and then fail live, feeding false
+            # diagnoses. Stubbed or not, an unknown tool fails the dry run.
+            try:
+                self._tools.get(step.tool)
+            except KeyError:
+                raise ValueError(
+                    f"Step '{step.id}': unknown tool '{step.tool}' — it is "
+                    "not in the tool registry. The playbook definition "
+                    "references a tool that does not exist (a live run "
+                    "would fail here too)."
+                ) from None
             # No execution. Stub the result from the tool's output hints if any,
             # but always surface the RESOLVED args (proves templates rendered).
             # Phase 4: a spec stub (step-id wins over tool-name) scripts the
@@ -669,7 +723,12 @@ class PlaybookRunner:
                 scripted = ctx.stubs.get(step.id, ctx.stubs.get(step.tool))
                 return {"tool": step.tool, "resolved_args": args, "result": scripted,
                         "stubbed": True, "_dry": True}
-            return {"tool": step.tool, "resolved_args": args, "result": {"_dry": True}, "_dry": True}
+            # plans/022 P5: self-describing stub — a transcript reader must
+            # never mistake this for evidence the tool ran.
+            return {"tool": step.tool, "resolved_args": args,
+                    "result": {"_dry": True,
+                               "_note": "simulated — tool was NOT called"},
+                    "_dry": True}
         # plans/016 phase 2: the stamped report_to is authoritative for tool
         # steps too, not just agent steps. A chat send that names no
         # conversation inherits the run's — and a background live run HAS
@@ -714,7 +773,10 @@ class PlaybookRunner:
                 return {"result": ctx.stubs[step.id],
                         "resolved_inputs": rendered,
                         "stubbed": True, "_dry": True}
-            return {"result": {"_dry": True}, "resolved_inputs": rendered,
+            # plans/022 P5: self-describing stub (code body NOT executed).
+            return {"result": {"_dry": True,
+                               "_note": "simulated — code was NOT executed"},
+                    "resolved_inputs": rendered,
                     "_dry": True}
         try:
             rt = self._tools.get("code_run")
@@ -835,11 +897,17 @@ class PlaybookRunner:
         return result if isinstance(result, dict) else {"_raw": result}
 
     async def _run_condition(self, step: StepDef, ctx: _RunContext) -> Any:
-        """Evaluate a condition and branch."""
+        """Evaluate a condition and branch.
+
+        plans/022 P5b: STRICT evaluation, like loop over/until (006.707).
+        Non-strict eval returned False on ANY exception — during the
+        meltdown live conditions silently picked the else branch when their
+        expression failed to evaluate. An un-evaluable condition now fails
+        the step loudly with the rendered error, never picks a branch."""
         if not step.when:
             raise ValueError(f"Step '{step.id}': condition requires 'when' field")
 
-        result = _eval_expression(step.when, ctx)
+        result = _eval_expression(step.when, ctx, strict=True, step_id=step.id)
         if result:
             if step.then:
                 await self._execute_steps(step.then, ctx)

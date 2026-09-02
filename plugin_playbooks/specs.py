@@ -49,6 +49,9 @@ class SpecDef(BaseModel):
     # becomes the tool's `result`; for agent/llm steps it is the step output.
     stubs: dict[str, Any] = Field(default_factory=dict)
     expect: SpecExpect = Field(default_factory=SpecExpect)
+    # plans/022 P3: provenance — the version this spec was originally
+    # authored on, stamped by copy_specs when a mint carries it forward.
+    carried_from: int | None = None
 
 
 def parse_spec_yaml(text: str) -> SpecDef:
