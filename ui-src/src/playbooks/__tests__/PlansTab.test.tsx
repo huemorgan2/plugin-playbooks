@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 // plans/016 phase 3: the Plans tab — audit trail + autonomy switch.
+// plans/022: table list, owner status control, full-page reader, delete.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 
@@ -7,20 +8,22 @@ vi.mock('../api', () => ({
   playbooksApi: {
     listPlans: vi.fn(),
     getPlan: vi.fn(),
+    patchPlan: vi.fn(),
+    deletePlan: vi.fn(),
     getSettings: vi.fn(),
     patchSettings: vi.fn(),
   },
 }))
 
 import { playbooksApi } from '../api'
-import { PlansTab, factLine, renderInline } from '../PlansTab'
+import { PlansTab, PlansList, factLine, renderInline } from '../PlansTab'
 
 const api = playbooksApi as unknown as Record<string, ReturnType<typeof vi.fn>>
 
 const BRIEF = {
   plan_id: 'p-1', title: 'Fix the greeter', status: 'proposed',
   playbook_refs: ['greeter'], created_at: '2026-08-30T10:00:00Z',
-  updated_at: null, has_execution_summary: false,
+  updated_at: '2026-08-30T10:30:00Z', has_execution_summary: false,
 }
 
 const DETAIL = {
@@ -42,21 +45,30 @@ beforeEach(() => {
   api.listPlans.mockResolvedValue({ plans: [BRIEF] })
   api.getSettings.mockResolvedValue({ plans_full_power: false })
   api.getPlan.mockResolvedValue(DETAIL)
+  api.patchPlan.mockResolvedValue({ ...BRIEF, status: 'done' })
+  api.deletePlan.mockResolvedValue({ plan_id: 'p-1', deleted: true })
 })
 afterEach(cleanup)
 
 describe('PlansTab', () => {
-  it('lists plans with a status pill, title, refs and headline count', async () => {
+  it('lists plans as a table with title, status, refs, dates and headline', async () => {
     render(<PlansTab agentName="Luna" />)
     await waitFor(() =>
       expect(screen.getByTestId('plans-headline').textContent).toBe('1 awaiting publish'))
+    const table = screen.getByTestId('plans-table')
+    expect(table.textContent).toContain('Plan')
+    expect(table.textContent).toContain('Status')
+    expect(table.textContent).toContain('Playbooks')
+    expect(table.textContent).toContain('Created')
+    expect(table.textContent).toContain('Updated')
     const row = screen.getByTestId('plan-row-p-1')
     expect(row.textContent).toContain('Fix the greeter')
     expect(row.textContent).toContain('greeter')
-    const pill = screen.getByTestId('plan-status-pill')
-    expect(pill.textContent).toBe('proposed')
-    expect(pill.className).toContain('text-amber-300')
-    expect(pill.className).not.toContain('bg-amber') // border+text only, never filled
+    expect(row.textContent).toContain('Aug 30') // created + updated dates
+    const select = screen.getByTestId('plan-status-select') as HTMLSelectElement
+    expect(select.value).toBe('proposed')
+    expect(select.className).toContain('text-amber-300')
+    expect(select.className).not.toContain('bg-amber') // border+text only, never filled
   })
 
   it('says "No changes planned" when nothing is publishable', async () => {
@@ -66,18 +78,69 @@ describe('PlansTab', () => {
       expect(screen.getByTestId('plans-headline').textContent).toBe('No changes planned'))
   })
 
-  it('expanding a row shows body, fact lines and the execution summary', async () => {
+  it('changing the status in a row PATCHes the plan optimistically', async () => {
+    render(<PlansTab agentName="Luna" />)
+    await screen.findByTestId('plan-row-p-1')
+    const select = screen.getByTestId('plan-status-select') as HTMLSelectElement
+    fireEvent.change(select, { target: { value: 'done' } })
+    await waitFor(() => expect(api.patchPlan).toHaveBeenCalledWith('p-1', 'done'))
+    expect((screen.getByTestId('plan-status-select') as HTMLSelectElement).value).toBe('done')
+    // no navigation happened — still the table
+    expect(screen.getByTestId('plans-table')).toBeTruthy()
+  })
+
+  it('deleting a row asks for an in-place confirm, then DELETEs it', async () => {
+    render(<PlansTab agentName="Luna" />)
+    await screen.findByTestId('plan-row-p-1')
+    fireEvent.click(screen.getByTestId('plan-delete-p-1'))
+    expect(api.deletePlan).not.toHaveBeenCalled() // armed, not yet deleted
+    fireEvent.click(screen.getByTestId('plan-delete-p-1-confirm'))
+    await waitFor(() => expect(api.deletePlan).toHaveBeenCalledWith('p-1'))
+    await waitFor(() => expect(screen.queryByTestId('plan-row-p-1')).toBeNull())
+  })
+
+  it('clicking a row opens the reader: body, facts, summary — and back returns', async () => {
     render(<PlansTab agentName="Luna" />)
     await screen.findByTestId('plan-row-p-1')
     fireEvent.click(screen.getByText('Fix the greeter'))
-    const detail = await screen.findByTestId('plan-detail')
-    await waitFor(() => expect(detail.textContent).toContain('add a default'))
-    const facts = screen.getByTestId('plan-facts')
-    expect(facts.textContent).toContain('Published greeter v1 → v2 by you')
+    const reader = await screen.findByTestId('plan-reader')
+    await waitFor(() =>
+      expect(screen.getByTestId('plan-body').textContent).toContain('add a default'))
+    expect(reader.textContent).toContain('Fix the greeter')
+    expect(screen.getByTestId('plan-facts').textContent)
+      .toContain('Published greeter v1 → v2 by you')
     expect(screen.getByTestId('plan-summary').textContent).toContain('without issues')
+    fireEvent.click(screen.getByTestId('plan-back'))
+    expect(screen.getByTestId('plans-table')).toBeTruthy()
   })
 
-  it('shows the rejection note on rejected plans', async () => {
+  it('the reader can change status and delete the plan', async () => {
+    render(<PlansTab agentName="Luna" />)
+    await screen.findByTestId('plan-row-p-1')
+    fireEvent.click(screen.getByText('Fix the greeter'))
+    await screen.findByTestId('plan-body')
+    const select = screen.getByTestId('plan-status-select') as HTMLSelectElement
+    expect(select.value).toBe('approved')
+    fireEvent.change(select, { target: { value: 'rejected' } })
+    await waitFor(() => expect(api.patchPlan).toHaveBeenCalledWith('p-1', 'rejected'))
+    fireEvent.click(screen.getByTestId('plan-delete'))
+    fireEvent.click(screen.getByTestId('plan-delete-confirm'))
+    await waitFor(() => expect(api.deletePlan).toHaveBeenCalledWith('p-1'))
+    // deleting from the reader navigates back to the (now empty) list
+    await waitFor(() => expect(screen.getByTestId('plans-headline')).toBeTruthy())
+  })
+
+  it('a done plan shows the locked note in the reader', async () => {
+    api.getPlan.mockResolvedValue({ ...DETAIL, status: 'done' })
+    render(<PlansTab agentName="Luna" />)
+    await screen.findByTestId('plan-row-p-1')
+    fireEvent.click(screen.getByText('Fix the greeter'))
+    const note = await screen.findByTestId('plan-locked-note')
+    expect(note.textContent).toContain('locked for Luna')
+    expect(note.textContent).toContain('proposed')
+  })
+
+  it('shows the rejection note only on rejected plans', async () => {
     api.listPlans.mockResolvedValue({ plans: [{ ...BRIEF, status: 'rejected' }] })
     api.getPlan.mockResolvedValue({
       ...DETAIL, status: 'rejected', rejection_note: 'not this week',
@@ -133,7 +196,6 @@ describe('factLine', () => {
 // `playbook` filter passed through to the API.
 describe('PlansList (per-playbook)', () => {
   it('passes the playbook filter to listPlans', async () => {
-    const { PlansList } = await import('../PlansTab')
     render(<PlansList agentName="Luna" playbook="greeter" />)
     await waitFor(() =>
       expect(api.listPlans).toHaveBeenCalledWith(undefined, 'greeter'))
@@ -141,7 +203,6 @@ describe('PlansList (per-playbook)', () => {
   })
 
   it('shows a per-playbook empty state', async () => {
-    const { PlansList } = await import('../PlansTab')
     api.listPlans.mockResolvedValue({ plans: [] })
     render(<PlansList agentName="Luna" playbook="greeter" />)
     await waitFor(() =>

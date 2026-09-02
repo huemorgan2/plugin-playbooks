@@ -619,7 +619,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.35.0",
+        version="0.36.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

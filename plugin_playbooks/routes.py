@@ -1754,3 +1754,40 @@ async def get_plan(plan_id: str):
         if plan is None:
             raise HTTPException(404, f"No plan with id '{plan_id}'")
         return _plan_detail(plan)
+
+
+# plans/022: the owner's plan controls. The done-lock is enforced on the
+# agent side (plan gate + plan_finish refuse done plans); flipping status
+# back to proposed/approved here is the one and only reopen switch.
+_OWNER_PLAN_STATUSES = ("proposed", "approved", "rejected", "done")
+
+
+class PlanStatusBody(BaseModel):
+    status: str
+
+
+@router.patch("/plans/{plan_id}")
+async def patch_plan(plan_id: str, body: PlanStatusBody):
+    status = (body.status or "").strip()
+    if status not in _OWNER_PLAN_STATUSES:
+        raise HTTPException(
+            422, f"status must be one of: {', '.join(_OWNER_PLAN_STATUSES)}"
+        )
+    async with _sf()() as session:
+        plan = await _load_plan(session, plan_id)
+        if plan is None:
+            raise HTTPException(404, f"No plan with id '{plan_id}'")
+        plan.status = status
+        await session.commit()
+        return _plan_brief(plan)
+
+
+@router.delete("/plans/{plan_id}")
+async def delete_plan(plan_id: str):
+    async with _sf()() as session:
+        plan = await _load_plan(session, plan_id)
+        if plan is None:
+            raise HTTPException(404, f"No plan with id '{plan_id}'")
+        await session.delete(plan)
+        await session.commit()
+        return {"plan_id": plan_id, "deleted": True}

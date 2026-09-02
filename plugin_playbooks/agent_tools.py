@@ -1740,7 +1740,12 @@ def build_tools(
                 f"playbook_publish(name, explanation, plan_id='{plan_id}') "
                 "— the owner sees this plan and the change on one approval "
                 "card. After the publish lands, write the wrap-up with "
-                "playbook_plan_finish."
+                "playbook_plan_finish. Reminder: for anything beyond a "
+                "trivial edit you can hand the execution to the playbook "
+                "authoring sub-agent instead — playbook_agent(task=...), "
+                f"naming plan_id '{plan_id}' in the task — it edits, tests "
+                "and publishes under this plan with a live progress card. "
+                "(Skip that if you are already the delegated sub-agent.)"
             ),
         })
 

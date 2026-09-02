@@ -563,3 +563,94 @@ async def test_plans_route_filters_by_playbook(route_env):
     # No param -> unfiltered listing still returns everything.
     r = await client.get(f"{BASE}/plans")
     assert len(r.json()["plans"]) == 3
+
+
+# --- plans/022: owner plan controls (status PATCH, delete, reopen) ----------
+
+@pytest.mark.asyncio
+async def test_plan_status_patch_route(route_env):
+    sf, client = route_env
+    pid = await seed_plan(sf)
+
+    r = await client.patch(f"{BASE}/plans/{pid}", json={"status": "done"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "done"
+
+    # the reopen switch: done -> proposed unlocks the plan for the agent
+    r = await client.patch(f"{BASE}/plans/{pid}", json={"status": "proposed"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "proposed"
+
+    r = await client.patch(f"{BASE}/plans/{pid}", json={"status": "bogus"})
+    assert r.status_code == 422
+
+    r = await client.patch(
+        f"{BASE}/plans/{uuid.uuid4()}", json={"status": "done"}
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_plan_delete_route(route_env):
+    sf, client = route_env
+    pid = await seed_plan(sf)
+
+    r = await client.delete(f"{BASE}/plans/{pid}")
+    assert r.status_code == 200
+    assert r.json() == {"plan_id": pid, "deleted": True}
+
+    r = await client.get(f"{BASE}/plans")
+    assert r.json()["plans"] == []
+
+    r = await client.delete(f"{BASE}/plans/{pid}")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_owner_reopen_lets_plan_finish_run_again():
+    # done plans refuse plan_finish; the owner's status flip is the unlock.
+    engine, sf, tools = await _env()
+    try:
+        out = json.loads(await tools["playbook_plan_write"](
+            title="Fix the greeter playbook", body=PLAN_BODY,
+        ))
+        pid = out["plan_id"]
+        await tools["playbook_plan_finish"](
+            plan_id=pid,
+            summary="Wrapped up: change landed and a green run verified it.",
+        )
+        again = json.loads(await tools["playbook_plan_finish"](
+            plan_id=pid, summary="Second wrap-up attempt over here, refused.",
+        ))
+        assert "already done" in again["error"]
+
+        # owner reopens from the UI (what PATCH /plans/{id} does)
+        async with sf() as s:
+            row = (await s.execute(
+                select(PlaybookPlan).where(PlaybookPlan.id == uuid.UUID(pid))
+            )).scalar_one()
+            row.status = "proposed"
+            await s.commit()
+
+        redo = json.loads(await tools["playbook_plan_finish"](
+            plan_id=pid,
+            summary="Reopened by the owner and finished again after rework.",
+        ))
+        assert redo["plan"]["status"] == "done"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_plan_write_note_reminds_about_the_subagent():
+    # plans/022: after writing a plan the agent is pointed at playbook_agent
+    # (the authoring sub-agent) as the way to execute the change.
+    engine, sf, tools = await _env()
+    try:
+        out = json.loads(await tools["playbook_plan_write"](
+            title="Fix the greeter playbook", body=PLAN_BODY,
+        ))
+        assert "playbook_agent" in out["note"]
+        assert out["plan_id"] in out["note"]
+    finally:
+        await engine.dispose()

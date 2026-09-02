@@ -188,6 +188,19 @@ export const playbooksApi = {
   getPlan: (planId: string) =>
     apiFetch<PlanDetail>(`${BASE}/plans/${planId}`),
 
+  // plans/022: owner plan controls — status is the done-lock's reopen
+  // switch (agent tools refuse done plans), delete is permanent.
+  patchPlan: (planId: string, status: string) =>
+    apiFetch<PlanBrief>(`${BASE}/plans/${planId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    }),
+
+  deletePlan: (planId: string) =>
+    apiFetch<{ plan_id: string; deleted: boolean }>(`${BASE}/plans/${planId}`, {
+      method: 'DELETE',
+    }),
+
   getSettings: () =>
     apiFetch<{ plans_full_power: boolean }>(`${BASE}/playbooks-settings`),
 
