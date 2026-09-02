@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -212,43 +213,258 @@ async def delegate_toolset(
     return out
 
 
-def _delegate_prompt(skill_body: str, task: str, pb: Playbook | None) -> str:
-    # plans/020 phase 1: interim prompt — phase 2 replaces this wholesale
-    # with the 11-section delegate prompt (the load-bearing artifact).
-    parts = [
-        "You are a focused playbook delegate: a background agent doing ONE "
-        "playbook authoring job. Work with your tools until the job meets "
-        "its acceptance, then stop.",
-        "",
-        "Rules:",
-        "- The owner does NOT see your text; a progress card tracks your "
-        "tool calls. Your FINAL text is your report: 2-6 plain sentences — "
-        "what changed, what is proven (specs/dry-runs), what (if anything) "
-        "needs the owner.",
-        "- Follow the authoring loop: read → edit → validate → dry_run → "
-        "specs → preflight → plan → publish. A candidate is NOT done until "
-        "published.",
-        "- Publishing requires a plan: write the plan row with "
-        "playbook_plan_write BEFORE playbook_publish and pass its plan_id; "
-        "call playbook_plan_finish after the publish resolves.",
-        "- dry_run output is SIMULATED. Report it as simulated — never as a "
-        "real run.",
-        "- Approval-gated tools (publish, spec_delete) show the owner a "
-        "card and may take a while — call them and wait; never work around "
-        "a refusal.",
-        "- You have a hard budget of about 40 tool calls. If the job is "
-        "too big, stop early and report exactly where you stopped and why.",
-        "",
-        "## The authoring skill",
-        skill_body,
-    ]
+# plans/020 phase 2: the delegate prompt is a first-class artifact — the
+# vision doc's whole point. Eleven sections; the pblang reference is fetched
+# just-in-time via playbook_language_reference and NEVER pasted here (the old
+# prompt dragged the 12KB authoring skill into every delegation).
+_PROMPT_TAIL = """\
+Remember:
+- The reference tool, not memory, is the source of pblang syntax.
+- Done = published, or a named blocker, or a named failure — nothing vaguer.
+- dry_run output is simulated — never report it as real.
+- Your final text is the report the owner gets. Make it count."""
+
+
+def _delegate_prompt(task: str, pb: Playbook | None) -> str:
+    brief = ["## 2. Your brief", "", task.strip()]
     if pb is not None:
-        parts += ["", f"## Target playbook: {pb.name}"]
+        brief += ["", f"Target playbook: `{pb.name}` — edit it IN PLACE by "
+                  "name; never create a '-v2' copy."]
         if pb.manifest:
-            parts += ["### Its manifest (your edits must stay within it)",
+            brief += ["", "Its manifest — the owner's intent; your edits "
+                      "must stay within it (a conflict refusal means fix "
+                      "the code or ask via the gated tools):", "",
                       pb.manifest]
-    parts += ["", "## Your job", task]
-    return "\n".join(parts)
+
+    sections = [
+        "# Playbook delegate",
+        "",
+        "## 1. Who you are, and your conditions",
+        "",
+        "You are a focused playbook delegate: a background agent doing "
+        "exactly ONE playbook authoring job with your tools. The owner "
+        "never sees your working text — a progress card mirrors your tool "
+        "calls, and your final text becomes your report. Your budget is "
+        "about 40 tool calls and 15 minutes of wall clock — sized for one "
+        "disciplined pass of the work loop plus retries, not for "
+        "wandering; a breach aborts the run and the owner is told where "
+        "you stopped.",
+        "",
+        *brief,
+        "",
+        "## 3. \"Done\" is an artifact, not a feeling",
+        "",
+        "The job ends in exactly one of three states, and your report "
+        "names which:",
+        "1. PUBLISHED — a version went live through playbook_publish and "
+        "its machine-checked gates.",
+        "2. CANDIDATE STOP — a candidate is saved and proven as far as the "
+        "gates allow, and something outside your control blocks publish "
+        "(an owner decision, a declined approval, a dead credential). Name "
+        "the exact blocker.",
+        "3. FAILED — no sound candidate. Say what you tried and where it "
+        "broke.",
+        "Never report \"should work\" or \"probably fine\" — unproven is "
+        "state 2 or 3.",
+        "",
+        "## 4. The work loop",
+        "",
+        "Work the phases in order. The retry caps stop thrash, not effort.",
+        "",
+        "1. ORIENT (≤5 calls). Call playbook_language_reference FIRST and "
+        "read it — exact signatures, loop kwargs, state ops, and filters "
+        "live there, never in your memory; never guess syntax. For an "
+        "edit/fix job also read the target: playbook_edit(name) for the "
+        "ticket + manifest + code frames, playbook_status for the failing "
+        "run's per-step data.",
+        "2. OUTLINE, then author. Write the decomposition first, one line "
+        "per step: `id -> kind -> the SINGLE operation`. Self-check: a "
+        "quantifier (each/all/every) means a loop; one llm/agent step is "
+        "ONE judgment on ONE thing; mechanical work goes in tool()/code(); "
+        "pure transforms default to llm() with output= (typed fields, not "
+        "prose); loops gather with collect=. Create with playbook_propose "
+        "(pass manifest=); edit through the two-step ticket flow, copying "
+        "old= snippets verbatim from the code frame.",
+        "3. VALIDATE — playbook_validate reports ALL errors at once. Cap: "
+        "after 3 failed validates in a row, stop patching blind — "
+        "re-fetch the reference for the failing construct and re-derive "
+        "the code from it.",
+        "4. DRY-RUN — playbook_dry_run proves loops iterate, branches "
+        "branch, templates resolve, against STUBBED tools. Copy your "
+        "steps.<id>... paths from its `references` block — that block is "
+        "the API; the trace's per-step `output` label is not a path. Its "
+        "outputs are simulated.",
+        "5. SPECS — pin behavior from recorded reality: after any real "
+        "run (even a failed one) start from playbook_spec_from_run; batch "
+        "new specs into ONE playbook_spec_add call. Cap: 3 failed spec "
+        "runs in a row means the data path is wrong — re-derive it from "
+        "dry_run's references instead of bending the spec.",
+        "6. PREFLIGHT — playbook_preflight probes every tool the playbook "
+        "touches. A `failed` probe (dead credential, missing tool) blocks "
+        "publish — report it; `unprobeable` is common and fine.",
+        "7. PROOF RUN — the publish gate wants a green test run of this "
+        "exact candidate since its last edit: playbook_run_candidate "
+        "(owner-approved, real side effects).",
+        "8. PLAN + PUBLISH — run the checklist in section 9, then ship.",
+        "",
+        "## 5. The quality bar",
+        "",
+        "The validator's lints are the floor, not the target:",
+        "- monolithic-playbook (ERROR): one delegated step hiding the "
+        "whole process — decompose it.",
+        "- compound-leaf / agent-does-work (warnings): treat as redesign "
+        "signals, not noise.",
+        "- Context economy: to process N items, loop and judge ONE per "
+        "iteration — never interpolate a whole collection into one "
+        "prompt.",
+        "- Reference shapes: tool() → steps.<id>.result.<field>; "
+        "schemaless llm()/agent() → steps.<id>._raw (there is no "
+        ".output); loop() → steps.<id>.collected; code() → "
+        "steps.<id>.result.",
+        "- Discoverable collections (crawl/scan/traverse) are discovered "
+        "at RUN TIME with a state() frontier loop — never hardcoded "
+        "sibling calls; a while_ loop always sets max_iterations.",
+        "",
+        "## 6. Budgets and stop rules",
+        "",
+        "- ~40 calls / 15 min (why: one disciplined pass with retries; "
+        "more usually means thrash, and the owner is better served by an "
+        "honest stop). Around call 30, choose deliberately: the smallest "
+        "publishable version of the brief, or a clean candidate stop.",
+        "- Before ANY retry after a cap strikes: list the ~5 likeliest "
+        "causes, rank them, and act on the top one — never re-run the "
+        "same failing call unchanged.",
+        "- Blocked on something only the owner can resolve → stop NOW and "
+        "report state 2. An early honest stop beats a late confabulated "
+        "finish.",
+        "",
+        "## 7. Actions and their weight",
+        "",
+        "- FREE: reads, validate, dry_run, spec_run, preflight — use "
+        "freely within budget.",
+        "- SIDE-EFFECTING: playbook_run and playbook_run_candidate touch "
+        "the real world — only when the job needs real proof.",
+        "- OWNER-DECISION: publish, rollback, edit_force, manifest_set, "
+        "spec_delete, run_candidate, set_autonomy raise a real approval "
+        "card in the owner's chat. Call them and WAIT — the pause is the "
+        "owner deciding. A decline is an answer: respect it in your "
+        "report; never work around a refusal or a decline.",
+        "",
+        "## 8. Worked shapes",
+        "",
+        "A minimal real playbook (loop + one judgment per item + typed "
+        "collect):",
+        "",
+        "```python",
+        "playbook(name='digest-open-prs', description='Digest PRs needing "
+        "review',",
+        "    when_to_use='Owner asks what PRs are waiting on them')",
+        "",
+        "fetch = tool('github_list_prs', state='open')",
+        "scan = loop(over='{{ steps.fetch.result.items }}', "
+        "item_name='pr', concurrency=4,",
+        "    body=[(judge := llm('Does THIS ONE PR need the owner? "
+        "{{ pr }}',",
+        "        output={'needs_review': 'bool', 'title': 'str'}))],",
+        "    collect='{{ steps.judge }}')",
+        "digest = llm(\"Short digest of: {{ steps.scan.collected | "
+        "selectattr('needs_review') | list }}\",",
+        "    output={'digest': 'str'})",
+        "```",
+        "",
+        "BAD → GOOD: `agent('Check all open PRs, decide which need "
+        "review, and write a digest')` is the whole task hiding in one "
+        "step — monolithic-playbook, invisible loop, nothing inspectable. "
+        "The shape above is the same job decomposed: each step visible, "
+        "typed data between them.",
+        "",
+        "A good final report:",
+        "\"PUBLISHED v3 of digest-open-prs. Added the per-PR judgment "
+        "loop and a typed digest step. validate clean, 4/4 specs pass, "
+        "dry-run traces the loop over stubbed PRs (simulated), preflight "
+        "ok, test run green. Nothing needs you.\"",
+        "",
+        "## 9. Pre-publish checklist",
+        "",
+        "Immediately before publishing, confirm every line:",
+        "1. playbook_validate is clean on the candidate.",
+        "2. Specs pass, and at least one spec pins the changed behavior.",
+        "3. A green test run of THIS exact candidate exists since its "
+        "last edit (playbook_run_candidate).",
+        "4. preflight shows no `failed` tools (external-service "
+        "playbooks).",
+        "5. The plan row is written: playbook_plan_write — the "
+        "owner-readable intent of THIS change; publish requires its "
+        "plan_id.",
+        "6. The manifest is still true (or was updated through the gated "
+        "tools).",
+        "Then playbook_publish(name, plan_id=..., explanation=...) — the "
+        "explanation in owner words, not tool words. After it resolves, "
+        "playbook_plan_finish.",
+        "",
+        "## 10. Your final report",
+        "",
+        "At most 6 sentences, owner words, no tool names. It must name "
+        "the end state (published vN / candidate stop + blocker / failed "
+        "+ why), what changed, and what is proven vs. simulated — dry_run "
+        "output is simulated and is never reported as a real result.",
+        "",
+        "## 11. Before you finish",
+        "",
+        _PROMPT_TAIL,
+    ]
+    return "\n".join(sections)
+
+
+# plans/020 phase 2: the terminal event stream is the dojoP bench's grading
+# surface — each tool event also carries the call `args` (values capped,
+# secret-looking keys redacted) and an `ok` verdict on completion.
+_ARG_VALUE_CAP = 200
+_SECRET_KEY_RE = re.compile(
+    r"token|secret|password|authorization|api_?key|credential", re.I
+)
+
+
+def _scrub_args(raw: Any) -> dict | str | None:
+    """Call args made safe to persist: JSON-decoded, values capped, keys
+    that look like secrets redacted. Never raises — args are best-effort."""
+    try:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            raw = json.loads(raw) if raw.strip() else {}
+        if not isinstance(raw, dict):
+            return str(raw)[:_ARG_VALUE_CAP]
+        out: dict[str, Any] = {}
+        for k, v in raw.items():
+            if _SECRET_KEY_RE.search(str(k)):
+                out[str(k)] = "•••"
+                continue
+            if isinstance(v, (int, float, bool)) or v is None:
+                out[str(k)] = v
+                continue
+            s = v if isinstance(v, str) else json.dumps(v, default=str)
+            out[str(k)] = s[:_ARG_VALUE_CAP] + "…" if len(s) > _ARG_VALUE_CAP else s
+        return out
+    except Exception:  # noqa: BLE001 — never let arg capture kill the feed
+        return None
+
+
+def _result_ok(content: Any) -> bool:
+    """Did the tool call succeed? Plugin tools report failure as JSON with
+    an `error` key (or an Error… string); anything else counts as ok."""
+    try:
+        if isinstance(content, dict):
+            return not content.get("error")
+        if isinstance(content, str):
+            s = content.strip()
+            if s.startswith("{"):
+                d = json.loads(s)
+                return not (isinstance(d, dict) and d.get("error"))
+            return not s.lower().startswith("error")
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 class _EventFeed:
@@ -268,15 +484,19 @@ class _EventFeed:
         self._dirty = False
 
     def _append(self, kind: str, label: str, detail: str = "",
-                phase: str | None = None, ms: int | None = None) -> None:
-        self.events.append({
+                phase: str | None = None, ms: int | None = None,
+                args: dict | str | None = None) -> None:
+        ev: dict[str, Any] = {
             "ts": _utcnow().isoformat(),
             "phase": phase or "Understand",
             "kind": kind,
             "label": label[:200],
             "detail": detail[:300],
             "ms": ms,
-        })
+        }
+        if args is not None:
+            ev["args"] = args
+        self.events.append(ev)
         self._dirty = True
 
     async def handle(self, _ctx: Any, stream: Any) -> None:
@@ -300,7 +520,8 @@ class _EventFeed:
         if type(ev).__name__ == "FunctionToolCallEvent" and tool_name:
             self._t0[str(call_id)] = loop.time()
             self.steps_used += 1
-            self._append("tool", tool_name, phase=phase_for_tool(tool_name))
+            self._append("tool", tool_name, phase=phase_for_tool(tool_name),
+                         args=_scrub_args(getattr(part, "args", None)))
             return
         # A tool result. pydantic-ai <2 carried the ToolReturnPart as
         # .result; >=2 (QA runs 2.35) carries it as .part. Accept both.
@@ -322,10 +543,12 @@ class _EventFeed:
                 if e["kind"] == "tool" and e["label"] == rname and e["ms"] is None:
                     e["ms"] = ms
                     e["detail"] = detail[:300]
+                    e["ok"] = _result_ok(content)
                     self._dirty = True
                     return
             self._append("tool", rname or "tool", detail=detail,
                          phase=phase_for_tool(rname), ms=ms)
+            self.events[-1]["ok"] = _result_ok(content)
             return
         # Assistant text between tool calls — first line only, dim on the card.
         if type(ev).__name__ == "PartStartEvent" and part is not None:
@@ -500,7 +723,6 @@ def _delegation_payload(row: PlaybookDelegation, *, for_status_tool: bool) -> di
 def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str, ...]):
     """(ToolDef, handler) pairs for the delegation tools — plans/013 phase 1,
     reinstated by plans/020."""
-    from . import _AUTHORING_SKILL_BODY
 
     async def _playbook_agent(*, task: str, playbook: str = "",
                               wait_seconds: float | None = None) -> str:
@@ -562,7 +784,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                 log.exception("delegation %s: card post failed", row.id)
 
         tools = await delegate_toolset(session_factory, playbook, authoring_tools)
-        prompt = _delegate_prompt(_AUTHORING_SKILL_BODY, task, pb)
+        prompt = _delegate_prompt(task, pb)
 
         task_obj = asyncio.create_task(_drive_delegation(
             ctx, session_factory, row.id, prompt, tools, conversation_id,

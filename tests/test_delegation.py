@@ -431,3 +431,53 @@ def test_skill_descriptions_steer_playbook_jobs_to_delegation():
     assert "playbook-delegation" in auth
     assert "default" in deleg.lower()
     assert "any playbook" not in auth  # the phrasing that caused the miss
+
+
+# ---- plans/020 phase 2: bench-readable tool stream ---------------------------
+
+
+async def test_events_carry_scrubbed_args_and_ok(env):
+    call = FunctionToolCallEvent("playbook_edit", "c1")
+    call.part.args = json.dumps({
+        "name": "candidate-intake",
+        "code": "x" * 500,
+        "api_key": "sk-live-123",
+    })
+    agent = FakeAgent(
+        result="ok",
+        events=[
+            call,
+            FunctionToolResultEvent("playbook_edit", "c1", "candidate_saved"),
+            FunctionToolCallEvent("playbook_validate", "c2"),
+            FunctionToolResultEvent(
+                "playbook_validate", "c2",
+                json.dumps({"error": "undefined ref steps.nope"}),
+            ),
+        ],
+    )
+    tools = _tools(FakeCtx(agent), env)
+    _, run = tools["playbook_agent"]
+    out = json.loads(await run(task="fix", wait_seconds=10))
+    async with env() as s:
+        row = await s.get(PlaybookDelegation, uuid.UUID(out["delegation_id"]))
+
+    edit = next(e for e in row.events if e["label"] == "playbook_edit")
+    assert edit["args"]["name"] == "candidate-intake"
+    assert len(edit["args"]["code"]) <= 201  # capped, not the 500-char slab
+    assert edit["args"]["api_key"] == "•••"  # secret-looking key redacted
+    assert edit["ok"] is True
+
+    bad = next(e for e in row.events if e["label"] == "playbook_validate")
+    assert bad["ok"] is False  # {"error": ...} results grade as failures
+
+
+def test_scrub_and_ok_helpers_never_raise():
+    from plugin_playbooks.delegation import _result_ok, _scrub_args
+
+    assert _scrub_args(None) is None
+    assert _scrub_args("not json {") is None
+    assert _scrub_args({"password": "x", "n": 3}) == {"password": "•••", "n": 3}
+    assert _result_ok("plain text") is True
+    assert _result_ok('{"error": "boom"}') is False
+    assert _result_ok({"error": ""}) is True  # empty error = not an error
+    assert _result_ok(b"\xff") is True  # junk grades ok, never raises

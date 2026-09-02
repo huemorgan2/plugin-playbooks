@@ -149,6 +149,68 @@ async def serve_ui(path: str):
     return FileResponse(str(target), headers=_NO_CACHE)
 
 
+# --- delegation records, authed (plans/020 phase 2) --------------------------
+# The dojoP bench grades a delegation through its terminal record — the full
+# tool stream (with args + ok) plus the report — over plain HTTP.
+
+
+@router.get("/delegations")
+async def list_delegations(limit: int = 20):
+    from .models import PlaybookDelegation
+
+    limit = max(1, min(int(limit), 100))
+    async with _sf()() as session:
+        rows = (await session.execute(
+            select(PlaybookDelegation)
+            .order_by(PlaybookDelegation.started_at.desc())
+            .limit(limit)
+        )).scalars().all()
+    return {"delegations": [
+        {
+            "id": str(r.id),
+            "task": (r.task or "")[:120],
+            "playbook": r.playbook or None,
+            "status": r.status,
+            "steps_used": r.steps_used,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        }
+        for r in rows
+    ]}
+
+
+@router.get("/delegations/{delegation_id}")
+async def get_delegation(delegation_id: str):
+    from .delegation import _LIVE_FEEDS
+    from .models import PlaybookDelegation
+
+    try:
+        did = uuid.UUID(delegation_id)
+    except ValueError:
+        raise HTTPException(404, "Not found")
+    async with _sf()() as session:
+        row = await session.get(PlaybookDelegation, did)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    events = row.events or []
+    steps_used = row.steps_used
+    feed = _LIVE_FEEDS.get(did)
+    if feed is not None and row.status == "running":
+        events = list(feed.events)
+        steps_used = feed.steps_used
+    return {
+        "id": str(row.id),
+        "task": row.task,
+        "playbook": row.playbook or None,
+        "status": row.status,
+        "steps_used": steps_used,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "result": row.result,
+        "events": events,
+    }
+
+
 # --- delegation progress card (plans/013, reinstated by plans/020) ----------
 # UNAUTHED by design: the card lives in a sandboxed srcdoc iframe with an
 # opaque origin — it can send no cookies and no bearer. Access is
