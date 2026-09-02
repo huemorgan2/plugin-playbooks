@@ -47,6 +47,17 @@ Executed 2026-09-03, autonomously, as Phase 1 of the meltdown recovery
   unpack, self-describing stub shape, carried_from in copied specs, `why=`
   on carried-spec delete, mode/toml manifests for the 4 new tools).
 
+## Deployment
+
+- 0.39.0 committed (7cf055e), pushed to huemorgan2/plugin-playbooks, published
+  to marketplaces.com.ai (`official`), upgraded on Scanny via the marketplace
+  route — live verification: version 0.39.0 active, needs_restart false,
+  29 tools, all four new read tools registered.
+- Phase-0 carry-over closed: candidate-intake's stale `candidate_version=44`
+  cleared to NULL by direct DB update (guarded: only if still 44) — no REST
+  route can clear a candidate, and promote-without-version would have
+  regressed live 45→44. API confirms live=45, candidate=null.
+
 ## Learnings
 
 - **The shared EXPLANATION fixture contains the word "green"** — asserting
