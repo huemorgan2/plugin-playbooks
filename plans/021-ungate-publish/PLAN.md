@@ -24,5 +24,5 @@ Owner decisions (2026-09-02):
    playbook toggles `publish_require_specs`/`publish_require_run` (kept) — specs and
    test-run. Toggles off = reported, never refused (existing `require=False` semantics).
 6. **Approval card gains ✓/✗ gate-status bullets** built from the gates list.
-7. Version 0.35.0 (three stamps), UI rebuild, tests, push, marketplace publish,
+7. Version 0.37.0 (three stamps; 0.35.0-0.36.0 were taken by the superseded plans-tab releases), UI rebuild, tests, push, marketplace publish,
    QA-Luna verify.
