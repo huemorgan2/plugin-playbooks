@@ -1,9 +1,11 @@
-"""0.30.0 (plans/018 phase 1) — publish is the aggregate, explainable approval.
+"""0.30.0 (plans/018 phase 1, reshaped by 021) — publish is the aggregate,
+explainable approval.
 
-After every gate passes, the handler raises ONE `playbook_change` approval:
-plain-language explanation up front (luna 094 presentation), technical diff
-collapsed behind it. The flip happens only after the owner approves, outside
-any row lock, and re-checks the approved target is still current.
+After every machine gate passes, the handler raises ONE `playbook_change`
+approval: plain-language explanation (optional since 021) up front, ✓/✗ check
+bullets, technical diff collapsed behind it. The flip happens only after the
+owner approves, outside any row lock, and re-checks the approved target is
+still current. 021: EVERY agent publish raises the card — no full-power skip.
 """
 
 from __future__ import annotations
@@ -13,14 +15,13 @@ import uuid
 
 import pytest
 
-from evidence import EXPLANATION, green_run, make_plan
+from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import Base, Playbook
-from plugin_playbooks.plans import set_full_power
 
 
 class _Bus:
@@ -110,24 +111,6 @@ async def _live_state(sf) -> Playbook:
 
 
 @pytest.mark.asyncio
-async def test_missing_or_short_explanation_is_a_steering_refusal():
-    approvals = _Approvals()
-    engine, sf, tools = await _env(_Ctx(approvals))
-    try:
-        await _green_candidate(sf, tools)
-        for bad in ({}, {"explanation": "fixed it."}):
-            out = json.loads(await tools["playbook_publish"](name="greeter", **bad))
-            assert "explanation" in out["error"]
-            assert "OWNER" in out["hint"]
-        pb = await _live_state(sf)
-        assert pb.live_version == 1
-        assert pb.candidate_version == 2
-        assert approvals.requests == []
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
 async def test_publish_files_one_rich_approval_then_flips():
     approvals = _Approvals()
     engine, sf, tools = await _env(_Ctx(approvals))
@@ -135,7 +118,6 @@ async def test_publish_files_one_rich_approval_then_flips():
         await _green_candidate(sf, tools)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
         ))
         assert out["status"] == "published"
         assert out["live_version"] == 2
@@ -152,12 +134,33 @@ async def test_publish_files_one_rich_approval_then_flips():
         assert len(pres["headline"]) <= 90
         assert EXPLANATION in pres["explanation"]
         assert "Evidence:" in pres["explanation"]
+        # 021: ✓/✗ check bullets on the card, in owner words
+        checks = [c for c in pres["changes"] if c["label"] == "Checks"]
+        assert checks and checks[0]["kind"] == "text"
+        assert "✓" in checks[0]["text"]
         diffs = [c for c in pres["changes"] if c["kind"] == "diff"]
         assert diffs and diffs[0]["label"] == "Playbook code"
         assert "inputs.greeting" in diffs[0]["before"]
         assert "inputs.name" in diffs[0]["after"]
         # presentation stays advisory — never inside the payload
         assert "presentation" not in req["payload"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_publish_without_explanation_still_files_the_card():
+    # 021: the explanation gate is gone — no explanation is a fine publish;
+    # the card headline falls back to the action line.
+    approvals = _Approvals()
+    engine, sf, tools = await _env(_Ctx(approvals))
+    try:
+        await _green_candidate(sf, tools)
+        out = json.loads(await tools["playbook_publish"](name="greeter"))
+        assert out["status"] == "published"
+        assert len(approvals.requests) == 1
+        pres = approvals.requests[0]["presentation"]
+        assert pres["headline"] == "Publish version 2 of 'greeter'"
     finally:
         await engine.dispose()
 
@@ -170,7 +173,6 @@ async def test_rejected_publish_leaves_live_untouched():
         await _green_candidate(sf, tools)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
         ))
         assert "did not approve" in out["error"]
         assert out["owner_reason"] == "not this week"
@@ -198,34 +200,10 @@ async def test_candidate_changed_during_approval_wait_refuses_flip():
         approvals.on_request = edit_while_pending
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
         ))
         assert "candidate changed" in out["error"]
         pb = await _live_state(sf)
         assert pb.live_version == 1
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_full_power_records_audit_only():
-    # plans/016 phase 1: `plans_full_power` replaces the old per-playbook
-    # publish_autonomy=='auto' + fix_publish branch.
-    approvals = _Approvals()
-    engine, sf, tools = await _env(_Ctx(approvals))
-    try:
-        await _green_candidate(sf, tools)
-        async with sf() as s:
-            await set_full_power(s, True)
-        out = json.loads(await tools["playbook_publish"](
-            name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
-        ))
-        assert out["status"] == "published"
-        assert approvals.requests == []  # no blocking ask
-        assert len(approvals.autos) == 1
-        assert approvals.autos[0]["kind"] == "playbook_change"
-        assert approvals.autos[0]["presentation"]["eyebrow"] == "Playbook change"
     finally:
         await engine.dispose()
 
@@ -236,14 +214,10 @@ async def test_rollback_carries_explanation_and_reverse_diff():
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
         await _green_candidate(sf, tools)
-        await tools["playbook_publish"](
-            name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
-        )
+        await tools["playbook_publish"](name="greeter", explanation=EXPLANATION)
         await green_run(sf, 1)  # restore evidence: v1 has a completed run
         out = json.loads(await tools["playbook_rollback"](
             name="greeter", explanation=EXPLANATION,
-            plan_id=await make_plan(tools),
         ))
         assert out["status"] == "rolled_back"
         req = approvals.requests[-1]

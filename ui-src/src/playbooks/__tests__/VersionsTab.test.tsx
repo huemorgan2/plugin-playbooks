@@ -4,13 +4,11 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import type { PlaybookDef, VersionDetail } from '../types'
 
 vi.mock('../api', () => ({
-  PUBLISHABLE_PLAN_STATUSES: ['proposed', 'approved'],
   playbooksApi: {
     listVersions: vi.fn(),
     getVersion: vi.fn(),
     promoteVersion: vi.fn(),
     promoteCandidate: vi.fn(),
-    listPlans: vi.fn(),
     listRuns: vi.fn().mockResolvedValue([]),
     getRun: vi.fn(),
   },
@@ -28,17 +26,11 @@ import { VersionsTab, promoteRefusalMessage, promoteRefusalGate } from '../Versi
 
 const api = playbooksApi as unknown as Record<string, ReturnType<typeof vi.fn>>
 
-// plans/016 phase 3: every promote goes through the plan picker.
-const PLAN = {
-  plan_id: 'p-1', title: 'Fix the greeter', status: 'proposed',
-  playbook_refs: ['greeter'], created_at: '2026-08-30T10:00:00Z',
-  updated_at: null, has_execution_summary: false,
-}
-
-async function promoteViaPicker() {
+// 021: the Promote click opens a ✓/✗ confirm; the confirm button publishes.
+async function promoteViaConfirm() {
   fireEvent.click(screen.getByTestId('promote-btn'))
-  await screen.findByTestId('plan-picker')
-  fireEvent.click(await screen.findByTestId('plan-option-p-1'))
+  await screen.findByTestId('promote-confirm')
+  fireEvent.click(screen.getByTestId('promote-confirm-btn'))
 }
 
 beforeAll(() => {
@@ -75,7 +67,7 @@ function detailOf(version: number, live: boolean, candidate = false): VersionDet
   }
 }
 
-function setup({ candidate = false, redV1 = false, requireSpecs = true }: { candidate?: boolean; redV1?: boolean; requireSpecs?: boolean } = {}) {
+function setup({ candidate = false, redV1 = false }: { candidate?: boolean; redV1?: boolean } = {}) {
   api.listVersions.mockResolvedValue([
     ...(candidate ? [entry(3, { candidate: true })] : []),
     entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
@@ -89,7 +81,7 @@ function setup({ candidate = false, redV1 = false, requireSpecs = true }: { cand
     <VersionsTab
       name="greeter" agentName="Luna" liveVersion={2}
       candidateVersion={candidate ? 3 : null}
-      onPromoted={onPromoted} onManifestSaved={() => {}} requireSpecs={requireSpecs}
+      onPromoted={onPromoted} onManifestSaved={() => {}}
     />,
   )
   return { onPromoted }
@@ -98,7 +90,6 @@ function setup({ candidate = false, redV1 = false, requireSpecs = true }: { cand
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset?.()
   api.listRuns.mockResolvedValue([])
-  api.listPlans.mockResolvedValue({ plans: [PLAN] })
 })
 
 describe('VersionsTab', () => {
@@ -128,9 +119,9 @@ describe('VersionsTab', () => {
     const btn = screen.getByTestId('promote-btn')
     expect(btn.textContent).toContain('Promote to live')
     api.promoteVersion.mockResolvedValue({ name: 'greeter', live_version: 1, promoted_from: 2, status: 'promoted' })
-    await promoteViaPicker()
+    await promoteViaConfirm()
     await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(1))
-    expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1, 'p-1', false)
+    expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1)
     expect(api.promoteCandidate).not.toHaveBeenCalled()
   })
 
@@ -140,67 +131,24 @@ describe('VersionsTab', () => {
     fireEvent.click(screen.getByTestId('version-row-3'))
     await waitFor(() => expect(screen.getByTestId('toolbar-version').textContent).toBe('v3'))
     api.promoteCandidate.mockResolvedValue({ name: 'greeter', live_version: 3, promoted_from: 2, status: 'promoted' })
-    await promoteViaPicker()
+    await promoteViaConfirm()
     await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(3))
-    expect(api.promoteCandidate).toHaveBeenCalledWith('greeter', 'p-1', false)
+    expect(api.promoteCandidate).toHaveBeenCalledWith('greeter')
     expect(api.promoteVersion).not.toHaveBeenCalled()
   })
 
-  it('with no publishable plan the picker says to ask the agent — no dead promote', async () => {
-    api.listPlans.mockResolvedValue({ plans: [{ ...PLAN, status: 'done' }] })
-    setup()
-    await screen.findByTestId('version-toolbar')
-    fireEvent.click(screen.getByTestId('version-row-1'))
-    await screen.findByTestId('promote-btn')
-    fireEvent.click(screen.getByTestId('promote-btn'))
-    const empty = await screen.findByTestId('plan-picker-empty')
-    expect(empty.textContent).toContain('Ask Luna')
-    expect(api.promoteVersion).not.toHaveBeenCalled()
-  })
-
-  it('a 422 refusal is shown under the toolbar, naming the gate', async () => {
+  it('a 422 refusal is shown under the toolbar', async () => {
     const { onPromoted } = setup()
     await screen.findByTestId('version-toolbar')
     fireEvent.click(screen.getByTestId('version-row-1'))
     await screen.findByTestId('promote-btn')
     api.promoteVersion.mockRejectedValue(new Error(
-      '422: {"detail":{"gate":"test_run","error":"version 1 has never completed a run"}}',
+      '422: {"detail":{"gate":"probes","message":"Promote refused — a tool this playbook uses is broken: send_chat_message — dead"}}',
     ))
-    await promoteViaPicker()
+    await promoteViaConfirm()
     const err = await screen.findByTestId('promote-error')
-    expect(err.textContent).toContain('never completed a run')
+    expect(err.textContent).toContain('broken')
     expect(onPromoted).not.toHaveBeenCalled()
-  })
-
-  // plans/016 phase 3: the owner's own click is the consent — a test_run
-  // refusal offers Promote anyway, which retries with force_test_run.
-  it('a test_run 422 offers Promote anyway; the retry forces only that gate', async () => {
-    const { onPromoted } = setup({ candidate: true })
-    await screen.findByTestId('version-toolbar')
-    fireEvent.click(screen.getByTestId('version-row-3'))
-    await screen.findByTestId('promote-btn')
-    api.promoteCandidate.mockRejectedValueOnce(new Error(
-      '422: {"detail":{"gate":"test_run","error":"specs are dry-run simulations"}}',
-    ))
-    await promoteViaPicker()
-    await screen.findByTestId('promote-error')
-    api.promoteCandidate.mockResolvedValueOnce({ name: 'greeter', live_version: 3, promoted_from: 2, status: 'promoted' })
-    fireEvent.click(screen.getByTestId('promote-anyway-btn'))
-    await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(3))
-    expect(api.promoteCandidate).toHaveBeenLastCalledWith('greeter', 'p-1', true)
-  })
-
-  it('a non-test_run 422 does NOT offer Promote anyway', async () => {
-    setup()
-    await screen.findByTestId('version-toolbar')
-    fireEvent.click(screen.getByTestId('version-row-1'))
-    await screen.findByTestId('promote-btn')
-    api.promoteVersion.mockRejectedValue(new Error(
-      '422: {"detail":{"gate":"plan_required","message":"needs a plan"}}',
-    ))
-    await promoteViaPicker()
-    await screen.findByTestId('promote-error')
-    expect(screen.queryByTestId('promote-anyway-btn')).toBeNull()
   })
 
   it('view switch: Code / Manifest / Tests / Runs render per version', async () => {
@@ -219,26 +167,62 @@ describe('VersionsTab', () => {
   })
 })
 
-describe('VersionsTab — per-version tests (phase 5)', () => {
-  it('rows show that version\'s test counts and a red version cannot be promoted', async () => {
-    setup({ redV1: true })
+describe('VersionsTab — the ✓/✗ promote confirm (021)', () => {
+  it('a candidate with no tests: button stays enabled, confirm shows ✗ and Publish anyway', async () => {
+    setup({ candidate: true })
+    await screen.findByTestId('version-toolbar')
+    // v3 candidate: no specs cache → ✗ "No tests defined", but never disabled
+    fireEvent.click(screen.getByTestId('version-row-3'))
+    const btn = await screen.findByTestId('promote-btn')
+    expect((btn as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(btn)
+    const confirm = await screen.findByTestId('promote-confirm')
+    expect(confirm.textContent).toContain('✗')
+    expect(screen.getByTestId('promote-confirm-btn').textContent).toBe('Publish anyway')
+  })
+
+  it('a red version still promotes — Publish anyway, owner click is the consent', async () => {
+    const { onPromoted } = setup({ redV1: true })
     await screen.findByTestId('version-toolbar')
     expect(screen.getByTestId('version-specs-2').textContent).toBe('2 tests · 2 green')
     expect(screen.getByTestId('version-specs-1').textContent).toBe('2 tests · 1 red')
     fireEvent.click(screen.getByTestId('version-row-1'))
     const btn = await screen.findByTestId('promote-btn')
-    expect((btn as HTMLButtonElement).disabled).toBe(true)
-    expect(btn.getAttribute('title')).toContain('red')
+    expect((btn as HTMLButtonElement).disabled).toBe(false)
+    api.promoteVersion.mockResolvedValue({ name: 'greeter', live_version: 1, promoted_from: 2, status: 'promoted' })
+    fireEvent.click(btn)
+    const confirm = await screen.findByTestId('promote-confirm')
+    expect(confirm.textContent).toContain('1 of 2 tests red')
+    const go = screen.getByTestId('promote-confirm-btn')
+    expect(go.textContent).toBe('Publish anyway')
+    fireEvent.click(go)
+    await waitFor(() => expect(onPromoted).toHaveBeenCalledWith(1))
+    expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1)
   })
 
-  // plans/016 phase 6: the client-side red-disable follows the specs gate switch.
-  it('a red version can be promoted when the specs gate is off in Settings → Publish', async () => {
-    setup({ redV1: true, requireSpecs: false })
+  it('a green version with runs shows all-✓ and a plain Publish button', async () => {
+    api.listVersions.mockResolvedValue([
+      entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
+      entry(1, { specs: { total: 3, failed: 0, green: 3 } }),
+    ])
+    api.getVersion.mockImplementation((_n: string, v: number) =>
+      Promise.resolve(detailOf(v, v === 2)),
+    )
+    render(
+      <VersionsTab
+        name="greeter" agentName="Luna" liveVersion={2} candidateVersion={null}
+        onPromoted={() => {}} onManifestSaved={() => {}}
+      />,
+    )
     await screen.findByTestId('version-toolbar')
-    expect(screen.getByTestId('version-specs-1').textContent).toBe('2 tests · 1 red')
     fireEvent.click(screen.getByTestId('version-row-1'))
     const btn = await screen.findByTestId('promote-btn')
-    expect((btn as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(btn)
+    const confirm = await screen.findByTestId('promote-confirm')
+    expect(confirm.textContent).toContain('Tests: 3/3 green')
+    expect(confirm.textContent).toContain('Has run 1 time')
+    expect(confirm.textContent).not.toContain('✗')
+    expect(screen.getByTestId('promote-confirm-btn').textContent).toBe('Publish')
   })
 
   it('version list folds to a slim rail and back; toolbar tabs stay present', async () => {

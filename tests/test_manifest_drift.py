@@ -78,12 +78,12 @@ def test_version_stamps_agree():
     assert py_v == toml_v
 
 
-def test_prompt_always_tools_lead_with_why():
-    """plans/018 phase 3: the remaining prompt_always mutations carry an
-    optional `why`, FIRST in the schema so the legacy approval card leads
-    with plain language."""
+def test_owner_facing_tools_lead_with_why():
+    """plans/018 phase 3 (trimmed by 021): mutations whose card/audit line
+    the owner reads carry an optional `why`, FIRST in the schema so the
+    presentation leads with plain language."""
     real = _code_tooldefs()
-    for name in ("playbook_edit_force", "playbook_manifest_set",
+    for name in ("playbook_manifest_set",
                  "playbook_spec_delete", "playbook_set_autonomy"):
         props = real[name].parameters["properties"]
         assert next(iter(props)) == "why", name

@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
-from evidence import EXPLANATION, make_plan, seed_plan
+from evidence import EXPLANATION
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -260,8 +260,7 @@ async def test_restore_runs_the_restored_versions_own_specs(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
-    # v2 = candidate whose copy of s1 is red; force it live via the owner
-    # route path: promote would refuse, so mint v2 as live by an owner PUT
+    # v2 = version whose copy of s1 is red: mint v2 as live by an owner PUT
     # of a definition that breaks s1, then add a v2-only spec.
     pb = await _pb(sf)
     broken = dict(pb.definition)
@@ -274,17 +273,21 @@ async def test_restore_runs_the_restored_versions_own_specs(env):
     assert set(await _specs(sf, 1)) == {"s1"}
 
     await _green_run(sf, 1)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
     assert r.status_code == 200, r.text            # v1's own spec is green
     assert (await _pb(sf)).live_version == 1
 
-    # and the other way: v2's set is red → refused, naming the gate
+    # and the other way: v2's set is red → 021: the owner still goes
+    # through, and v2's own specs were the ones refreshed (red cached).
     await _green_run(sf, 2)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 2, "plan_id": await seed_plan(sf)})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["gate"] == "specs"
-    assert "v2" in r.json()["detail"]["message"]
-    assert {f["spec"] for f in r.json()["detail"]["failing_specs"]} == {"s1", "only-v2"}
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 2})
+    assert r.status_code == 200, r.text
+    assert (await _pb(sf)).live_version == 2
+    async with sf() as s:
+        rows = (await s.execute(select(PlaybookSpec).where(
+            PlaybookSpec.playbook_version == 2))).scalars().all()
+    assert {r_.name for r_ in rows} == {"s1", "only-v2"}
+    assert all(r_.last_result and r_.last_result.get("passed") is False for r_ in rows)
 
 
 @pytest.mark.asyncio
@@ -303,7 +306,7 @@ async def test_tool_publish_restore_uses_the_same_gate(env):
             "send_chat_message": {"args_contain": {"message": "Slartibartfast"}}}}}
         await s.commit()
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(handlers)))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out["gate"] == "specs"
     assert (await _pb(sf)).live_version == 2
 

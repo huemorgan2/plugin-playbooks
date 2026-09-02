@@ -60,14 +60,16 @@ def test_honesty_rules_present():
     assert "never work around a refusal" in low
 
 
-def test_plan_gate_wired_into_checklist():
+def test_checklist_wired_before_publish():
+    # 021: the plans feature is gone — the checklist + approval card are
+    # the whole pre-publish story, and the manifest is context, not law.
     p = _delegate_prompt("task", None)
-    assert "playbook_plan_write" in p
-    assert "plan_id" in p
-    assert "playbook_plan_finish" in p
+    assert "playbook_plan_write" not in p
+    assert "plan_id" not in p
+    assert "playbook_manifest_set" in p
     # The checklist sits immediately before the publish instruction.
     assert p.index("Pre-publish checklist") < p.index(
-        "playbook_publish(name, plan_id=")
+        "playbook_publish(name, explanation=")
 
 
 def test_budgets_named_with_rationale_and_losing_exits():

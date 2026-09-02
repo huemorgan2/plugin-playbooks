@@ -62,8 +62,8 @@ class Playbook(Base):
     failures_acked_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_autonomy: Mapped[str] = mapped_column(String(32), default="agent_must_confirm", nullable=False)
     # 0.26.0 (plans/015, 089 §3): legacy. 'ask' (default) | 'auto'. The ops
-    # mode that honored 'auto' was removed (luna 098); publishing is governed
-    # by the 016 gates (plan + green test + approval card / plans_full_power).
+    # mode that honored 'auto' was removed (luna 098); agent publishing is
+    # governed by the machine gates + one approval card (021).
     # Kept only so old rows keep loading.
     publish_autonomy: Mapped[str] = mapped_column(String(16), default="ask", nullable=False)
     # 0.28.0 (plans/016 phase 6): owner-switchable publish gates (Settings →
@@ -322,59 +322,6 @@ class PlaybookFixProposal(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
-    )
-
-
-# plans/016 (luna-plugins): plan lifecycle. proposed → approved (a publish
-# went through under it) → done (agent wrote the execution summary); or
-# rejected (owner said no on the publish card) / abandoned (agent gave up).
-PLAN_STATUSES = ("proposed", "approved", "rejected", "done", "abandoned")
-
-
-class PlaybookPlan(Base):
-    """0.32.0 (luna-plugins plans/016): a playbook change plan — one row, all
-    text. The agent writes title/body/execution_summary; `outcome_facts` is
-    stamped by the publish path ONLY (facts are recorded by code, never by
-    chat narrative). No revision chains — a rejected plan keeps its note and
-    a retry is simply a new row.
-    """
-    __tablename__ = "playbook_plans"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
-    title: Mapped[str] = mapped_column(String(256), nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), default="proposed", nullable=False)
-    rejection_note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    execution_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # list of publish records appended by _do_publish on success — never
-    # written by any agent tool.
-    outcome_facts: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    # playbook names this plan intends to touch (advisory, not enforced).
-    playbook_refs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
-    )
-
-    __table_args__ = (
-        Index("ix_playbook_plans_status", "status"),
-    )
-
-
-class PlaybookAppSetting(Base):
-    """0.32.0 (plans/016): plugin-global key/value settings. First key:
-    `plans_full_power` — {"on": bool}; when on, gated publishes auto-approve
-    (audited) instead of raising an owner card. The plan row stays required
-    either way."""
-    __tablename__ = "playbook_app_settings"
-
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )

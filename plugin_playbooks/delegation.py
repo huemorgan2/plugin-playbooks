@@ -13,9 +13,8 @@ the current world, not reverted:
 
 - luna 098 collapsed conversation states to planning/building (the old
   fix_approve/fix_publish modes are gone) — ToolDef ``modes`` updated.
-- The plan gate (plans/017+): ``playbook_publish`` requires a ``plan_id``,
-  so the delegate's allowlist now includes the plan tools and it writes the
-  plan row itself.
+- 021 deleted the plans feature — publish runs the machine gates and raises
+  the owner's approval card, nothing more.
 
 Core seams used (all shipped, no core changes):
 - luna 046/phase03: an explicit ``tools=`` allowlist bypasses skill-gating,
@@ -67,10 +66,8 @@ _PHASE_BY_TOOL = {
     "playbook_status": "Understand",
     "playbook_language_reference": "Understand",
     "playbook_spec_list": "Understand",
-    "playbook_plan_read": "Understand",
     "playbook_propose": "Change",
     "playbook_edit": "Change",
-    "playbook_edit_force": "Change",
     "playbook_manifest_set": "Change",
     "playbook_set_autonomy": "Change",
     "playbook_list_available_triggers": "Understand",
@@ -82,10 +79,6 @@ _PHASE_BY_TOOL = {
     "playbook_spec_delete": "Prove",
     "playbook_preflight": "Prove",
     "playbook_run_candidate": "Prove",
-    # plans/020: the plan row is the last thing written before publish — it
-    # belongs to the Ship story on the card, not Prove.
-    "playbook_plan_write": "Ship",
-    "playbook_plan_finish": "Ship",
     "playbook_publish": "Ship",
     "playbook_rollback": "Ship",
 }
@@ -100,8 +93,6 @@ def phase_for_tool(tool_name: str) -> str:
 # approval card. Kept in sync with agent_tools.py by a drift test.
 _GATED_TOOLS = frozenset({
     "playbook_set_autonomy",
-    "playbook_edit_force",
-    "playbook_manifest_set",
     "playbook_publish",
     "playbook_rollback",
     "playbook_run_candidate",
@@ -118,19 +109,10 @@ _WAITING_THRESHOLD_S = 8.0
 _GATED_TOOL_OWNER_WORDS = {
     "playbook_publish": "make the change live",
     "playbook_rollback": "roll back the live version",
-    "playbook_edit_force": "force past failing specs",
-    "playbook_manifest_set": "change the playbook's contract",
     "playbook_spec_delete": "delete a spec",
     "playbook_set_autonomy": "change how it runs on its own",
     "playbook_run_candidate": "test-run the draft version",
 }
-
-# plans/020: publish is plan-gated — the delegate writes the plan row itself.
-_PLAN_TOOLS = (
-    "playbook_plan_write",
-    "playbook_plan_read",
-    "playbook_plan_finish",
-)
 
 
 def waiting_on_owner(events: list[dict] | None,
@@ -188,13 +170,11 @@ def _referenced_tools(definition: dict) -> list[str]:
 async def delegate_toolset(
     session_factory, playbook_name: str, authoring_tools: tuple[str, ...]
 ) -> list[str]:
-    """The delegate's allowlist: authoring tools + the plan tools (publish
-    is plan-gated — the delegate writes the plan row itself) + run/inspect +
-    the tools the target playbook's steps reference. Never send_chat_message
-    — the card is the owner-facing surface, not delegate chatter."""
+    """The delegate's allowlist: authoring tools + run/inspect + the tools
+    the target playbook's steps reference. Never send_chat_message — the
+    card is the owner-facing surface, not delegate chatter."""
     tools = (
         list(authoring_tools)
-        + list(_PLAN_TOOLS)
         + ["playbook_list", "playbook_status"]
     )
     if playbook_name:
@@ -231,9 +211,10 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         brief += ["", f"Target playbook: `{pb.name}` — edit it IN PLACE by "
                   "name; never create a '-v2' copy."]
         if pb.manifest:
-            brief += ["", "Its manifest — the owner's intent; your edits "
-                      "must stay within it (a conflict refusal means fix "
-                      "the code or ask via the gated tools):", "",
+            brief += ["", "Its manifest — the bigger picture of what this "
+                      "playbook is for. Read it before changing things; it "
+                      "is context, not law. If your change makes it "
+                      "outdated, update it (playbook_manifest_set):", "",
                       pb.manifest]
 
     sections = [
@@ -305,7 +286,7 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "7. PROOF RUN — the publish gate wants a green test run of this "
         "exact candidate since its last edit: playbook_run_candidate "
         "(owner-approved, real side effects).",
-        "8. PLAN + PUBLISH — run the checklist in section 9, then ship.",
+        "8. PUBLISH — run the checklist in section 9, then ship.",
         "",
         "## 5. The quality bar",
         "",
@@ -344,11 +325,11 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "freely within budget.",
         "- SIDE-EFFECTING: playbook_run and playbook_run_candidate touch "
         "the real world — only when the job needs real proof.",
-        "- OWNER-DECISION: publish, rollback, edit_force, manifest_set, "
-        "spec_delete, run_candidate, set_autonomy raise a real approval "
-        "card in the owner's chat. Call them and WAIT — the pause is the "
-        "owner deciding. A decline is an answer: respect it in your "
-        "report; never work around a refusal or a decline.",
+        "- OWNER-DECISION: publish, rollback, spec_delete, run_candidate, "
+        "set_autonomy raise a real approval card in the owner's chat. "
+        "Call them and WAIT — the pause is the owner deciding. A decline "
+        "is an answer: respect it in your report; never work around a "
+        "refusal or a decline.",
         "",
         "## 8. Worked shapes",
         "",
@@ -393,14 +374,10 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "last edit (playbook_run_candidate).",
         "4. preflight shows no `failed` tools (external-service "
         "playbooks).",
-        "5. The plan row is written: playbook_plan_write — the "
-        "owner-readable intent of THIS change; publish requires its "
-        "plan_id.",
-        "6. The manifest is still true (or was updated through the gated "
-        "tools).",
-        "Then playbook_publish(name, plan_id=..., explanation=...) — the "
-        "explanation in owner words, not tool words. After it resolves, "
-        "playbook_plan_finish.",
+        "5. The manifest still tells the true bigger picture (update it "
+        "with playbook_manifest_set if your change made it stale).",
+        "Then playbook_publish(name, explanation=...) — the explanation "
+        "in owner words, not tool words.",
         "",
         "## 10. Your final report",
         "",
@@ -610,7 +587,7 @@ async def _drive_delegation(
         # plans/020: luna 098 collapsed conversation states to
         # planning/building. The delegate always runs as "building" — its
         # whole job is building, and the publish-class tools it needs
-        # declare modes=["planning","building"] or are plan-gated anyway.
+        # declare modes=["planning","building"] anyway.
         # Containment comes from the explicit `tools` allowlist plus the
         # machine-checked publish gates, not from the spawning chat's state.
         result, _usage = await ctx.agent.run_turn(
@@ -826,7 +803,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                     "Delegate a playbook authoring job (create, fix, edit, "
                     "add specs) to a focused background agent. It works "
                     "through the full loop (read, edit, validate, dry-run, "
-                    "specs, plan, publish) in its own context; a live "
+                    "specs, publish) in its own context; a live "
                     "progress card appears in the chat. Returns within "
                     "wait_seconds (default 25): either the finished report "
                     "or status 'running' — then tell the owner the card "

@@ -350,18 +350,19 @@ side-effect-free `over=` loop body — but never mutate shared state in a
 concurrent loop. THAT is a crawl.
 
 ### MANIFEST + THE EDIT FLOW (read → ticket → write)
-Every playbook can carry a MANIFEST: the owner's intent in plain markdown —
-Purpose, Side effects, Never (invariants), Acceptance. Editing is TWO steps:
+Every playbook can carry a MANIFEST: the bigger picture in plain markdown —
+Purpose, Side effects, Never (invariants), Acceptance. It is context, not
+law: read it before changing things; nothing enforces it, and if a change
+makes it stale, update it with `playbook_manifest_set`. Editing is TWO
+steps:
 1. READ: `playbook_edit(name)` alone → a JSON header (versions, ticket)
-plus the manifest and current code as plain-text frames. Your edit must stay
-within the manifest; copy `old=` snippets verbatim from the code frame.
+plus the manifest and current code as plain-text frames; copy `old=`
+snippets verbatim from the code frame.
 2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`
 or `old=`/`new=` (the `old` snippet must match exactly one place). The
 ticket is single-use and expires; no valid ticket, no save.
-On a manifest conflict: fix the code, retry with the SAME ticket (refusals
-don't burn it); or `playbook_manifest_set` (asks the owner); or
-`playbook_edit_force` when the owner wants the change (also asks). NEVER work around a refusal any other way. Pass `manifest=` to
-`playbook_propose` on create; if a playbook has none, propose one.
+Pass `manifest=` to `playbook_propose` on create; if a playbook has none,
+propose one.
 
 ### CANDIDATE → PUBLISH (a save never changes the running playbook)
 Saving an edit creates a CANDIDATE — the LIVE playbook keeps running
@@ -562,9 +563,8 @@ _DELEGATION_SKILL_BODY = '''\
 
 `playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
 authoring job (create, fix, edit, add specs) to a focused background agent.
-It runs the full loop — read, edit, validate, dry-run, specs, plan row,
-publish — in its own context; your chat keeps one call and one short
-result.
+It runs the full loop — read, edit, validate, dry-run, specs, publish —
+in its own context; your chat keeps one call and one short result.
 
 ## When to delegate vs. do it yourself
 
@@ -619,7 +619,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.34.0",
+        version="0.35.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -650,7 +650,6 @@ class PlaybooksPlugin(LunaPlugin):
                 tools=[
                     "playbook_propose",
                     "playbook_edit",
-                    "playbook_edit_force",
                     "playbook_manifest_set",
                     "playbook_publish",
                     "playbook_rollback",
@@ -857,7 +856,6 @@ class PlaybooksPlugin(LunaPlugin):
     AUTHORING_TOOLS = (
         "playbook_propose",
         "playbook_edit",
-        "playbook_edit_force",       # 0.10.0: gate the whole edit flow
         "playbook_manifest_set",
         "playbook_publish",
         "playbook_rollback",
@@ -968,16 +966,16 @@ class PlaybooksPlugin(LunaPlugin):
 
     # luna 098: the ops chat has no modes — one section, shown whenever the
     # current chat is the ops chat. Enforcement lives in the publish gates
-    # (016: plan + green test + one approval card), not in tool hiding.
+    # (021: machine gates + one approval card), not in tool hiding.
     _OPS_SECTION = (
         "## Ops chat\n"
         "You are operating, not building: monitor production playbook "
         "activity, diagnose failures, and fix them. The full toolset is "
         "available; the machine-checked publish gates do the enforcing — a "
-        "publish needs a plan, a green test run since the draft's last edit "
-        "(playbook_run_candidate), and the owner's approval. Run the test "
+        "publish needs a green test run since the draft's last edit "
+        "(playbook_run_candidate) and the owner's approval. Run the test "
         "first instead of arguing with the gate.\n"
-        "The owner is not an engineer. Anything you write for them — plans, "
+        "The owner is not an engineer. Anything you write for them — "
         "`why` arguments, the publish `explanation` — must say in everyday "
         "language what went wrong, what the change does about it, and how "
         "it was tested, tied back to the failure that started this work. No "

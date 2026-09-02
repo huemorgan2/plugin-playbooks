@@ -1,8 +1,9 @@
-"""0.9.0 (plans/002 phase 2) — manifest + staged edit flow.
+"""0.9.0 (plans/002 phase 2, reshaped by 021) — manifest + staged edit flow.
 
 playbook_edit is two-stage: read (manifest + code + single-use ticket) →
-write (ticket required; compile → validate → LLM drift check against the
-manifest). playbook_manifest_set / playbook_edit_force are prompt_always.
+write (ticket required; compile → validate). 021: the manifest is context,
+not law — the LLM drift gate and playbook_edit_force are gone, and
+playbook_manifest_set is auto_approve.
 """
 
 from __future__ import annotations
@@ -213,12 +214,13 @@ async def test_concurrent_change_is_refused(env):
     assert "changed while you were editing" in out["error"]
 
 
-# --- drift gate ---
+# --- no drift gate (021) ---
 
 @pytest.mark.asyncio
-async def test_drift_check_skipped_without_manifest(env):
+async def test_edit_never_calls_the_llm_even_with_a_manifest(env):
+    # 021: the manifest is context, not law — no drift judge on any edit.
     _, tools, agent = env
-    await tools["playbook_propose"](name="greeter", code=CODE)
+    await tools["playbook_propose"](name="greeter", code=CODE, manifest=MANIFEST)
     ticket = (await _read_stage(tools))["ticket"]
     out = json.loads(await tools["playbook_edit"](
         name="greeter", ticket=ticket, code=NEW_CODE,
@@ -227,75 +229,9 @@ async def test_drift_check_skipped_without_manifest(env):
     assert agent.calls == []
 
 
-@pytest.mark.asyncio
-async def test_drift_check_runs_with_manifest_and_passes(env):
-    _, tools, agent = env
-    await tools["playbook_propose"](name="greeter", code=CODE, manifest=MANIFEST)
-    ticket = (await _read_stage(tools))["ticket"]
-    out = json.loads(await tools["playbook_edit"](
-        name="greeter", ticket=ticket, code=NEW_CODE,
-    ))
-    assert out["status"] == "candidate_saved"
-    assert len(agent.calls) == 1
-    prompt, kw = agent.calls[0]
-    assert MANIFEST in prompt and CODE in prompt and NEW_CODE in prompt
-    assert kw["output_schema"] == {"conflict": "bool", "reason": "str"}
-    assert kw["purpose"] == "summarization"
-
-
-@pytest.mark.asyncio
-async def test_drift_conflict_refuses_and_keeps_ticket(env):
-    sf, tools, agent = env
-    await tools["playbook_propose"](name="greeter", code=CODE, manifest=MANIFEST)
-    ticket = (await _read_stage(tools))["ticket"]
-    agent.result = {"conflict": True, "reason": "the manifest forbids email"}
-    out = json.loads(await tools["playbook_edit"](
-        name="greeter", ticket=ticket, code=NEW_CODE,
-    ))
-    assert "conflicts with the playbook's manifest" in out["error"]
-    assert out["reason"] == "the manifest forbids email"
-    assert any("playbook_manifest_set" in o for o in out["your_options"])
-    assert any("playbook_edit_force" in o for o in out["your_options"])
-    assert (await _get(sf, "greeter")).version == 1  # nothing saved
-
-    agent.result = {"conflict": False, "reason": ""}
-    out = json.loads(await tools["playbook_edit"](
-        name="greeter", ticket=ticket, code=NEW_CODE,  # SAME ticket retries
-    ))
-    assert out["status"] == "candidate_saved", out
-
-
-@pytest.mark.asyncio
-async def test_drift_check_fails_open_on_llm_error(env):
-    sf, tools, agent = env
-    await tools["playbook_propose"](name="greeter", code=CODE, manifest=MANIFEST)
-    ticket = (await _read_stage(tools))["ticket"]
-    agent.exc = RuntimeError("llm down")
-    out = json.loads(await tools["playbook_edit"](
-        name="greeter", ticket=ticket, code=NEW_CODE,
-    ))
-    assert out["status"] == "candidate_saved"
-    assert "unavailable" in out["drift_warning"]
-    assert (await _get(sf, "greeter")).version == 2
-
-
-@pytest.mark.asyncio
-async def test_edit_force_skips_drift_and_records_override(env):
-    sf, tools, agent = env
-    await tools["playbook_propose"](name="greeter", code=CODE, manifest=MANIFEST)
-    ticket = (await _read_stage(tools))["ticket"]
-    agent.result = {"conflict": True, "reason": "no"}
-    out = json.loads(await tools["playbook_edit_force"](
-        name="greeter", ticket=ticket, code=NEW_CODE,
-    ))
-    assert out["status"] == "candidate_saved"
-    assert "forced" in out["note"]
-    assert agent.calls == []  # drift gate never ran
-    async with sf() as s:
-        v = (await s.execute(select(PlaybookVersion).where(
-            PlaybookVersion.version == out["candidate_version"]
-        ))).scalar_one()
-    assert "forced" in v.message  # the override is recorded on the candidate
+def test_edit_force_tool_is_gone(env):
+    _, tools, _ = env
+    assert "playbook_edit_force" not in tools
 
 
 # --- manifest tool + snapshots ---
@@ -335,8 +271,8 @@ async def test_edit_snapshot_carries_manifest(env):
 
 def test_approval_policies():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _Runner())}
-    assert tds["playbook_manifest_set"].policy == "prompt_always"
-    assert tds["playbook_edit_force"].policy == "prompt_always"
+    # 021: the manifest is context, not law — keeping it fresh must be cheap.
+    assert tds["playbook_manifest_set"].policy == "auto_approve"
     assert getattr(tds["playbook_edit"], "policy", None) != "prompt_always"
     assert "ticket" in tds["playbook_edit"].parameters["properties"]
     assert "manifest" in tds["playbook_propose"].parameters["properties"]

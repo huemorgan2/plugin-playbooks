@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from evidence import EXPLANATION, green_run, make_plan
+from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -125,7 +125,7 @@ async def _make_candidate(tools) -> None:
 async def test_publish_refused_without_test_run(env):
     sf, tools, _, _ = env
     await _make_candidate(tools)
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
     assert "simulations" in out["error"]
     assert "playbook_run_candidate" in out["hint"]
@@ -148,7 +148,7 @@ async def test_publish_refused_on_failed_test_run(env):
             completed_at=later,
         ))
         await s.commit()
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
     assert "FAILED" in out["error"]
     assert out["run_id"]
@@ -159,7 +159,7 @@ async def test_publish_passes_with_green_test_run_and_announces(env):
     sf, tools, _, bus = env
     await _make_candidate(tools)
     await green_run(sf, 2)
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "published"
     gates = {g["gate"]: g for g in out["gates"]}
     assert gates["test_run"]["ok"] is True
@@ -182,7 +182,7 @@ async def test_stale_evidence_does_not_satisfy_a_new_edit(env):
         name="greeter", ticket=read["ticket"],
         old="inputs.name", new="inputs.nickname",
     )
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
 
 
@@ -338,8 +338,8 @@ def test_mode_declarations():
     for name, td in tds.items():
         modes = getattr(td, "modes", None)
         assert modes in (None, planning_and_building), (name, modes)
-    # plans/016: publish/rollback and the plan tools are available even in
-    # planning — the plan gate is the enforcement, not modes.
+    # plans/016 (021: plan tools gone): publish/rollback stay available even
+    # in planning — the machine gates + approval card are the enforcement.
     planning_ok = {
         n for n, td in tds.items()
         if getattr(td, "modes", None) == planning_and_building
@@ -349,12 +349,11 @@ def test_mode_declarations():
         "playbook_get_definition", "playbook_validate",
         "playbook_language_reference", "playbook_spec_list",
         "playbook_spec_from_run", "playbook_preflight",
-        "playbook_plan_write", "playbook_plan_read", "playbook_plan_finish",
         "playbook_publish", "playbook_rollback",
     }
     # everything else (draft authoring, runs, autonomy, acks) is
     # building-only by default — absent while the owner is planning.
-    for name in ("playbook_propose", "playbook_edit", "playbook_edit_force",
+    for name in ("playbook_propose", "playbook_edit",
                  "playbook_manifest_set", "playbook_spec_add",
                  "playbook_spec_delete", "playbook_spec_run",
                  "playbook_dry_run", "playbook_run_candidate",
@@ -366,7 +365,7 @@ def test_mode_declarations():
 def test_artifact_ref_declarations():
     """089 P5 work registry: mutating playbook tools claim playbook:{name}."""
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
-    for name in ("playbook_propose", "playbook_edit", "playbook_edit_force",
+    for name in ("playbook_propose", "playbook_edit",
                  "playbook_manifest_set", "playbook_publish",
                  "playbook_rollback", "playbook_run_candidate",
                  "playbook_spec_add", "playbook_spec_delete"):
@@ -546,8 +545,8 @@ async def test_fix_proposal_wakes_ops_without_approval():
         assert "failed once" in body
         assert "HTTP 500 from mail server" in body
         assert str(run.id) in body
-        assert "playbook_plan_write" in body   # plan before any change
-        assert "publish approval card" in body  # where the owner decides
+        assert "playbook_run_candidate" in body  # test before publishing
+        assert "publish approval card" in body   # where the owner decides
 
         # luna 098: no state juggling — the ops chat is always 'building',
         # the wake never touches conversation state.

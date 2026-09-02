@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from evidence import EXPLANATION, make_plan, seed_plan
+from evidence import EXPLANATION
 from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -154,7 +154,7 @@ async def test_candidate_gate_still_requires_a_run_after_the_row(env):
 async def test_route_restore_of_an_old_version_goes_live(env):
     sf, _, client = env
     await _seed(sf, runs_of_v1=["failed", "done"])   # latest is green
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["live_version"] == 1 and body["promoted_from"] == 2
@@ -165,25 +165,23 @@ async def test_route_restore_of_an_old_version_goes_live(env):
 
 
 @pytest.mark.asyncio
-async def test_route_restore_refused_when_version_never_ran(env):
+async def test_route_restore_never_blocks_when_version_never_ran(env):
+    # 021: the owner's click is the consent — no run evidence, still 200;
+    # the UI confirm showed the ✗ "never run" bullet first.
     sf, _, client = env
     await _seed(sf, runs_of_v1=[])
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
-    assert r.status_code == 422, r.text
-    detail = r.json()["detail"]
-    assert detail["gate"] == "test_run"
-    assert "never completed a run" in detail["error"]
-    assert await _live(sf) == 2
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    assert r.status_code == 200, r.text
+    assert await _live(sf) == 1
 
 
 @pytest.mark.asyncio
-async def test_route_restore_refused_when_latest_run_failed(env):
+async def test_route_restore_never_blocks_when_latest_run_failed(env):
     sf, _, client = env
     await _seed(sf, runs_of_v1=["done", "failed"])   # latest is red
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["gate"] == "test_run"
-    assert await _live(sf) == 2
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
+    assert r.status_code == 200, r.text
+    assert await _live(sf) == 1
 
 
 @pytest.mark.asyncio
@@ -208,7 +206,7 @@ async def test_route_rollback_uses_the_same_relaxed_gate(env):
 async def test_tool_restore_matches_the_route(env):
     sf, tools, _ = env
     await _seed(sf, runs_of_v1=["done"])
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out.get("status") == "published", out
     assert await _live(sf) == 1
 
@@ -217,6 +215,6 @@ async def test_tool_restore_matches_the_route(env):
 async def test_tool_restore_refused_without_any_run(env):
     sf, tools, _ = env
     await _seed(sf, runs_of_v1=[])
-    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(tools)))
+    out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out["gate"] == "test_run"
     assert await _live(sf) == 2

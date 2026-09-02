@@ -25,21 +25,11 @@ from .definition import PlaybookDef, parse_yaml
 from .models import (
     Playbook,
     PlaybookDraft,
-    PlaybookPlan,
     PlaybookProbeResult,
     PlaybookRun,
     PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
-)
-from .plans import (
-    full_power as _plans_full_power,
-    load_plan as _load_plan,
-    plan_brief as _plan_brief,
-    plan_detail as _plan_detail,
-    plan_gate as _plan_gate,
-    set_full_power as _set_full_power,
-    stamp_outcome as _plan_stamp_outcome,
 )
 from .probes import run_preflight
 from .publish import announce_publish, test_run_gate, specs_gate
@@ -1179,28 +1169,19 @@ async def get_version(name: str, n: int):
         }
 
 
-async def _specs_gate_or_422(session: AsyncSession, p: Playbook, row: PlaybookVersion) -> None:
-    """Run the specs of `row.version` against its content; 422 on red."""
-    _gate, refusal = await specs_gate(
+async def _refresh_specs(session: AsyncSession, p: Playbook, row: PlaybookVersion) -> None:
+    """Run the specs of `row.version` to refresh results — never blocks (021):
+    the owner's own click is the consent; the UI shows the red/green state."""
+    await specs_gate(
         session, _runner, p.id, _shim_for(p, row), row.version,
-        require=p.publish_require_specs,
+        require=False,
     )
-    if refusal is not None:
-        await session.commit()  # persist last_result on spec rows
-        raise HTTPException(422, refusal)
 
 
 class PromoteBody(BaseModel):
     # None → promote the CANDIDATE through the gate; a number → owner-restore
     # that stored version to live (pointer move, no gate beyond existence).
     version: int | None = None
-    # plans/016 phase 1: every playbook change runs under a plan.
-    plan_id: str | None = None
-    # plans/016 phase 3: the owner's "Promote anyway" — their own click is
-    # the consent, so this skips ONLY the test-run gate for THIS call.
-    # Plan gate, static validation, specs and probes still hold. Recorded
-    # in the plan's outcome facts.
-    force_test_run: bool = False
 
 
 def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: bool) -> None:
@@ -1222,9 +1203,11 @@ def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: b
 async def promote_version(name: str, body: PromoteBody):
     """0.10.0: pointer semantics — no new version numbers are minted.
 
-    Without a version: promote the pending CANDIDATE through the gate
-    (static validation; drift was enforced when the candidate was saved).
-    With a version: owner-restore that stored version to live.
+    Without a version: promote the pending CANDIDATE. With a version:
+    owner-restore that stored version to live. 021: the owner is never
+    blocked on specs or test-run — their click is the consent (the UI
+    shows the red/green state first). Static validation and probes
+    still refuse: a structurally broken playbook cannot go live.
     """
     async with _sf()() as session:
         p = (await session.execute(
@@ -1232,18 +1215,6 @@ async def promote_version(name: str, body: PromoteBody):
         )).scalar_one_or_none()
         if not p:
             raise HTTPException(404, f"Playbook '{name}' not found")
-
-        # plans/016 phase 1: the plan gate — same rule as the
-        # playbook_publish tool, so no code path skips it.
-        plan_row, plan_refusal = await _plan_gate(session, body.plan_id or "")
-        if plan_refusal is not None:
-            detail = json.loads(plan_refusal)
-            detail["message"] = (
-                "Promote refused — every playbook change requires a plan. "
-                "Ask Luna to write one, or pick one in the Plans tab."
-            )
-            raise HTTPException(422, detail)
-        plan_id = str(plan_row.id)
 
         target_n = body.version
         candidate = target_n is None
@@ -1270,9 +1241,8 @@ async def promote_version(name: str, body: PromoteBody):
                     "gate": "static_validation",
                     "issues": errors,
                 })
-            # 0.11.0: specs gate — every stored spec must pass against the
-            # candidate (same gate as the playbook_publish tool).
-            await _specs_gate_or_422(session, p, row)
+            # 021: specs run to refresh the record but never block the owner.
+            await _refresh_specs(session, p, row)
             # 0.12.0: probes gate — no tool the candidate touches may be
             # KNOWN-broken (unprobeable tools pass; see probes.py).
             probe_summary = await run_preflight(
@@ -1281,35 +1251,38 @@ async def promote_version(name: str, body: PromoteBody):
             )
             if probe_summary["failed"]:
                 await session.commit()  # persist the probe cache rows
+                failing = [
+                    r for r in probe_summary["results"]
+                    if r["status"] == "failed"
+                ]
+                broken = "; ".join(
+                    f"{r['tool']} — {r['detail']}" for r in failing
+                )
                 raise HTTPException(422, {
-                    "message": "Promote refused — gate 'probes' failed",
+                    "message": (
+                        "Promote refused — a tool this playbook uses is "
+                        f"broken: {broken}"
+                    ),
                     "gate": "probes",
-                    "failing_tools": [
-                        r for r in probe_summary["results"]
-                        if r["status"] == "failed"
-                    ],
+                    "failing_tools": failing,
                 })
 
-        # 0.26.0 (plans/015, 089 contract #8): test-run gate — same rule as
-        # the playbook_publish tool, so no code path skips it. Restores accept
-        # the version's live history as evidence. plans/016 phase 3: the
-        # owner's "Promote anyway" click skips this one gate for this call.
-        _gate, refusal, ev_run = await test_run_gate(
+        # 021: test-run evidence is looked up for the announce message but
+        # never blocks the owner. Restores accept live history as evidence.
+        _gate, _refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at,
             include_live=not candidate,
-            require=p.publish_require_run and not body.force_test_run,
+            require=False,
         )
-        if refusal is not None:
-            raise HTTPException(422, json.loads(refusal))
         evidence = (
             SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
             if ev_run is not None else None
         )
 
         if not candidate:
-            # plans/016 phase 5: a restore runs the RESTORED version's own
-            # specs against its content (specs travel with versions).
-            await _specs_gate_or_422(session, p, row)
+            # a restore runs the RESTORED version's own specs (specs travel
+            # with versions) — refresh only, never a block (021).
+            await _refresh_specs(session, p, row)
 
         old_live = _live_version_of(p)
         await _ensure_live_row(session, p)
@@ -1321,25 +1294,12 @@ async def promote_version(name: str, body: PromoteBody):
             p.candidate_version = None
 
         await session.commit()
-        # plans/016 phase 1: code-stamp the publish outcome onto the plan.
-        facts = {
-            "action": "promote" if candidate else "restore",
-            "playbook": name,
-            "old_live_version": old_live,
-            "new_live_version": target_n,
-            "evidence_run_id": str(evidence.id) if evidence else None,
-            "actor": "owner",
-        }
-        if body.force_test_run:
-            facts["test_run_forced"] = True
-        await _plan_stamp_outcome(session, plan_id, facts)
         result = {
             "name": name,
             "live_version": target_n,
             "version": p.version,
             "promoted_from": old_live,
             "status": "promoted",
-            "plan_id": plan_id,
         }
     await _notify_changed(name)
     if _events is not None:
@@ -1377,16 +1337,13 @@ async def rollback_playbook(name: str):
         if not row:
             raise HTTPException(404, f"No stored content for version {target_n}")
 
-        # 0.26.0 (plans/015, 089 contract #8): rollback IS a publish of a
-        # previous version — same test-run gate, live history counts.
-        # plans/016 phase 5: and the target version's own specs.
-        await _specs_gate_or_422(session, p, row)
-        _gate, refusal, ev_run = await test_run_gate(
+        # 021: rollback is the owner's escape hatch — specs refresh and
+        # test-run evidence are recorded but never block.
+        await _refresh_specs(session, p, row)
+        _gate, _refusal, ev_run = await test_run_gate(
             session, p.id, row.version, row.created_at, include_live=True,
-            require=p.publish_require_run,
+            require=False,
         )
-        if refusal is not None:
-            raise HTTPException(422, json.loads(refusal))
         evidence = (
             SimpleNamespace(id=ev_run.id, completed_at=ev_run.completed_at)
             if ev_run is not None else None
@@ -1702,46 +1659,3 @@ async def delete_draft(draft_id: str):
         await session.delete(d)
         await session.commit()
         return {"id": draft_id, "status": "deleted"}
-
-
-# ---------------------------------------------------------------------------
-# plans/016 phase 1: plugin-global settings + change plans (Plans tab reads
-# these; the phase-3 UI supplies the panel).
-
-
-class PlaybooksSettingsPatch(BaseModel):
-    plans_full_power: bool | None = None
-
-
-@router.get("/playbooks-settings")
-async def get_playbooks_settings():
-    async with _sf()() as session:
-        return {"plans_full_power": await _plans_full_power(session)}
-
-
-@router.patch("/playbooks-settings")
-async def patch_playbooks_settings(body: PlaybooksSettingsPatch):
-    async with _sf()() as session:
-        if body.plans_full_power is not None:
-            await _set_full_power(session, body.plans_full_power)
-        return {"plans_full_power": await _plans_full_power(session)}
-
-
-@router.get("/plans")
-async def list_plans(status: str | None = None, limit: int = 100):
-    async with _sf()() as session:
-        q = select(PlaybookPlan).order_by(PlaybookPlan.created_at.desc())
-        if status:
-            q = q.where(PlaybookPlan.status == status)
-        rows = (await session.execute(q.limit(max(1, min(limit, 500))))
-                ).scalars().all()
-        return {"plans": [_plan_brief(r) for r in rows]}
-
-
-@router.get("/plans/{plan_id}")
-async def get_plan(plan_id: str):
-    async with _sf()() as session:
-        plan = await _load_plan(session, plan_id)
-        if plan is None:
-            raise HTTPException(404, f"No plan with id '{plan_id}'")
-        return _plan_detail(plan)

@@ -352,7 +352,6 @@ export function PlaybookEditor(props: Props) {
         mode === 'versions' ? (
           <div className="flex-1 min-h-0">
             <VersionsTab
-            requireSpecs={publishSettings.require_specs}
               name={props.name}
               agentName={agentName}
               liveVersion={meta?.version ?? 0}

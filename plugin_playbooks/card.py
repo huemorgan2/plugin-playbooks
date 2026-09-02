@@ -180,8 +180,6 @@ var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='',
     everPolled=false;
 var WAIT_WORDS={{playbook_publish:'make the change live',
   playbook_rollback:'roll back the live version',
-  playbook_edit_force:'force past failing specs',
-  playbook_manifest_set:"change the playbook's contract",
   playbook_spec_delete:'delete a spec',
   playbook_set_autonomy:'change how it runs on its own',
   playbook_run_candidate:'test-run the draft version'}};

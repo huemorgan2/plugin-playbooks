@@ -32,29 +32,6 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
 
 const BASE = '/api/p/plugin-playbooks'
 
-// plans/016: a plan is one row of owner-readable text; briefs list it,
-// the detail adds the body + code-stamped outcome facts.
-export type PlanBrief = {
-  plan_id: string
-  title: string
-  status: 'proposed' | 'approved' | 'rejected' | 'done' | string
-  playbook_refs: string[]
-  created_at: string | null
-  updated_at: string | null
-  has_execution_summary: boolean
-}
-
-export type PlanDetail = PlanBrief & {
-  body: string
-  rejection_note: string | null
-  execution_summary: string | null
-  outcome_facts: Record<string, any>[]
-  conversation_id: string | null
-}
-
-/** Statuses that may carry a publish (mirrors the server's PUBLISHABLE_STATUSES). */
-export const PUBLISHABLE_PLAN_STATUSES = ['proposed', 'approved']
-
 export const playbooksApi = {
   list: (status: 'active' | 'archived' | 'all' = 'active') =>
     apiFetch<PlaybookSummary[]>(`${BASE}/playbooks?status=${status}`),
@@ -151,46 +128,22 @@ export const playbooksApi = {
   getVersion: (name: string, n: number) =>
     apiFetch<VersionDetail>(`${BASE}/playbooks/${name}/versions/${n}`),
 
-  // plans/016 phase 3: every promote carries a plan (the server's plan gate
-  // 422s without one). `forceTestRun` is the owner's "Promote anyway" — it
-  // skips ONLY the test-run gate for that one call.
-  promoteVersion: (name: string, version: number, planId: string, forceTestRun = false) =>
+  // 021: the owner's click is the consent — the server never blocks a
+  // promote on specs or test-run (static validation and broken tools
+  // still 422). The confirm dialog shows the ✓/✗ state first.
+  promoteVersion: (name: string, version: number) =>
     apiFetch<{ name: string; live_version: number; promoted_from: number; status: string }>(
       `${BASE}/playbooks/${name}/promote`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ version, plan_id: planId, force_test_run: forceTestRun }),
-      },
+      { method: 'POST', body: JSON.stringify({ version }) },
     ),
 
-  // Candidate promote — no version in the body → the server gates
-  // (static_validation, specs, probes) and promotes the candidate.
-  promoteCandidate: (name: string, planId: string, forceTestRun = false) =>
+  // Candidate promote — no version in the body → the server promotes the
+  // candidate (static_validation + probes still gate).
+  promoteCandidate: (name: string) =>
     apiFetch<{ name: string; live_version: number; promoted_from: number; status: string }>(
       `${BASE}/playbooks/${name}/promote`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ plan_id: planId, force_test_run: forceTestRun }),
-      },
+      { method: 'POST', body: JSON.stringify({}) },
     ),
-
-  // plans/016 phase 3: plans + the plans_full_power switch.
-  listPlans: (status?: string) =>
-    apiFetch<{ plans: PlanBrief[] }>(
-      `${BASE}/plans${status ? `?status=${status}` : ''}`,
-    ),
-
-  getPlan: (planId: string) =>
-    apiFetch<PlanDetail>(`${BASE}/plans/${planId}`),
-
-  getSettings: () =>
-    apiFetch<{ plans_full_power: boolean }>(`${BASE}/playbooks-settings`),
-
-  patchSettings: (body: { plans_full_power: boolean }) =>
-    apiFetch<{ plans_full_power: boolean }>(`${BASE}/playbooks-settings`, {
-      method: 'PATCH',
-      body: JSON.stringify(body),
-    }),
 
   rollback: (name: string) =>
     apiFetch<{ name: string; live_version: number; rolled_back_from: number; status: string }>(

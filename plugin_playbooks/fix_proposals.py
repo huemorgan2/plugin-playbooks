@@ -6,7 +6,7 @@ counts them. plans/016 phase 2: each new or bumped proposal sends ONE
 muted wake message directly to the ops chat (no bus contract, no approval
 card): what failed, the error, the count. The wake turn investigates and
 fixes right away; the owner's single approval happens at publish, where
-the card shows the plan together with the change (phase 1's plan gate).
+the card shows the change and the gate-status bullets (021).
 
 On cores without an ops chat the service still records proposals in
 `playbook_fix_proposals`, so nothing is lost — the failure digest keeps
@@ -194,8 +194,8 @@ class FixProposalService:
         bumped proposal — the failure wake. Direct send, no bus contract.
 
         The wake turn is expected to investigate and fix immediately; the
-        owner's consent lives at the publish approval card (plan + change,
-        phase 1), so the old approve-a-fix-attempt card is gone. Since luna
+        owner's consent lives at the publish approval card, so the old
+        approve-a-fix-attempt card is gone. Since luna
         098 the ops chat always runs in the ordinary 'building' state, so
         the wake turn has the full toolset without any state juggling.
         """
@@ -222,11 +222,10 @@ class FixProposalService:
             f"Error: {card.get('error') or 'not recorded'}",
             "",
             "Investigate now: playbook_status(run_id) shows the failing "
-            "trace. If a change is needed, write a plan first "
-            "(playbook_plan_write — plain language for the owner), fix the "
-            "candidate, test it for real (playbook_run_candidate), and "
-            "publish — the publish approval card is where the owner decides. "
-            "If nothing should change, say so briefly here instead.",
+            "trace. If a change is needed, fix the candidate, test it for "
+            "real (playbook_run_candidate), and publish — the publish "
+            "approval card is where the owner decides. If nothing should "
+            "change, say so briefly here instead.",
         ]
         try:
             await send(

@@ -255,11 +255,7 @@ async def test_toolset_includes_referenced_tools_of_target_playbook(env):
 
     tools = await delegate_toolset(env, "candidate-intake", AUTHORING)
     for expected in ("gmail_search", "sheets_append", "slack_post",
-                     "playbook_list", "playbook_status", "playbook_publish",
-                     # plans/020: publish is plan-gated — the delegate writes
-                     # the plan row itself.
-                     "playbook_plan_write", "playbook_plan_read",
-                     "playbook_plan_finish"):
+                     "playbook_list", "playbook_status", "playbook_publish"):
         assert expected in tools
     assert "send_chat_message" not in tools  # card is the surface, always
 

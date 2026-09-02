@@ -1,8 +1,10 @@
-"""0.28.0 (plans/016 phase 6) — owner-switchable publish gates.
+"""0.28.0 (plans/016 phase 6, reshaped by 021) — owner-switchable AGENT gates.
 
 `publish_require_specs` / `publish_require_run` (default on) decide whether
-the specs gate and the test-run gate REFUSE. Off = the gate still runs and is
-reported, but never blocks. Static validation and probes are not switchable.
+the specs gate and the test-run gate REFUSE the AGENT's publish. Off = the
+gate still runs and is reported, but never blocks. 021: the owner's own UI
+promote/rollback NEVER blocks on these — the click is the consent; only
+static validation and probes still 422.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from readstage import parse_read_stage
-from evidence import EXPLANATION, make_plan, seed_plan
+from evidence import EXPLANATION
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -137,26 +139,15 @@ async def test_tool_sets_the_flags(env):
 
 # --- specs gate --------------------------------------------------------------
 
-async def test_restore_red_specs_refused_when_required_names_setting(env):
+async def test_restore_red_specs_never_blocks_the_owner(env):
+    # 021: even with require_specs ON, the owner's promote goes through —
+    # the specs still run so the UI can show the red state.
     sf, handlers, client = env
     await _seed(handlers, specs={"bad": SPEC_FAILING})
     # v2 via owner PUT so v1 is restorable; v2 inherits the red spec.
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
-    assert r.status_code == 422, r.text
-    body = r.json()["detail"]
-    assert body["gate"] == "specs"
-    assert "Owner can relax this in Settings → Publish." in body["message"]
-
-
-async def test_restore_red_specs_allowed_when_specs_gate_off(env):
-    sf, handlers, client = env
-    await _seed(handlers, specs={"bad": SPEC_FAILING})
-    await _owner_edit(sf, client)
-    await _green_run(sf, 1)
-    await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_specs": False})
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
     assert r.status_code == 200, r.text
     p = await _pb(sf)
     assert p.live_version == 1
@@ -174,7 +165,7 @@ async def test_tool_publish_reports_unenforced_specs_gate(env):
     await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_specs": False})
     await _owner_edit(sf, client)
     await _green_run(sf, 1)
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1, plan_id=await make_plan(handlers)))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", version=1))
     assert out.get("status") == "published", out
     specs_gate = next(g for g in out["gates"] if g["gate"] == "specs")
     assert specs_gate["ok"] is False
@@ -184,37 +175,22 @@ async def test_tool_publish_reports_unenforced_specs_gate(env):
 
 # --- run gate ----------------------------------------------------------------
 
-async def test_restore_without_run_refused_when_required_names_setting(env):
+async def test_restore_without_run_never_blocks_the_owner(env):
+    # 021: no test run of the target version — the owner's promote still
+    # goes through regardless of require_run.
     sf, handlers, client = env
     await _seed(handlers, specs={"ok": SPEC_OK})
     await _owner_edit(sf, client)
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
-    assert r.status_code == 422, r.text
-    body = r.json()["detail"]
-    assert body["gate"] == "test_run"
-    assert "Owner can relax this in Settings → Publish." in body["error"]
-
-
-async def test_restore_without_run_allowed_when_run_gate_off(env):
-    sf, handlers, client = env
-    await _seed(handlers, specs={"ok": SPEC_OK})
-    await _owner_edit(sf, client)
-    await client.patch(f"{BASE}/playbooks/greeter/publish-settings", json={"require_run": False})
-    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1, "plan_id": await seed_plan(sf)})
+    r = await client.post(f"{BASE}/playbooks/greeter/promote", json={"version": 1})
     assert r.status_code == 200, r.text
     assert (await _pb(sf)).live_version == 1
 
 
-async def test_rollback_honours_both_flags(env):
+async def test_rollback_never_blocks_the_owner(env):
+    # 021: red specs, flags on — the owner's rollback still goes through.
     sf, handlers, client = env
     await _seed(handlers, specs={"bad": SPEC_FAILING})
     await _owner_edit(sf, client)
-    r = await client.post(f"{BASE}/playbooks/greeter/rollback")
-    assert r.status_code == 422
-    await client.patch(
-        f"{BASE}/playbooks/greeter/publish-settings",
-        json={"require_specs": False, "require_run": False},
-    )
     r = await client.post(f"{BASE}/playbooks/greeter/rollback")
     assert r.status_code == 200, r.text
     assert (await _pb(sf)).live_version == 1
@@ -230,7 +206,7 @@ async def test_candidate_tool_publish_run_gate_off(env):
     ))
     assert "error" not in out, out
     assert (await _pb(sf)).candidate_version == 2
-    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter", plan_id=await make_plan(handlers)))
+    out = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out.get("status") == "published", out
     run_gate = next(g for g in out["gates"] if g["gate"] == "test_run")
     assert run_gate["ok"] is False and run_gate["enforced"] is False
