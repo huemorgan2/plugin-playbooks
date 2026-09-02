@@ -128,3 +128,32 @@ describe('factLine', () => {
     })).toContain('without a fresh test run')
   })
 })
+
+// plans/021: the editor's per-playbook Plans tab reuses PlansList with a
+// `playbook` filter passed through to the API.
+describe('PlansList (per-playbook)', () => {
+  it('passes the playbook filter to listPlans', async () => {
+    const { PlansList } = await import('../PlansTab')
+    render(<PlansList agentName="Luna" playbook="greeter" />)
+    await waitFor(() =>
+      expect(api.listPlans).toHaveBeenCalledWith(undefined, 'greeter'))
+    expect(api.getSettings).not.toHaveBeenCalled() // no autonomy switch here
+  })
+
+  it('shows a per-playbook empty state', async () => {
+    const { PlansList } = await import('../PlansTab')
+    api.listPlans.mockResolvedValue({ plans: [] })
+    render(<PlansList agentName="Luna" playbook="greeter" />)
+    await waitFor(() =>
+      expect(screen.getByTestId('plans-headline').textContent).toBe('No plans yet'))
+    expect(screen.getByText(/change this playbook/).textContent)
+      .toContain('Ask Luna to change this playbook')
+  })
+
+  it('unfiltered PlansTab still lists all plans and keeps the switch', async () => {
+    render(<PlansTab agentName="Luna" />)
+    await waitFor(() =>
+      expect(api.listPlans).toHaveBeenCalledWith(undefined, undefined))
+    expect(screen.getByTestId('autonomy-toggle')).toBeTruthy()
+  })
+})

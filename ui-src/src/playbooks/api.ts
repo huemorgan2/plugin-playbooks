@@ -175,10 +175,15 @@ export const playbooksApi = {
     ),
 
   // plans/016 phase 3: plans + the plans_full_power switch.
-  listPlans: (status?: string) =>
-    apiFetch<{ plans: PlanBrief[] }>(
-      `${BASE}/plans${status ? `?status=${status}` : ''}`,
-    ),
+  // plans/021: `playbook` narrows to plans referencing that playbook
+  // (the editor's per-playbook Plans tab).
+  listPlans: (status?: string, playbook?: string) => {
+    const qs = new URLSearchParams()
+    if (status) qs.set('status', status)
+    if (playbook) qs.set('playbook', playbook)
+    const q = qs.toString()
+    return apiFetch<{ plans: PlanBrief[] }>(`${BASE}/plans${q ? `?${q}` : ''}`)
+  },
 
   getPlan: (planId: string) =>
     apiFetch<PlanDetail>(`${BASE}/plans/${planId}`),

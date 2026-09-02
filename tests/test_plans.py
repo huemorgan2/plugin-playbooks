@@ -538,3 +538,28 @@ async def test_plans_routes_list_and_detail(route_env):
 
     r = await client.get(f"{BASE}/plans/{uuid.uuid4()}")
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_plans_route_filters_by_playbook(route_env):
+    # plans/021: the editor's per-playbook Plans tab narrows by ref.
+    sf, client = route_env
+    pid = await seed_plan(sf, title="Fix the greeter playbook")
+    from plugin_playbooks.models import PlaybookPlan
+    async with sf() as s:
+        s.add(PlaybookPlan(title="Other job", body=PLAN_BODY,
+                           playbook_refs=["other-pb"]))
+        s.add(PlaybookPlan(title="No refs at all", body=PLAN_BODY,
+                           playbook_refs=None))
+        await s.commit()
+
+    r = await client.get(f"{BASE}/plans", params={"playbook": "greeter"})
+    plans = r.json()["plans"]
+    assert [p["plan_id"] for p in plans] == [pid]
+
+    r = await client.get(f"{BASE}/plans", params={"playbook": "nobody"})
+    assert r.json()["plans"] == []
+
+    # No param -> unfiltered listing still returns everything.
+    r = await client.get(f"{BASE}/plans")
+    assert len(r.json()["plans"]) == 3

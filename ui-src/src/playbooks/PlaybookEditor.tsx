@@ -8,7 +8,7 @@ import {
 } from '@xyflow/react'
 import {
   ArrowLeft, FileCode, Eye, Loader2, Rocket, Settings, History,
-  ShieldCheck, ShieldAlert, ShieldOff, Check,
+  ShieldCheck, ShieldAlert, ShieldOff, Check, ClipboardList,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { buildGraph } from './layout'
@@ -16,6 +16,7 @@ import { CanvasSurface, CodeView, sourceFor } from './VersionCanvas'
 import { applyPlaybookPatch, patchMatchesEditor, type PlaybookPatchEvt } from './livePatch'
 import { setPlaybookConsumerReady } from './liveBus'
 import { playbooksApi } from './api'
+import { PlansList } from './PlansTab'
 import { useAgentName } from './agentIdentity'
 import type { PlaybookDef, StepDef } from './types'
 import { StepDetailPanel } from './StepDetailPanel'
@@ -30,7 +31,7 @@ export { promoteRefusalMessage } from './VersionsTab'
 // top-level tab (Canvas, Code, Manifest, Tests, Runs) is a view of the
 // selected version inside `Versions`. Drafts have no history and keep
 // Canvas | Code.
-type PlaybookMode = 'versions' | 'settings'
+type PlaybookMode = 'versions' | 'plans' | 'settings'
 type DraftMode = 'canvas' | 'code'
 
 type Props =
@@ -280,6 +281,7 @@ export function PlaybookEditor(props: Props) {
   ]
   const playbookTabs: { mode: PlaybookMode; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
     { mode: 'versions', label: 'Versions', icon: History },
+    { mode: 'plans', label: 'Plans', icon: ClipboardList },
     { mode: 'settings', label: 'Settings', icon: Settings },
   ]
 
@@ -365,6 +367,10 @@ export function PlaybookEditor(props: Props) {
                 setRefreshKey((k) => k + 1)
               }}
             />
+          </div>
+        ) : mode === 'plans' ? (
+          <div className="flex-1 min-h-0 overflow-y-auto" data-testid="editor-plans-tab">
+            <PlansList agentName={agentName} playbook={props.name} />
           </div>
         ) : (
           <SettingsTab autonomy={autonomy} onChangeAutonomy={changeAutonomy}>

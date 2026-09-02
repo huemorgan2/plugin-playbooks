@@ -135,13 +135,70 @@ function PlanRow({ plan, expanded, onToggle }: {
   )
 }
 
-export function PlansTab({ agentName }: { agentName: string }) {
+/**
+ * The plans list on its own — reused by the section-level PlansTab (all
+ * plans) and the editor's per-playbook Plans tab (plans/021: pass
+ * `playbook` to narrow to plans referencing it).
+ */
+export function PlansList({ agentName, playbook }: { agentName: string; playbook?: string }) {
   const [plans, setPlans] = useState<PlanBrief[] | null>(null)
-  const [fullPower, setFullPower] = useState<boolean | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
 
+  useEffect(() => {
+    playbooksApi.listPlans(undefined, playbook)
+      .then((r) => setPlans(r.plans))
+      .catch(() => setPlans([]))
+  }, [playbook])
+
+  const awaiting = (plans ?? []).filter((p) => p.status === 'proposed' || p.status === 'approved').length
+
+  return (
+    <>
+      <div className="px-6 pt-4 pb-1">
+        <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500 mb-1">Plans</div>
+        <p className="text-base font-semibold text-ink-50" data-testid="plans-headline">
+          {plans === null
+            ? 'Loading…'
+            : awaiting > 0
+              ? `${awaiting} awaiting publish`
+              : plans.length > 0
+                ? 'No changes planned'
+                : 'No plans yet'}
+        </p>
+        <p className="text-xs text-ink-500 mt-0.5 mb-2">
+          Every playbook change starts with a plan you can read — publishes are
+          stamped onto it.
+        </p>
+      </div>
+      {plans === null ? (
+        <div className="flex items-center justify-center py-8 text-ink-500">
+          <Loader2 className="w-4 h-4 animate-spin" />
+        </div>
+      ) : plans.length === 0 ? (
+        <p className="text-sm text-ink-500 px-6 py-6">
+          Ask {agentName} to change {playbook ? 'this playbook' : 'a playbook'} and
+          its plan will show up here.
+        </p>
+      ) : (
+        <div>
+          {plans.map((p) => (
+            <PlanRow
+              key={p.plan_id}
+              plan={p}
+              expanded={expanded === p.plan_id}
+              onToggle={() => setExpanded((cur) => (cur === p.plan_id ? null : p.plan_id))}
+            />
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+export function PlansTab({ agentName }: { agentName: string }) {
+  const [fullPower, setFullPower] = useState<boolean | null>(null)
+
   const refresh = useCallback(() => {
-    playbooksApi.listPlans().then((r) => setPlans(r.plans)).catch(() => setPlans([]))
     playbooksApi.getSettings()
       .then((s) => setFullPower(s.plans_full_power))
       .catch(() => {})
@@ -159,8 +216,6 @@ export function PlansTab({ agentName }: { agentName: string }) {
       setFullPower(!next)
     }
   }
-
-  const awaiting = (plans ?? []).filter((p) => p.status === 'proposed' || p.status === 'approved').length
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -200,42 +255,7 @@ export function PlansTab({ agentName }: { agentName: string }) {
       </div>
 
       {/* Plans list */}
-      <div className="px-6 pt-4 pb-1">
-        <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500 mb-1">Plans</div>
-        <p className="text-base font-semibold text-ink-50" data-testid="plans-headline">
-          {plans === null
-            ? 'Loading…'
-            : awaiting > 0
-              ? `${awaiting} awaiting publish`
-              : plans.length > 0
-                ? 'No changes planned'
-                : 'No plans yet'}
-        </p>
-        <p className="text-xs text-ink-500 mt-0.5 mb-2">
-          Every playbook change starts with a plan you can read — publishes are
-          stamped onto it.
-        </p>
-      </div>
-      {plans === null ? (
-        <div className="flex items-center justify-center py-8 text-ink-500">
-          <Loader2 className="w-4 h-4 animate-spin" />
-        </div>
-      ) : plans.length === 0 ? (
-        <p className="text-sm text-ink-500 px-6 py-6">
-          Ask {agentName} to change a playbook and its plan will show up here.
-        </p>
-      ) : (
-        <div>
-          {plans.map((p) => (
-            <PlanRow
-              key={p.plan_id}
-              plan={p}
-              expanded={expanded === p.plan_id}
-              onToggle={() => setExpanded((cur) => (cur === p.plan_id ? null : p.plan_id))}
-            />
-          ))}
-        </div>
-      )}
+      <PlansList agentName={agentName} />
     </div>
   )
 }

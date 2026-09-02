@@ -1728,13 +1728,22 @@ async def patch_playbooks_settings(body: PlaybooksSettingsPatch):
 
 
 @router.get("/plans")
-async def list_plans(status: str | None = None, limit: int = 100):
+async def list_plans(
+    status: str | None = None, limit: int = 100, playbook: str | None = None,
+):
+    limit = max(1, min(limit, 500))
     async with _sf()() as session:
         q = select(PlaybookPlan).order_by(PlaybookPlan.created_at.desc())
         if status:
             q = q.where(PlaybookPlan.status == status)
-        rows = (await session.execute(q.limit(max(1, min(limit, 500))))
-                ).scalars().all()
+        # `playbook` narrows to plans referencing that playbook (the editor's
+        # per-playbook Plans tab). refs live in JSONB; filter in Python so
+        # SQLite tests and Postgres behave identically.
+        if playbook:
+            rows = (await session.execute(q)).scalars().all()
+            rows = [r for r in rows if playbook in (r.playbook_refs or [])][:limit]
+        else:
+            rows = (await session.execute(q.limit(limit))).scalars().all()
         return {"plans": [_plan_brief(r) for r in rows]}
 
 
