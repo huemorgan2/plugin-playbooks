@@ -24,12 +24,19 @@ def live_version_of(p: Playbook) -> int:
 async def get_version_row(
     session: AsyncSession, p: Playbook, n: int,
 ) -> PlaybookVersion | None:
-    return (await session.execute(
+    # Legacy DBs can hold DUPLICATE rows for one number (the pre-0.32 edit
+    # path snapshotted at the counter even when a row existed) — pick
+    # deterministically instead of scalar_one_or_none() 500ing: real lineage
+    # (promoted_from set) beats a plain snapshot, then oldest wins.
+    rows = (await session.execute(
         select(PlaybookVersion).where(
             PlaybookVersion.playbook_id == p.id,
             PlaybookVersion.version == n,
         )
-    )).scalar_one_or_none()
+    )).scalars().all()
+    if not rows:
+        return None
+    return min(rows, key=lambda r: (r.promoted_from is None, r.created_at))
 
 
 async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
@@ -107,7 +114,16 @@ async def mint_version(
     """Increment `p.version`, add the row for the new number and inherit
     `source_version`'s specs. Callers decide what the number means (move
     `live_version` / `candidate_version` themselves) and commit."""
-    p.version += 1
+    from sqlalchemy import func
+
+    # Mint ABOVE any stored row, not just above the counter — a counter that
+    # fell behind the rows (legacy damage) must never re-issue a taken number.
+    max_stored = (await session.execute(
+        select(func.max(PlaybookVersion.version)).where(
+            PlaybookVersion.playbook_id == p.id,
+        )
+    )).scalar() or 0
+    p.version = max(p.version, max_stored) + 1
     row = PlaybookVersion(
         playbook_id=p.id,
         version=p.version,
@@ -121,6 +137,44 @@ async def mint_version(
     session.add(row)
     await copy_specs(session, p.id, source_version, p.version)
     return row
+
+
+async def heal_duplicate_version_rows(session_factory) -> int:
+    """0.38.0: delete redundant duplicate (playbook_id, version) rows.
+
+    The pre-0.32 whole-YAML edit path snapshotted at the current counter even
+    when that number already had a row, leaving e.g. two v33s — the Versions
+    list showed both and version reads 500ed (MultipleResultsFound). Keeps
+    the same row `get_version_row` prefers (real lineage first, then oldest)
+    and drops the rest. Idempotent; returns rows deleted."""
+    import logging
+
+    log = logging.getLogger("luna.plugin.playbooks")
+    deleted = 0
+    async with session_factory() as session:
+        rows = (await session.execute(
+            select(PlaybookVersion).order_by(
+                PlaybookVersion.playbook_id, PlaybookVersion.version,
+            )
+        )).scalars().all()
+        by_number: dict[tuple, list[PlaybookVersion]] = {}
+        for r in rows:
+            by_number.setdefault((r.playbook_id, r.version), []).append(r)
+        for (pid, n), group in by_number.items():
+            if len(group) < 2:
+                continue
+            keep = min(group, key=lambda r: (r.promoted_from is None, r.created_at))
+            for r in group:
+                if r.id != keep.id:
+                    await session.delete(r)
+                    deleted += 1
+            log.info(
+                "playbooks: healed %d duplicate row(s) of version %d "
+                "(playbook %s)", len(group) - 1, n, pid,
+            )
+        if deleted:
+            await session.commit()
+    return deleted
 
 
 def spec_source_version(p: Playbook) -> int:

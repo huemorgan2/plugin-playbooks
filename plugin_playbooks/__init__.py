@@ -619,7 +619,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.37.0",
+        version="0.38.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -776,6 +776,15 @@ class PlaybooksPlugin(LunaPlugin):
             await backfill_spec_versions(ctx.db_session_factory)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: spec version backfill failed: %s", e)
+
+        # 0.38.0: drop redundant duplicate (playbook, version) rows left by
+        # the pre-0.32 edit path (they 500ed version reads and doubled the
+        # Versions list).
+        try:
+            from .versioning import heal_duplicate_version_rows
+            await heal_duplicate_version_rows(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: duplicate-version heal failed: %s", e)
 
         init_routes(
             ctx.db_session_factory, self._runner, ctx.events,

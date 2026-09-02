@@ -48,6 +48,7 @@ from .runner import active_run_id as _active_playbook_run
 from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
 from .validation import validate_definition
 from .versioning import ensure_live_row, mint_version, spec_source_version
+from .versioning import get_version_row as _tolerant_get_version_row_fn
 
 _log = logging.getLogger("luna.plugin.playbooks.agent_tools")
 
@@ -837,27 +838,10 @@ def build_tools(
 
     # --- Whole-YAML authoring helpers + tools ---
 
-    async def _snapshot_version(
-        session: AsyncSession,
-        playbook: Playbook,
-        *,
-        author: str = "agent",
-        message: str = "",
-        promoted_from: int | None = None,
-    ) -> PlaybookVersion:
-        """Snapshot the current playbook definition into playbook_versions."""
-        v = PlaybookVersion(
-            playbook_id=playbook.id,
-            version=playbook.version,
-            definition=playbook.definition,
-            code=playbook.code,
-            manifest=playbook.manifest,
-            author=author,
-            message=message,
-            promoted_from=promoted_from,
-        )
-        session.add(v)
-        return v
+    # (0.38.0) The legacy _snapshot_version helper lived here. It inserted a
+    # row at the CURRENT counter — duplicating the number when a row already
+    # existed — and had no callers left. Minting goes through
+    # versioning.mint_version; nothing snapshots in place.
 
     # 0.10.0 (plans/002 phase 3): candidate/live plumbing. `playbooks.version`
     # is the monotonic counter; live content stays on the playbook row
@@ -873,12 +857,7 @@ def build_tools(
     async def _get_version_row(
         session: AsyncSession, playbook: Playbook, n: int,
     ) -> PlaybookVersion | None:
-        return (await session.execute(
-            select(PlaybookVersion).where(
-                PlaybookVersion.playbook_id == playbook.id,
-                PlaybookVersion.version == n,
-            )
-        )).scalar_one_or_none()
+        return await _tolerant_get_version_row_fn(session, playbook, n)
 
     async def _ensure_live_row(
         session: AsyncSession, playbook: Playbook,

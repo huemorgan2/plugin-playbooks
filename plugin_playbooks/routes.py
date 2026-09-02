@@ -35,6 +35,7 @@ from .probes import run_preflight
 from .publish import announce_publish, test_run_gate, specs_gate
 from .specs import run_all_specs
 from .versioning import ensure_live_row, mint_version
+from .versioning import get_version_row as _tolerant_get_version_row
 from .validation import validate_definition
 
 # 009.001/phase03: every endpoint requires an authenticated user (router-level
@@ -428,12 +429,7 @@ def _live_version_of(p: Playbook) -> int:
 async def _get_version_row(
     session: AsyncSession, p: Playbook, n: int,
 ) -> PlaybookVersion | None:
-    return (await session.execute(
-        select(PlaybookVersion).where(
-            PlaybookVersion.playbook_id == p.id,
-            PlaybookVersion.version == n,
-        )
-    )).scalar_one_or_none()
+    return await _tolerant_get_version_row(session, p, n)
 
 
 async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:

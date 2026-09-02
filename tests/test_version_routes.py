@@ -130,3 +130,72 @@ async def test_runs_carry_their_version(client):
     assert sorted(r["playbook_version"] for r in runs) == [1, 1, 2]
     detail = (await c.get(f"{BASE}/playbooks/runs/{runs[0]['id']}")).json()
     assert detail["playbook_version"] == runs[0]["playbook_version"]
+
+
+# --- 0.38.0: duplicate (playbook, version) rows — legacy damage ---------------
+# The pre-0.32 edit path snapshotted at the current counter even when a row
+# for that number existed, so hosted DBs hold e.g. two v33s. Reads must not
+# 500, the load-time heal must delete the redundant row, and the minting
+# counter must never re-issue a taken number.
+
+async def _add_duplicate_v1(sf) -> None:
+    """A second v1 row: no lineage (promoted_from NULL), newer created_at —
+    the shape the old 'before whole-YAML edit' snapshot left behind."""
+    from sqlalchemy import select
+    async with sf() as s:
+        pb = (await s.execute(select(Playbook))).scalar_one()
+        s.add(PlaybookVersion(playbook_id=pb.id, version=1, definition=_defn(1),
+                              manifest="M1-dup", author="agent",
+                              message="before whole-YAML edit",
+                              created_at=NOW - timedelta(hours=6)))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_version_rows_do_not_500(client):
+    sf, c = client
+    await _seed(sf, rows=True)
+    await _add_duplicate_v1(sf)
+    r = await c.get(f"{BASE}/playbooks/greeter/versions/1")
+    assert r.status_code == 200, r.text
+    b = r.json()
+    # deterministic pick: the original row (older) wins over the snapshot
+    assert b["message"] == "first" and b["manifest"] == "M1"
+
+
+@pytest.mark.asyncio
+async def test_heal_deletes_the_redundant_duplicate(client):
+    from sqlalchemy import select
+    from plugin_playbooks.versioning import heal_duplicate_version_rows
+
+    sf, c = client
+    await _seed(sf, rows=True)
+    await _add_duplicate_v1(sf)
+
+    assert await heal_duplicate_version_rows(sf) == 1
+    assert await heal_duplicate_version_rows(sf) == 0  # idempotent
+
+    async with sf() as s:
+        rows = (await s.execute(
+            select(PlaybookVersion).where(PlaybookVersion.version == 1)
+        )).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].message == "first"  # kept the original, dropped the snapshot
+
+
+@pytest.mark.asyncio
+async def test_mint_version_mints_above_stored_rows(client):
+    from sqlalchemy import select
+    from plugin_playbooks.versioning import mint_version
+
+    sf, _c = client
+    await _seed(sf, rows=True)
+    async with sf() as s:
+        pb = (await s.execute(select(Playbook))).scalar_one()
+        pb.version = 1  # counter fell behind the stored rows (max row = 2)
+        row = await mint_version(
+            s, pb, definition=_defn(3), code=None, manifest="M3",
+            author="agent", message="edit", source_version=2,
+        )
+        await s.commit()
+    assert row.version == 3  # above max(rows), not counter+1 == 2
