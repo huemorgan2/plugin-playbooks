@@ -158,3 +158,8 @@ against the built plugin set.
 ## License
 
 MIT
+
+## Vision
+
+The durable product shape — including the architecture pieces no refactor may remove —
+lives in [vision/vision.md](vision/vision.md). Read it before any structural change.
