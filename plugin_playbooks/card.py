@@ -1,4 +1,4 @@
-"""Delegation progress card — plans/013 phase 2.
+"""Delegation progress card — plans/013 phase 2, refreshed by plans/020 phase 3.
 
 `render_delegation_card(...)` builds ONE self-contained HTML document
 (inline CSS + JS) posted into the chat via ``ctx.post_chat_card``. The chat
@@ -7,9 +7,18 @@ the document polls the capability-token status route and re-renders itself.
 Height is auto-reported with ``postMessage({type:"luna:embed:height"})``.
 
 Layout per vision/ux_guidelines.md: eyebrow → bottom-line headline →
-support line → phase rows with status dots → collapsed detail feed. Dark
-tokens, no gradient (this is a status card, not a hero), owner words only —
-the phase labels come from the server's fixed vocabulary.
+support line → phase rows with status dots → LIVE activity feed (open by
+default — the owner watches the delegate work) → result. Dark tokens, no
+gradient (this is a status card, not a hero), owner words only — the phase
+labels come from the server's fixed vocabulary.
+
+plans/020 phase 3 additions, built on the richer phase-2 events:
+- the feed is open by default and auto-scrolls to the newest entry
+  (respecting a user who scrolled up or closed it);
+- every tool row carries a verdict tick (✓ / ✗ from the event's ``ok``) or
+  a pulsing dot while in flight, plus a faint one-value args hint;
+- a steps counter (used / budget) ticks in the header while running;
+- terminal states color a thin top border as well as the headline.
 """
 
 from __future__ import annotations
@@ -19,6 +28,9 @@ import json
 
 _POLL_MS = 1500
 _PHASES = ["Understand", "Change", "Prove", "Ship"]
+# Mirror of delegation._MAX_TURNS (card.py can't import delegation — the
+# import runs the other way). Pinned together by a drift test.
+_MAX_STEPS = 40
 
 
 def render_delegation_card(
@@ -33,6 +45,7 @@ def render_delegation_card(
         "playbook": playbook,
         "phases": _PHASES,
         "pollMs": _POLL_MS,
+        "maxSteps": _MAX_STEPS,
     }).replace("<", "\\u003c").replace(">", "\\u003e")
     chip = (
         f'<span class="chip">{html.escape(playbook)}</span>' if playbook else ""
@@ -49,6 +62,7 @@ def render_delegation_card(
   --bg:#0b0e14; --panel:#11151f; --panel-2:#161b28; --line:#232a3a;
   --text:#e6e9f2; --dim:#8b93a7; --faint:#5b6275;
   --violet:#8b5cf6; --ok:#3ad29f; --amber:#f5a524; --red:#f4645f;
+  --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }}
 *{{box-sizing:border-box;margin:0;padding:0}}
 html,body{{background:transparent}}
@@ -56,16 +70,22 @@ body{{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   color:var(--text);font-size:14px;line-height:1.45;
   -webkit-font-smoothing:antialiased}}
 .card{{background:var(--panel);border:1px solid var(--line);
+  border-top:2px solid var(--line);
   border-radius:12px;padding:16px 18px;max-width:560px}}
+.card.done{{border-top-color:var(--ok)}}
+.card.failed{{border-top-color:var(--red)}}
+.card.needs_owner{{border-top-color:var(--amber)}}
 .top{{display:flex;align-items:baseline;justify-content:space-between;gap:12px}}
 .eyebrow{{font-size:11px;font-weight:600;letter-spacing:.12em;
   text-transform:uppercase;color:var(--violet);display:flex;
-  align-items:center;gap:8px}}
+  align-items:center;gap:8px;min-width:0}}
 .chip{{font-size:11px;font-weight:500;letter-spacing:0;text-transform:none;
   color:var(--dim);background:var(--panel-2);border:1px solid var(--line);
-  border-radius:6px;padding:1px 7px}}
-.elapsed{{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums;
+  border-radius:6px;padding:1px 7px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}}
+.meta{{display:flex;align-items:baseline;gap:10px;white-space:nowrap}}
+.steps{{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}}
+.elapsed{{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}}
 h1{{font-size:16px;font-weight:600;margin-top:10px;letter-spacing:-.01em}}
 .support{{color:var(--dim);font-size:13px;margin-top:3px;min-height:19px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
@@ -83,6 +103,7 @@ h1{{font-size:16px;font-weight:600;margin-top:10px;letter-spacing:-.01em}}
   font-variant-numeric:tabular-nums}}
 @media (prefers-reduced-motion:no-preference){{
   .phase.current .dot{{animation:pulse 1.6s ease-in-out infinite}}
+  .ev .tick.run{{animation:pulse 1.2s ease-in-out infinite}}
   @keyframes pulse{{50%{{opacity:.35}}}}
 }}
 details{{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}}
@@ -91,13 +112,22 @@ summary{{cursor:pointer;color:var(--faint);font-size:12px;list-style:none;
 summary::before{{content:"▸ "}}
 details[open] summary::before{{content:"▾ "}}
 .feed{{margin-top:8px;display:flex;flex-direction:column;gap:4px;
-  max-height:260px;overflow-y:auto;font-size:12px}}
-.ev{{display:flex;gap:8px;align-items:baseline}}
-.ev .lbl{{color:var(--dim);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap}}
-.ev.thought .lbl{{color:var(--faint);font-style:italic}}
+  max-height:260px;overflow-y:auto;font-size:12px;
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent}}
+.ev{{display:flex;gap:8px;align-items:baseline;min-width:0}}
+.ev .tick{{flex:0 0 12px;text-align:center;font-size:11px;
+  color:var(--faint)}}
+.ev .tick.ok{{color:var(--ok)}}
+.ev .tick.err{{color:var(--red)}}
+.ev .tick.run{{color:var(--amber)}}
+.ev .lbl{{color:var(--dim);font-family:var(--mono);font-size:11.5px;
+  white-space:nowrap;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}}
+.ev .hint{{color:var(--faint);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;flex:0 1 auto;min-width:0}}
+.ev.thought .lbl{{color:var(--faint);font-style:italic;
+  font-family:inherit;font-size:12px}}
 .ev .ms{{margin-left:auto;color:var(--faint);
-  font-variant-numeric:tabular-nums;white-space:nowrap}}
+  font-variant-numeric:tabular-nums;white-space:nowrap;flex:0 0 auto}}
 .waiting{{display:none;margin-top:12px;padding:8px 12px;font-size:13px;
   color:var(--amber);background:rgba(245,165,36,.08);
   border:1px solid rgba(245,165,36,.35);border-left-width:3px;
@@ -113,13 +143,16 @@ details[open] summary::before{{content:"▾ "}}
 <div class="card" id="card">
   <div class="top">
     <div class="eyebrow">Playbook agent {chip}</div>
-    <div class="elapsed" id="elapsed"></div>
+    <div class="meta">
+      <span class="steps" id="steps"></span>
+      <span class="elapsed" id="elapsed"></span>
+    </div>
   </div>
   <h1 id="headline">Starting…</h1>
   <div class="support" id="support">Handing the job to the delegate</div>
   <div class="phases" id="phases"></div>
   <div class="waiting" id="waiting"></div>
-  <details id="detail"><summary>What it did</summary>
+  <details id="detail" open><summary id="detailsum">Activity</summary>
     <div class="feed" id="feed"></div>
   </details>
   <div class="result" id="result"></div>
@@ -140,7 +173,9 @@ var API_BASE=(function(){{
 var card=document.getElementById('card'),headline=document.getElementById('headline'),
     support=document.getElementById('support'),phasesEl=document.getElementById('phases'),
     feed=document.getElementById('feed'),resultEl=document.getElementById('result'),
-    elapsedEl=document.getElementById('elapsed'),waitingEl=document.getElementById('waiting');
+    elapsedEl=document.getElementById('elapsed'),waitingEl=document.getElementById('waiting'),
+    stepsEl=document.getElementById('steps'),detail=document.getElementById('detail'),
+    detailSum=document.getElementById('detailsum');
 var startedAt=null,finishedAt=null,stopped=false,failedPolls=0,lastSupport='',
     everPolled=false;
 var WAIT_WORDS={{playbook_publish:'make the change live',
@@ -190,6 +225,29 @@ function headlineFor(st,ps){{
   return verb+(pb?' — '+pb:'');
 }}
 
+// One faint hint per tool row: the first short string value from the
+// scrubbed args (e.g. the playbook name), so the feed reads as a story,
+// not a bare list of tool codes.
+function hintFor(e){{
+  var a=e.args;
+  if(!a||typeof a!=='object')return '';
+  var keys=Object.keys(a);
+  for(var i=0;i<keys.length;i++){{
+    var v=a[keys[i]];
+    if(typeof v!=='string'||!v||v==='\\u2022\\u2022\\u2022')continue;
+    v=v.replace(/\\s+/g,' ').trim();
+    if(!v)continue;
+    return v.length>40?v.slice(0,40)+'…':v;
+  }}
+  return '';
+}}
+
+function tickFor(e){{
+  if(e.ms==null)return '<span class="tick run">●</span>';
+  if(e.ok===false)return '<span class="tick err">✗</span>';
+  return '<span class="tick ok">✓</span>';
+}}
+
 function render(st){{
   startedAt=st.started_at||startedAt;finishedAt=st.finished_at||null;
   var events=st.events||[];
@@ -205,6 +263,9 @@ function render(st){{
   else{{lastSupport=last?('Stopped after: '+last.label):'';}}
   support.textContent=lastSupport;
 
+  stepsEl.textContent=(st.status==='running'&&st.steps_used>0)?
+    (st.steps_used+'/'+BOOT.maxSteps):'';
+
   phasesEl.innerHTML=BOOT.phases.map(function(p,i){{
     var cls='phase';
     if(i<ps.current)cls+=' done';
@@ -215,12 +276,25 @@ function render(st){{
     return '<div class="'+cls+'"><span class="dot"></span>'+esc(p)+n+'</div>';
   }}).join('');
 
+  // Auto-scroll only when the reader was already pinned to the newest
+  // entry — a user who scrolled up to study something stays put.
+  var pinned=feed.scrollHeight-feed.scrollTop-feed.clientHeight<24;
   feed.innerHTML=events.map(function(e){{
-    var ms=(e.kind==='tool'&&e.ms!=null)?
+    if(e.kind!=='tool'){{
+      return '<div class="ev thought"><span class="tick"></span>'+
+        '<span class="lbl">'+esc(e.label)+'</span></div>';
+    }}
+    var ms=(e.ms!=null)?
       '<span class="ms">'+(e.ms>=1000?(e.ms/1000).toFixed(1)+'s':e.ms+'ms')+'</span>':'';
-    return '<div class="ev '+esc(e.kind)+'"><span class="lbl">'+
-      esc(e.label)+'</span>'+ms+'</div>';
+    var hint=hintFor(e);
+    return '<div class="ev tool">'+tickFor(e)+'<span class="lbl">'+
+      esc(e.label)+'</span>'+(hint?'<span class="hint">'+esc(hint)+'</span>':'')+
+      ms+'</div>';
   }}).join('');
+  if(pinned)feed.scrollTop=feed.scrollHeight;
+  var nTools=events.filter(function(e){{return e.kind==='tool';}}).length;
+  detailSum.textContent='Activity'+(nTools?' · '+nTools+
+    (nTools>1?' steps':' step'):'');
 
   var waitTool=(st.status==='running')?st.waiting_for_approval:null;
   if(waitTool){{
@@ -270,6 +344,7 @@ function poll(){{
     }});
 }}
 
+detail.addEventListener('toggle',reportHeight);
 setInterval(function(){{if(!stopped){{elapsedEl.textContent=fmtElapsed();}}}},1000);
 window.addEventListener('resize',reportHeight);
 reportHeight();

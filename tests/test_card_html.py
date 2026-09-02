@@ -86,3 +86,58 @@ def test_auth_blocked_poll_shows_honest_offline_state():
     # CORS-less proxy errors surface as network failures — the fallback must
     # trip after the first polls all fail.
     assert "!everPolled&&failedPolls>=5" in doc
+
+
+# ── plans/020 phase 3 — the card the owner actually watches ──────────────
+
+
+def test_feed_is_open_by_default():
+    # The whole point of the refresh: execution visible without a click.
+    assert '<details id="detail" open>' in _card()
+
+
+def test_tool_rows_carry_verdict_ticks():
+    doc = _card()
+    # ✓ for ok, ✗ for a failed call, pulsing dot while in flight.
+    assert 'class="tick ok"' in doc and "✓" in doc
+    assert 'class="tick err"' in doc and "✗" in doc
+    assert 'class="tick run"' in doc
+    assert "e.ok===false" in doc  # keyed on the phase-2 ok field
+    assert "e.ms==null" in doc    # in-flight = no duration yet
+
+
+def test_args_hint_rendered_and_escaped():
+    doc = _card()
+    assert "function hintFor" in doc
+    assert "e.args" in doc
+    # Hints reach the DOM only through esc() — never raw innerHTML concat.
+    assert "esc(hint)" in doc
+    # The scrub sentinel for secret values is skipped, not displayed.
+    assert "\\u2022\\u2022\\u2022" in doc
+
+
+def test_steps_budget_counter():
+    doc = _card()
+    boot = json.loads(doc.split("var BOOT=")[1].split(";\n")[0])
+    assert boot["maxSteps"] == 40
+    assert "st.steps_used+'/'+BOOT.maxSteps" in doc
+
+
+def test_max_steps_matches_delegation_budget():
+    # card._MAX_STEPS mirrors delegation._MAX_TURNS (no import: delegation
+    # imports card). This is the drift pin.
+    from plugin_playbooks import card as card_mod
+    from plugin_playbooks import delegation
+    assert card_mod._MAX_STEPS == delegation._MAX_TURNS
+
+
+def test_autoscroll_respects_reader_position():
+    doc = _card()
+    assert "feed.scrollHeight-feed.scrollTop-feed.clientHeight<24" in doc
+    assert "if(pinned)feed.scrollTop=feed.scrollHeight" in doc
+
+
+def test_terminal_states_color_the_top_border():
+    doc = _card()
+    for state in ("done", "failed", "needs_owner"):
+        assert f".card.{state}{{border-top-color:" in doc

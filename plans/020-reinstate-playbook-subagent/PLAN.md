@@ -177,6 +177,13 @@ plugin (compare_digest, single 404). Tests in luna-service; commit + push.
 Deployment of luna-service follows its usual pipeline — noted for the owner
 in the summary if a manual deploy step is theirs.
 
+> **Phase-3 finding:** this half was already landed upstream as
+> luna-service plan 077 (merged to main 2026-08-30, with tests and a
+> no-wake guard mine lacked). No new luna-service code shipped from this
+> plan; what remains for the owner is deploying luna-service main, plus a
+> small `x-luna-user` hardening nit — both detailed in
+> `phase-3-card/execution_summary.md`.
+
 **B. Visual refresh of `card.py`.** Keep everything honest from 0.25.3
 (API_BASE resolution, readable-401/403 → offline, never-succeeded → offline
 copy, height postMessage) and the eyebrow/headline/support/phases/feed/result
