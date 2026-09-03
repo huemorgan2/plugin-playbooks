@@ -860,8 +860,8 @@ class PlaybooksPlugin(LunaPlugin):
     # 0.3.0: authoring tools ride behind the playbook-authoring skill (the
     # manifest SkillDef lists them) — building/editing playbooks is rare and
     # the skill body is required reading anyway. Run/inspect tools
-    # (playbook_run/list/status/cancel) stay visible every turn. Cores
-    # without the skill_gated kwarg get everything ungated.
+    # (playbook_run/list/status/cancel) stay visible every turn. A core
+    # that cannot gate fails loud at load time (plans/027).
     AUTHORING_TOOLS = (
         "playbook_propose",
         "playbook_edit",
@@ -896,20 +896,33 @@ class PlaybooksPlugin(LunaPlugin):
     )
 
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:
+        # plans/027 (luna 102/phase9.1): a core that cannot gate must fail
+        # LOUD at load time — the old fallback silently registered all 18
+        # authoring/delegation tools ungated on such cores, defeating the
+        # skill gate with no operator-visible signal.
         if (
-            (
-                tool_def.name in self.AUTHORING_TOOLS
-                or tool_def.name in self.DELEGATION_TOOLS
-            )
-            and getattr(ctx, "skill_registry", None) is not None
+            tool_def.name in self.AUTHORING_TOOLS
+            or tool_def.name in self.DELEGATION_TOOLS
         ):
+            if getattr(ctx, "skill_registry", None) is None:
+                raise RuntimeError(
+                    f"plugin-playbooks: cannot register skill-gated tool "
+                    f"{tool_def.name!r} — this core exposes no skill_registry. "
+                    "Upgrade the Luna core (or remove the plugin); refusing to "
+                    "register authoring/delegation tools ungated."
+                )
             try:
                 ctx.tool_registry.register(
                     self.manifest.name, tool_def, handler, skill_gated=True
                 )
                 return
-            except TypeError:  # older core: no skill_gated kwarg
-                pass
+            except TypeError as e:  # older core: no skill_gated kwarg
+                raise RuntimeError(
+                    f"plugin-playbooks: this core's tool registry does not "
+                    f"support skill_gated registration (tool "
+                    f"{tool_def.name!r}). Upgrade the Luna core; refusing to "
+                    "register authoring/delegation tools ungated."
+                ) from e
         ctx.tool_registry.register(self.manifest.name, tool_def, handler)
 
     def _register_trigger_tools(self, ctx: PluginContext) -> None:
