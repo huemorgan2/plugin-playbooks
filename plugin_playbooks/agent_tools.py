@@ -2629,6 +2629,21 @@ def build_tools(
                 "YAML specs were removed — pass spec= (a JSON object) with "
                 "spec_name, or specs= (JSON object of spec-name → spec body)."
             )})
+        # Agents frequently stringify object-typed args — accept a JSON string
+        # for spec=/specs= and parse it, rather than failing the whole call.
+        for _argname, _val in (("spec", spec), ("specs", specs)):
+            if isinstance(_val, str):
+                try:
+                    _parsed = json.loads(_val)
+                except json.JSONDecodeError as e:
+                    return json.dumps({"error": (
+                        f"{_argname}= was a string but not valid JSON "
+                        f"({e}). Pass a JSON object."
+                    )})
+                if _argname == "spec":
+                    spec = _parsed
+                else:
+                    specs = _parsed
         single = bool(spec_name or spec is not None)
         if single and specs:
             return json.dumps({"error": (

@@ -604,7 +604,9 @@ async def test_undefined_ref_error_names_real_keys(env):
     out = await runner.dry_run(pb)
     assert out["status"] == "failed"
     assert "steps.fetch.result.rows does not exist" in out["error"]
-    assert "_dry" in out["error"]  # the real key present at that level
+    # the failing segment is an unstubbed dry-run placeholder — the error now
+    # says so and prescribes the fix instead of the cryptic "keys: _dry, _note"
+    assert "not stubbed" in out["error"] and "stubs" in out["error"]
     assert "schemaless llm_step" not in out["error"]
 
 
@@ -652,6 +654,24 @@ async def test_spec_add_batch_upserts_and_runs_suite_once(env):
     async with sf() as s:
         rows = (await s.execute(select(PlaybookSpec))).scalars().all()
     assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_spec_add_accepts_stringified_specs(env):
+    """Agents frequently stringify object-typed args. specs= (and spec=) may
+    arrive as a JSON string; the tool parses it instead of failing the call."""
+    sf, _, handlers, _ = env
+    await handlers["playbook_propose"](name="greeter", code=CODE)
+    out = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", specs=json.dumps(BATCH_OK),
+    ))
+    assert out.get("specs") == {"mentions-name": "created", "wrong-name": "created"}
+    assert out["total"] == 2
+    # a non-JSON string is a clear, non-fatal error (not a raw traceback)
+    bad = json.loads(await handlers["playbook_spec_add"](
+        name="greeter", specs="{not json",
+    ))
+    assert "not valid JSON" in bad["error"]
 
 
 @pytest.mark.asyncio

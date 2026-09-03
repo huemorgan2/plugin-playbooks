@@ -1640,9 +1640,9 @@ def _render_template(template: str, ctx: _RunContext, *, step_id: str = "") -> s
             return template
         raise ValueError(
             f"Step '{step_id}': template '{template}' failed to render "
-            f"({type(e).__name__}: {e}). Available variables: "
-            f"{_available_vars(ctx)}. Inside a loop use the loop's "
-            "item_name, or steps.<loop_id>._item / ._index."
+            f"({type(e).__name__}: {e})." + _dry_stub_hint(template, ctx) +
+            f" Available variables: {_available_vars(ctx)}. Inside a loop use "
+            "the loop's item_name, or steps.<loop_id>._item / ._index."
         ) from e
 
 
@@ -1671,6 +1671,34 @@ _STEP_PATH = re.compile(
 _PATH_SEG = re.compile(r"\.([A-Za-z_]\w*)|\[[\"']([^\"'\]]+)[\"']\]")
 
 
+def _is_dry_placeholder(out: Any) -> bool:
+    """True when a step's recorded output is a dry-run simulation placeholder
+    (an unstubbed tool_call or code step during dry_run)."""
+    return isinstance(out, dict) and out.get("_dry") is True
+
+
+def _dry_stub_hint(expr: str, ctx: "_RunContext") -> str:
+    """If `expr` references any step whose output is a dry-run placeholder,
+    name those steps and tell the author to stub them. Empty string otherwise.
+
+    This is the actionable form of the otherwise-cryptic "keys: _dry, _note"
+    failure: in a dry-run/spec, an unstubbed tool_call or code step returns a
+    simulated placeholder, so any template reading a field off it fails."""
+    hits: list[str] = []
+    for m in _STEP_PATH.finditer(expr):
+        sid = m.group(1) or m.group(2)
+        if _is_dry_placeholder(ctx.step_outputs.get(sid)):
+            hits.append(sid)
+    if not hits:
+        return ""
+    uniq = ", ".join(sorted(set(hits)))
+    return (
+        f" Step(s) [{uniq}] were not stubbed and returned a simulated dry-run "
+        "placeholder — in a spec, add a `stubs` entry for each so its output "
+        "is defined."
+    )
+
+
 def _undefined_ref_detail(expr: str, ctx: "_RunContext") -> str:
     """Walk each `steps.<id>...` chain in `expr` against the outputs that
     actually exist and name the first segment that doesn't resolve, plus the
@@ -1689,6 +1717,13 @@ def _undefined_ref_detail(expr: str, ctx: "_RunContext") -> str:
                 node = node[seg]
                 path += f".{seg}"
             else:
+                if _is_dry_placeholder(node):
+                    details.append(
+                        f"{path}.{seg} does not exist — {path} is a simulated "
+                        f"dry-run placeholder because step '{sid}' was not "
+                        "stubbed; add a `stubs` entry for it in the spec"
+                    )
+                    break
                 have = (
                     f"a dict with keys: {', '.join(node.keys())}"
                     if isinstance(node, dict)
@@ -1762,7 +1797,8 @@ def _eval_expression(
             ) or "inputs.*, steps.<step_id>.*"
             raise ValueError(
                 f"Step '{step_id}': expression '{expr}' failed to evaluate "
-                f"({type(e).__name__}: {e}). Available variables: {available}. "
+                f"({type(e).__name__}: {e})." + _dry_stub_hint(expr, ctx) +
+                f" Available variables: {available}. "
                 "Inside a loop use steps.<loop_id>._item and steps.<loop_id>._index."
             ) from e
 
