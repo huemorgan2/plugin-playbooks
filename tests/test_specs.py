@@ -585,11 +585,11 @@ async def test_spec_with_unmatched_stub_key_fails(env):
 
 
 @pytest.mark.asyncio
-async def test_undefined_ref_error_names_real_keys(env):
+async def test_loop_over_unstubbed_dry_output_iterates_zero_times(env):
     sf, runner, handlers, _ = env
-    # loop over a path that doesn't exist in the (unstubbed) dry output:
-    # the error must name the real keys at the failing segment, not blame
-    # a "schemaless llm_step".
+    # plans/026: a loop over a path inside an (unstubbed) dry output no longer
+    # fails with UndefinedError — the navigable dry stub resolves the path to
+    # an empty placeholder and the loop simply runs zero iterations.
     pb = Playbook(
         name="p3", display_name="p3", status="enabled",
         definition={"name": "p3", "steps": [
@@ -602,12 +602,9 @@ async def test_undefined_ref_error_names_real_keys(env):
         ]},
     )
     out = await runner.dry_run(pb)
-    assert out["status"] == "failed"
-    assert "steps.fetch.result.rows does not exist" in out["error"]
-    # the failing segment is an unstubbed dry-run placeholder — the error now
-    # says so and prescribes the fix instead of the cryptic "keys: _dry, _note"
-    assert "not stubbed" in out["error"] and "stubs" in out["error"]
-    assert "schemaless llm_step" not in out["error"]
+    assert out["status"] == "done", out["error"]
+    assert out["references"]["crawl"]["iterations"] == 0
+    assert out["references"]["crawl"]["results"] == []
 
 
 # ---- batch spec_add (plans/012 phase 1) ------------------------------------

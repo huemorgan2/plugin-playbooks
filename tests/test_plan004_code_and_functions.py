@@ -254,10 +254,14 @@ async def test_code_step_dry_run_stubs_by_id(db):
     assert step["resolved_inputs"] == {"raw": "052"}
     # unstubbed: never touches the jail, result is a dry marker
     out2 = await runner.dry_run(pb, inputs={"raw": "052"})
-    # plans/022 P5: the stub self-describes — never mistakable for evidence
-    assert out2["trace"][0]["output"]["result"] == {
-        "_dry": True, "_note": "simulated — code was NOT executed",
-    }
+    # plans/022 P5 + plans/026: self-describes (never mistakable for
+    # evidence) AND is a navigable empty stub.
+    res = out2["trace"][0]["output"]
+    assert res["_dry"] is True
+    assert res["_note"] == "simulated — code was NOT executed"
+    assert res["result"]["_dry"] is True
+    assert res["result"]["_note"] == "simulated — code was NOT executed"
+    assert dict(res["result"]) == {}
 
 
 # ------------------------------------------------------------ def functions

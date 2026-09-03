@@ -85,9 +85,10 @@ class _Bus:
 
 
 @pytest.mark.asyncio
-async def test_unstubbed_step_yields_actionable_dry_run_error():
-    """End-to-end: an unstubbed tool step read downstream fails the dry-run
-    with a message naming the step and telling the author to stub it."""
+async def test_unstubbed_step_no_longer_fails_the_dry_run():
+    """End-to-end, plans/026: an unstubbed tool step read downstream resolves
+    to a navigable dry stub — the condition sees an empty (falsy) value, the
+    branch is skipped, and the dry run completes instead of erroring."""
     class _Tool:
         def __init__(self, handler):
             self.handler = handler
@@ -126,10 +127,10 @@ async def test_unstubbed_step_yields_actionable_dry_run_error():
         name="diag", display_name="diag", status="enabled",
         definition=pb_def.model_dump(mode="json", exclude_none=True, by_alias=True),
     )
-    # rows is intentionally NOT stubbed -> placeholder -> gate read fails.
+    # rows is intentionally NOT stubbed -> navigable placeholder -> the gate
+    # condition evaluates (length of an empty stub is 0) and skips the branch.
     out = await runner.dry_run(pb, inputs={}, stubs={})
-    assert out["status"] == "failed"
-    err = out.get("error") or ""
-    assert "rows" in err
-    assert "not stubbed" in err and "stubs" in err
+    assert out["status"] == "done", out["error"]
+    gate = out["references"]["gate"]
+    assert gate["condition"] is False
     await engine.dispose()

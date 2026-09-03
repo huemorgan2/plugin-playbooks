@@ -72,6 +72,37 @@ def _split(value: Any, sep: str | None = None, maxsplit: int = -1) -> list[str]:
     return str(value).split(sep, maxsplit)
 
 
+class _DryStub(dict):
+    """plans/026: the placeholder result of an UNSTUBBED tool/code step in a
+    dry run — an empty Mapping that resolves ANY key chain to a chained stub
+    rendering as ``<dry:path>``, instead of raising StrictUndefined.
+
+    Empty means ``{% if %}`` sees falsy and ``loop over=`` iterates zero
+    times. ``_dry``/``_note`` answer via access (self-description, plans/022)
+    without being real keys, so iteration and JSON serialization (``{}``)
+    stay clean; the step WRAPPER carries the real ``_dry``/``_note`` markers.
+    Spec stubs still script results verbatim — this only covers the unstubbed
+    path, so a playbook smoke-tests before any stubs are written.
+    """
+
+    def __init__(self, path: str = "dry", note: str = "simulated") -> None:
+        super().__init__()
+        self._path = path
+        self._stub_note = note
+
+    def __missing__(self, key: Any) -> Any:
+        if key == "_dry":
+            return True
+        if key == "_note":
+            return self._stub_note
+        return _DryStub(f"{self._path}.{key}", self._stub_note)
+
+    def __str__(self) -> str:
+        return f"<dry:{self._path}>"
+
+    __repr__ = __str__
+
+
 _SANDBOX_ENV = _PlaybookEnvironment(undefined=StrictUndefined)
 # plans/003 phase 2: the one real gap in the builtin filter set. Everything
 # else agents reached for (selectattr, map, tojson, …) already exists.
@@ -723,12 +754,14 @@ class PlaybookRunner:
                 scripted = ctx.stubs.get(step.id, ctx.stubs.get(step.tool))
                 return {"tool": step.tool, "resolved_args": args, "result": scripted,
                         "stubbed": True, "_dry": True}
-            # plans/022 P5: self-describing stub — a transcript reader must
-            # never mistake this for evidence the tool ran.
+            # plans/022 P5 + plans/026: self-describing AND navigable — a
+            # transcript reader must never mistake this for evidence the tool
+            # ran, yet downstream `steps.<id>.result.<field>` refs must
+            # resolve (to `<dry:...>`) so the playbook smoke-tests unstubbed.
+            note = "simulated — tool was NOT called"
             return {"tool": step.tool, "resolved_args": args,
-                    "result": {"_dry": True,
-                               "_note": "simulated — tool was NOT called"},
-                    "_dry": True}
+                    "result": _DryStub(step.tool, note),
+                    "_note": note, "_dry": True}
         # plans/016 phase 2: the stamped report_to is authoritative for tool
         # steps too, not just agent steps. A chat send that names no
         # conversation inherits the run's — and a background live run HAS
@@ -773,11 +806,12 @@ class PlaybookRunner:
                 return {"result": ctx.stubs[step.id],
                         "resolved_inputs": rendered,
                         "stubbed": True, "_dry": True}
-            # plans/022 P5: self-describing stub (code body NOT executed).
-            return {"result": {"_dry": True,
-                               "_note": "simulated — code was NOT executed"},
+            # plans/022 P5 + plans/026: self-describing, navigable stub
+            # (code body NOT executed).
+            note = "simulated — code was NOT executed"
+            return {"result": _DryStub(step.id, note),
                     "resolved_inputs": rendered,
-                    "_dry": True}
+                    "_note": note, "_dry": True}
         try:
             rt = self._tools.get("code_run")
         except KeyError:
@@ -1072,6 +1106,10 @@ class PlaybookRunner:
                 items = list(step.over)
             else:
                 items = _eval_expression(step.over, ctx, strict=True, step_id=step.id)
+            # plans/026: `over` an unstubbed dry placeholder iterates zero
+            # times (the scalar-wrap below would fake ONE bogus iteration).
+            if isinstance(items, _DryStub):
+                items = []
             if not isinstance(items, (list, tuple)):
                 items = [items]
             items = list(items)
