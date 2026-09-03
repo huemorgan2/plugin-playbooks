@@ -1673,8 +1673,18 @@ _PATH_SEG = re.compile(r"\.([A-Za-z_]\w*)|\[[\"']([^\"'\]]+)[\"']\]")
 
 def _is_dry_placeholder(out: Any) -> bool:
     """True when a step's recorded output is a dry-run simulation placeholder
-    (an unstubbed tool_call or code step during dry_run)."""
-    return isinstance(out, dict) and out.get("_dry") is True
+    (an *unstubbed* tool_call or code step during dry_run).
+
+    A stubbed step's wrapper also carries top-level ``_dry: True`` (the run is
+    still a dry run) but is NOT a placeholder — its ``result`` is scripted from
+    the spec. Those wrappers set ``stubbed: True``, so exclude them; otherwise a
+    stubbed-but-wrong-shape stub (e.g. a bare list where a dict was expected)
+    would be falsely reported as "not stubbed"."""
+    return (
+        isinstance(out, dict)
+        and out.get("_dry") is True
+        and out.get("stubbed") is not True
+    )
 
 
 def _dry_stub_hint(expr: str, ctx: "_RunContext") -> str:

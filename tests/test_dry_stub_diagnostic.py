@@ -34,6 +34,34 @@ def test_is_dry_placeholder():
     assert not _is_dry_placeholder(None)
 
 
+def test_stubbed_wrapper_is_not_a_placeholder():
+    """A stubbed tool/code step wrapper carries top-level ``_dry: True`` (the
+    run is still a dry run) yet is NOT an unstubbed placeholder — it sets
+    ``stubbed: True`` and its ``result`` is scripted. Regression: a
+    stubbed-but-wrong-shape stub (bare list where a dict was expected) was
+    falsely reported as "not stubbed"."""
+    # tool step stubbed with a wrong-shape (bare list) result
+    assert not _is_dry_placeholder(
+        {"tool": "get_cols", "resolved_args": {}, "result": [1, 2, 3],
+         "stubbed": True, "_dry": True}
+    )
+    # code step stubbed
+    assert not _is_dry_placeholder(
+        {"result": {"found": True}, "resolved_inputs": {},
+         "stubbed": True, "_dry": True}
+    )
+
+
+def test_dry_stub_hint_skips_stubbed_wrong_shape_step():
+    """The false-positive this fixes: get_cols IS stubbed (with a bare list),
+    so a template failing on it must NOT be told get_cols "was not stubbed"."""
+    ctx = SimpleNamespace(step_outputs={
+        "get_cols": {"tool": "get_cols", "result": [1, 2, 3],
+                     "stubbed": True, "_dry": True},
+    })
+    assert _dry_stub_hint("{{ steps.get_cols.result.column_values }}", ctx) == ""
+
+
 def test_dry_stub_hint_names_unstubbed_steps():
     ctx = SimpleNamespace(step_outputs={
         "find_dupes": {"tool": "monday_api_query", "result": {"_dry": True, "_note": "x"}, "_dry": True},
