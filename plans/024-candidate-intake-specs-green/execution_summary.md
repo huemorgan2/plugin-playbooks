@@ -55,8 +55,11 @@ Test: `test_spec_add_accepts_stringified_specs` in test_specs.py.
 
 - Full suite: 359 passed.
 - Local dry-run of all 20 specs against v46: 20/20.
-- Live tenant (vaselin-scanny-2): pending upgrade to 0.41.0 + spec push +
-  run — recorded below once confirmed.
+- Live tenant (vaselin-scanny-2): upgraded to 0.41.0 (marketplace upgrade
+  route), the 20 corrected specs pushed to live v46 via `playbook_spec_add`
+  (4 batches of 5), then run independently via
+  `POST /playbooks/candidate-intake/specs/run?version=46` →
+  **20 total, 20 passed, 0 failed**.
 
 ## Non-goals
 
