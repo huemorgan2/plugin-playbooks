@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 
-import yaml
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -37,19 +36,23 @@ CODE = (
     "playbook(name='greeter', description='says hi')\n"
     "say = tool('send_chat_message', message=inputs.greeting)\n"
 )
-SPEC_OK = (
-    "inputs: {greeting: 'hi Roy'}\n"
-    "expect:\n"
-    "  status: done\n"
-    "  tool_calls:\n"
-    "    send_chat_message: {count: 1, args_contain: {message: 'Roy'}}\n"
-)
-SPEC_FAILING = (
-    "inputs: {greeting: 'hi Roy'}\n"
-    "expect:\n"
-    "  tool_calls:\n"
-    "    send_chat_message: {args_contain: {message: 'Slartibartfast'}}\n"
-)
+SPEC_OK: dict = {
+    "inputs": {"greeting": "hi Roy"},
+    "expect": {
+        "status": "done",
+        "tool_calls": {
+            "send_chat_message": {"count": 1, "args_contain": {"message": "Roy"}},
+        },
+    },
+}
+SPEC_FAILING: dict = {
+    "inputs": {"greeting": "hi Roy"},
+    "expect": {
+        "tool_calls": {
+            "send_chat_message": {"args_contain": {"message": "Slartibartfast"}},
+        },
+    },
+}
 
 
 class _Bus:
@@ -114,10 +117,6 @@ async def _specs(sf, version: int) -> dict[str, PlaybookSpec]:
     return {r.name: r for r in rows}
 
 
-def _yaml(defn: dict) -> str:
-    return yaml.safe_dump(defn, sort_keys=False)
-
-
 async def _pb(sf) -> Playbook:
     async with sf() as s:
         return (await s.execute(select(Playbook))).scalar_one()
@@ -145,7 +144,7 @@ async def _green_run(sf, version: int) -> None:
 async def test_candidate_save_duplicates_live_specs(env):
     sf, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     await handlers["playbook_edit"](
         name="greeter", ticket=await _ticket(handlers),
         code=CODE.replace("says hi", "says hello"),
@@ -164,7 +163,7 @@ async def test_candidate_save_duplicates_live_specs(env):
 async def test_mint_resets_the_copied_result_cache(env):
     sf, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     async with sf() as s:
         pb = (await s.execute(select(Playbook))).scalar_one()
         await mint_version(
@@ -187,13 +186,13 @@ async def test_mint_resets_the_copied_result_cache(env):
 async def test_spec_added_on_candidate_does_not_touch_live(env):
     sf, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     await handlers["playbook_edit"](
         name="greeter", ticket=await _ticket(handlers),
         code=CODE.replace("says hi", "says hello"),
     )
     out = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="s2", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="s2", spec=SPEC_OK,
     ))
     assert out["ran_against_version"] == 2
     assert set(await _specs(sf, 1)) == {"s1"}
@@ -212,7 +211,7 @@ async def test_spec_added_on_candidate_does_not_touch_live(env):
 async def test_owner_put_and_manifest_save_mint_with_specs(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     r = await client.put(f"{BASE}/playbooks/greeter/manifest", json={"manifest": "# new"})
     assert r.status_code == 200, r.text
     assert r.json()["version"] == 2
@@ -220,7 +219,7 @@ async def test_owner_put_and_manifest_save_mint_with_specs(env):
     pb = await _pb(sf)
     r = await client.put(
         f"{BASE}/playbooks/greeter",
-        json={"definition_yaml": _yaml(pb.definition), "message": "owner edit"},
+        json={"definition": pb.definition, "message": "owner edit"},
     )
     assert r.status_code == 200, r.text
     assert r.json()["version"] == 3
@@ -234,7 +233,7 @@ async def test_owner_put_and_manifest_save_mint_with_specs(env):
 async def test_routes_list_and_run_specs_by_version(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     # candidate breaks the expectation; its copy of s1 goes red, live stays green
     await handlers["playbook_edit"](
         name="greeter", ticket=await _ticket(handlers),
@@ -263,16 +262,16 @@ async def test_routes_list_and_run_specs_by_version(env):
 async def test_restore_runs_the_restored_versions_own_specs(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     # v2 = version whose copy of s1 is red: mint v2 as live by an owner PUT
     # of a definition that breaks s1, then add a v2-only spec.
     pb = await _pb(sf)
     broken = dict(pb.definition)
     broken["steps"] = [{"id": "say", "kind": "tool_call", "tool": "send_chat_message",
                         "args": {"message": "plain hello"}}]
-    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition_yaml": _yaml(broken)})
+    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition": broken})
     assert r.status_code == 200 and r.json()["version"] == 2
-    await handlers["playbook_spec_add"](name="greeter", spec_name="only-v2", spec_yaml=SPEC_FAILING)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="only-v2", spec=SPEC_FAILING)
     assert set(await _specs(sf, 2)) == {"s1", "only-v2"}
     assert set(await _specs(sf, 1)) == {"s1"}
 
@@ -298,9 +297,9 @@ async def test_restore_runs_the_restored_versions_own_specs(env):
 async def test_tool_publish_restore_uses_the_same_gate(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     pb = await _pb(sf)
-    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition_yaml": _yaml(pb.definition)})
+    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition": pb.definition})
     assert r.json()["version"] == 2
     # make v1's spec red (edit the stored spec directly — the content is fine)
     async with sf() as s:
@@ -319,9 +318,9 @@ async def test_tool_publish_restore_uses_the_same_gate(env):
 async def test_rollback_reads_the_target_versions_specs(env):
     sf, handlers, client = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec_yaml=SPEC_OK)
+    await handlers["playbook_spec_add"](name="greeter", spec_name="s1", spec=SPEC_OK)
     pb = await _pb(sf)
-    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition_yaml": _yaml(pb.definition)})
+    r = await client.put(f"{BASE}/playbooks/greeter", json={"definition": pb.definition})
     async with sf() as s:                              # v2 promoted from v1
         row = (await s.execute(select(PlaybookVersion).where(
             PlaybookVersion.version == 2))).scalar_one()

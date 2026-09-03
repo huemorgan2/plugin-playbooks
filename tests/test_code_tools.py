@@ -112,17 +112,19 @@ async def test_code_cannot_rename(env):
 
 
 @pytest.mark.asyncio
-async def test_get_definition_returns_code_by_default_and_yaml_on_request(env):
+async def test_get_definition_returns_code_by_default_and_json_on_request(env):
     _, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     got = await tools["playbook_get_definition"](name="greeter")
     assert got == CODE
-    yaml_out = await tools["playbook_get_definition"](name="greeter", format="yaml")
-    assert "kind: tool_call" in yaml_out
+    json_out = json.loads(
+        await tools["playbook_get_definition"](name="greeter", format="json")
+    )
+    assert json_out["steps"][0]["kind"] == "tool_call"
 
 
 @pytest.mark.asyncio
-async def test_get_definition_derives_code_for_yaml_playbooks(env):
+async def test_get_definition_derives_code_for_codeless_playbooks(env):
     sf, tools = env
     async with sf() as s:
         s.add(Playbook(

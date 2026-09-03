@@ -185,8 +185,8 @@ def validate_definition(
     """Return all validation issues for a playbook definition. Never raises on a
     bad playbook (reports instead). Raises only on a non-mapping input.
 
-    `check_unknown_keys` only makes sense for the agent's HAND-WRITTEN YAML
-    (yaml.safe_load output) — pydantic silently drops unknown keys there, so a
+    `check_unknown_keys` only makes sense for a HAND-WRITTEN definition
+    (a raw JSON object) — pydantic silently drops unknown keys there, so a
     typo like `iteratot:` would vanish. Never enable it for a stored/round-
     tripped definition (model_dump emits defaulted keys like `fan_in`/
     `max_iterations` on every step, which would all look "unknown").
@@ -222,7 +222,7 @@ def validate_definition(
     )
     _check_required_steps(raw_steps, issues)
 
-    # 2. unknown-key typo detection — ONLY on agent-authored YAML
+    # 2. unknown-key typo detection — ONLY on hand-written raw definitions
     if check_unknown_keys and raw_dict is not None:
         _check_unknown_keys_steps(raw_steps, issues)
 

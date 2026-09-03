@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import Base, Playbook, PlaybookRun, PlaybookSpec, PlaybookStepRun
 from plugin_playbooks.runner import PlaybookRunner
-from plugin_playbooks.specs import SpecDef, evaluate_spec, parse_spec_yaml
+from plugin_playbooks.specs import SpecDef, evaluate_spec, parse_spec
 
 
 class _Bus:
@@ -149,13 +149,13 @@ async def test_dry_run_stubs_agent_and_llm_steps(env):
 
 # ---- SpecDef + evaluator ---------------------------------------------------
 
-def test_parse_spec_yaml_rejects_bad_documents():
-    with pytest.raises(ValueError, match="YAML mapping"):
-        parse_spec_yaml("- a\n- b\n")
+def test_parse_spec_rejects_bad_documents():
+    with pytest.raises(ValueError, match="JSON object"):
+        parse_spec(["a", "b"])
     with pytest.raises(ValueError, match="invalid"):
-        parse_spec_yaml("expect:\n  status: maybe\n")
+        parse_spec({"expect": {"status": "maybe"}})
     with pytest.raises(ValueError, match="invalid"):
-        parse_spec_yaml("unknown_key: 1\n")
+        parse_spec({"unknown_key": 1})
 
 
 def _dry(status="done", trace=None, error=None):
@@ -247,21 +247,25 @@ def test_evaluator_output_contains():
 
 # ---- tools -----------------------------------------------------------------
 
-SPEC_OK = (
-    "description: greeting mentions the name\n"
-    "inputs: {greeting: 'hi Roy'}\n"
-    "expect:\n"
-    "  status: done\n"
-    "  tool_calls:\n"
-    "    send_chat_message: {count: 1, args_contain: {message: 'Roy'}}\n"
-)
+SPEC_OK: dict = {
+    "description": "greeting mentions the name",
+    "inputs": {"greeting": "hi Roy"},
+    "expect": {
+        "status": "done",
+        "tool_calls": {
+            "send_chat_message": {"count": 1, "args_contain": {"message": "Roy"}},
+        },
+    },
+}
 
-SPEC_FAILING = (
-    "inputs: {greeting: 'hi Roy'}\n"
-    "expect:\n"
-    "  tool_calls:\n"
-    "    send_chat_message: {args_contain: {message: 'Slartibartfast'}}\n"
-)
+SPEC_FAILING: dict = {
+    "inputs": {"greeting": "hi Roy"},
+    "expect": {
+        "tool_calls": {
+            "send_chat_message": {"args_contain": {"message": "Slartibartfast"}},
+        },
+    },
+}
 
 
 @pytest.mark.asyncio
@@ -269,14 +273,14 @@ async def test_spec_add_runs_immediately_and_upserts(env):
     sf, runner, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="mentions-name", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="mentions-name", spec=SPEC_OK,
     ))
     assert out["status"] == "created"
     assert out["result"]["passed"] is True
     assert out["ran_against_version"] == 1
 
     out2 = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="mentions-name", spec_yaml=SPEC_FAILING,
+        name="greeter", spec_name="mentions-name", spec=SPEC_FAILING,
     ))
     assert out2["status"] == "updated"
     assert out2["result"]["passed"] is False
@@ -288,11 +292,11 @@ async def test_spec_add_runs_immediately_and_upserts(env):
 
 
 @pytest.mark.asyncio
-async def test_spec_add_rejects_invalid_yaml(env):
+async def test_spec_add_rejects_invalid_spec(env):
     _, _, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="bad", spec_yaml="expect: {status: maybe}",
+        name="greeter", spec_name="bad", spec={"expect": {"status": "maybe"}},
     ))
     assert "error" in out
 
@@ -305,7 +309,7 @@ async def test_spec_list_and_delete(env):
     assert empty["count"] == 0
     assert "note" in empty
     await handlers["playbook_spec_add"](
-        name="greeter", spec_name="s1", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="s1", spec=SPEC_OK,
     )
     lst = json.loads(await handlers["playbook_spec_list"](name="greeter"))
     assert lst["count"] == 1
@@ -328,7 +332,7 @@ async def test_spec_run_targets_candidate_by_default(env):
     sf, runner, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     await handlers["playbook_spec_add"](
-        name="greeter", spec_name="s1", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="s1", spec=SPEC_OK,
     )
     # candidate replaces the greeting input with a constant WITHOUT 'Roy'
     new_code = CODE.replace("inputs.greeting", "'plain hello'")
@@ -350,7 +354,7 @@ async def test_candidate_save_autoruns_specs(env):
     sf, runner, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     await handlers["playbook_spec_add"](
-        name="greeter", spec_name="s1", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="s1", spec=SPEC_OK,
     )
     new_code = CODE.replace("inputs.greeting", "'plain hello'")
     out = json.loads(await handlers["playbook_edit"](
@@ -367,7 +371,7 @@ async def test_promote_refused_on_failing_spec_then_passes_after_fix(env):
     sf, runner, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     await handlers["playbook_spec_add"](
-        name="greeter", spec_name="s1", spec_yaml=SPEC_OK,
+        name="greeter", spec_name="s1", spec=SPEC_OK,
     )
     new_code = CODE.replace("inputs.greeting", "'plain hello'")
     await handlers["playbook_edit"](
@@ -421,7 +425,7 @@ async def test_spec_from_run_builds_proposal(env):
     assert out.get("status") == "done", out
     pin = json.loads(await handlers["playbook_spec_from_run"](name="greeter"))
     assert pin["run_id"] == out["run_id"]
-    doc = parse_spec_yaml(pin["spec_yaml"])
+    doc = parse_spec(pin["spec"])
     assert doc.inputs == {"greeting": "hi Roy"}
     assert doc.expect.status == "done"
     assert doc.expect.steps_ran == ["say"]
@@ -429,7 +433,7 @@ async def test_spec_from_run_builds_proposal(env):
     assert doc.stubs["say"] == {"ok": True}  # recorded tool result
     # the proposal round-trips: saving it as a spec passes against live
     saved = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="pinned", spec_yaml=pin["spec_yaml"],
+        name="greeter", spec_name="pinned", spec=pin["spec"],
     ))
     assert saved["result"]["passed"] is True
 
@@ -463,7 +467,7 @@ async def test_spec_from_run_failed_run_pins_failure(env):
     pin = json.loads(await handlers["playbook_spec_from_run"](name="crasher"))
     assert pin["run_id"] == out["run_id"]
     assert "FAILED run" in pin["next"]
-    doc = parse_spec_yaml(pin["spec_yaml"])
+    doc = parse_spec(pin["spec"])
     assert doc.expect.status == "failed"
     # step a DID run — its real output is pinned; failing step b is not
     assert doc.stubs["a"] == {"ok": True}
@@ -474,7 +478,7 @@ async def test_spec_from_run_failed_run_pins_failure(env):
     assert doc.expect.error_contains in status["error"]
     # the proposal round-trips: saved as-is it documents current behavior
     saved = json.loads(await handlers["playbook_spec_add"](
-        name="crasher", spec_name="pinned-failure", spec_yaml=pin["spec_yaml"],
+        name="crasher", spec_name="pinned-failure", spec=pin["spec"],
     ))
     assert saved["result"]["passed"] is True, saved
 
@@ -503,7 +507,7 @@ async def test_spec_from_run_prefers_done_over_newer_failed(env):
     pin2 = json.loads(await handlers["playbook_spec_from_run"](
         name="flaky", run_id=bad["run_id"],
     ))
-    assert parse_spec_yaml(pin2["spec_yaml"]).expect.status == "failed"
+    assert parse_spec(pin2["spec"]).expect.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -606,20 +610,10 @@ async def test_undefined_ref_error_names_real_keys(env):
 
 # ---- batch spec_add (plans/012 phase 1) ------------------------------------
 
-BATCH_OK = (
-    "mentions-name:\n"
-    "  description: greeting mentions the name\n"
-    "  inputs: {greeting: 'hi Roy'}\n"
-    "  expect:\n"
-    "    status: done\n"
-    "    tool_calls:\n"
-    "      send_chat_message: {count: 1, args_contain: {message: 'Roy'}}\n"
-    "wrong-name:\n"
-    "  inputs: {greeting: 'hi Roy'}\n"
-    "  expect:\n"
-    "    tool_calls:\n"
-    "      send_chat_message: {args_contain: {message: 'Slartibartfast'}}\n"
-)
+BATCH_OK: dict = {
+    "mentions-name": SPEC_OK,
+    "wrong-name": SPEC_FAILING,
+}
 
 
 @pytest.mark.asyncio
@@ -641,13 +635,16 @@ async def test_spec_add_batch_upserts_and_runs_suite_once(env):
     # second batch touching one existing spec → updated, still 2 rows
     out2 = json.loads(await handlers["playbook_spec_add"](
         name="greeter",
-        specs=(
-            "wrong-name:\n"
-            "  inputs: {greeting: 'hi Roy'}\n"
-            "  expect:\n"
-            "    tool_calls:\n"
-            "      send_chat_message: {args_contain: {message: 'Roy'}}\n"
-        ),
+        specs={
+            "wrong-name": {
+                "inputs": {"greeting": "hi Roy"},
+                "expect": {
+                    "tool_calls": {
+                        "send_chat_message": {"args_contain": {"message": "Roy"}},
+                    },
+                },
+            },
+        },
     ))
     assert out2["specs"] == {"wrong-name": "updated"}
     assert out2["failed"] == 0
@@ -661,13 +658,10 @@ async def test_spec_add_batch_upserts_and_runs_suite_once(env):
 async def test_spec_add_batch_partial_parse_failure_keeps_good_specs(env):
     sf, _, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
-    batch = (
-        "good:\n"
-        "  inputs: {greeting: 'hi Roy'}\n"
-        "  expect: {status: done}\n"
-        "bad:\n"
-        "  expect: {status: maybe}\n"
-    )
+    batch = {
+        "good": {"inputs": {"greeting": "hi Roy"}, "expect": {"status": "done"}},
+        "bad": {"expect": {"status": "maybe"}},
+    }
     out = json.loads(await handlers["playbook_spec_add"](name="greeter", specs=batch))
     assert out["specs"] == {"good": "created"}
     assert "bad" in out["spec_errors"]
@@ -682,7 +676,7 @@ async def test_spec_add_batch_all_bad_stores_nothing(env):
     sf, _, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", specs="bad: {expect: {status: maybe}}",
+        name="greeter", specs={"bad": {"expect": {"status": "maybe"}}},
     ))
     assert "error" in out
     assert "bad" in out["spec_errors"]
@@ -696,7 +690,7 @@ async def test_spec_add_form_validation(env):
     _, _, handlers, _ = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
     both = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", spec_name="x", spec_yaml=SPEC_OK, specs=BATCH_OK,
+        name="greeter", spec_name="x", spec=SPEC_OK, specs=BATCH_OK,
     ))
     assert "not both" in both["error"]
     neither = json.loads(await handlers["playbook_spec_add"](name="greeter"))
@@ -704,8 +698,8 @@ async def test_spec_add_form_validation(env):
     half = json.loads(await handlers["playbook_spec_add"](
         name="greeter", spec_name="x",
     ))
-    assert "both spec_name and spec_yaml" in half["error"]
+    assert "both spec_name and spec" in half["error"]
     not_map = json.loads(await handlers["playbook_spec_add"](
-        name="greeter", specs="- a\n- b\n",
+        name="greeter", specs=["a", "b"],
     ))
-    assert "mapping" in not_map["error"]
+    assert "object" in not_map["error"]

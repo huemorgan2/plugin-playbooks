@@ -2,13 +2,13 @@
 
 These are the tools Luna uses to propose, list, run, and manage playbooks.
 
-006.714: authoring is whole-YAML only. `playbook_propose` creates from full
-YAML; `playbook_edit` rewrites an existing playbook from full YAML (snapshot →
-validate → replace). The granular node tools (add/update/remove step, new
-version, create draft, add trigger, save) were removed — they led the agent to
-build playbooks piecemeal. To change a playbook: `playbook_get_definition` →
-edit the whole YAML → `playbook_edit`; `playbook_validate` / `playbook_dry_run`
-to check before `playbook_run`.
+Authoring is Python (the pblang playbook language) — whole-source or targeted
+snippet edits, never piecemeal node surgery. `playbook_propose` creates from
+full code; `playbook_edit` rewrites from full code or applies an old=/new=
+snippet (snapshot → validate → replace). To change a playbook:
+`playbook_get_definition` → edit the code → `playbook_edit`;
+`playbook_validate` / `playbook_dry_run` to check before `playbook_run`.
+plans/023: zero YAML — every input/output is Python code or JSON.
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ import logging
 import uuid
 from types import SimpleNamespace
 from typing import Any
-
-import yaml
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -45,7 +43,7 @@ from .publish import (
 )
 from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
 from .runner import active_run_id as _active_playbook_run
-from .specs import parse_spec_batch_yaml, parse_spec_yaml, run_all_specs, spec_from_run
+from .specs import parse_spec, parse_spec_batch, run_all_specs, spec_from_run
 from .validation import validate_definition
 from .versioning import ensure_live_row, mint_version, spec_source_version
 from .versioning import get_version_row as _tolerant_get_version_row_fn
@@ -839,7 +837,7 @@ def build_tools(
         _ack_failures,
     ))
 
-    # --- Whole-YAML authoring helpers + tools ---
+    # --- Whole-source authoring helpers + tools ---
 
     # (0.38.0) The legacy _snapshot_version helper lived here. It inserted a
     # row at the CURRENT counter — duplicating the number when a row already
@@ -912,8 +910,6 @@ def build_tools(
         )
 
     async def _playbook_get_definition(*, name: str, format: str = "code") -> str:
-        import yaml as _yaml
-
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
@@ -921,16 +917,14 @@ def build_tools(
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
 
-            if format == "yaml":
-                return _yaml.dump(
-                    playbook.definition, default_flow_style=False, sort_keys=False,
-                )
+            if format == "json":
+                return json.dumps(playbook.definition, indent=2)
             try:
                 return _derive_code(playbook)
             except Exception as e:  # noqa: BLE001 — legacy defs must stay readable
                 return json.dumps({
                     "error": f"Could not render code for '{name}': {e}",
-                    "hint": "retry with format='yaml'",
+                    "hint": "retry with format='json'",
                 })
 
     tools.append((
@@ -942,7 +936,7 @@ def build_tools(
                 "playbook CODE (the Python-like playbook language) by default — "
                 "edit it and pass it back via playbook_edit(code=...), or make a "
                 "targeted change with playbook_edit(old=..., new=...). "
-                "format='yaml' returns the raw YAML IR instead."
+                "format='json' returns the raw JSON IR instead."
             ),
             parameters={
                 "type": "object",
@@ -950,7 +944,7 @@ def build_tools(
                     "name": {"type": "string", "description": "Playbook name"},
                     "format": {
                         "type": "string",
-                        "enum": ["code", "yaml"],
+                        "enum": ["code", "json"],
                         "default": "code",
                     },
                 },
@@ -1074,9 +1068,7 @@ def build_tools(
                 "candidate": row.version == playbook.candidate_version,
                 "code": code,
                 "manifest": row.manifest,
-                "definition_yaml": yaml.dump(
-                    row.definition, default_flow_style=False, sort_keys=False,
-                ),
+                "definition": row.definition,
             }
             if include_specs:
                 specs = (await session.execute(
@@ -1119,7 +1111,7 @@ def build_tools(
             modes=["planning", "building"],
             description=(
                 "Full read of ANY stored playbook version — the equivalent "
-                "of `cat` on an old file: its code, YAML definition, "
+                "of `cat` on an old file: its code, JSON definition, "
                 "manifest, specs (tests, with carried-from provenance and "
                 "last results), and its 10 most recent runs. Use "
                 "playbook_runs for a run's full failure output."
@@ -1311,8 +1303,12 @@ def build_tools(
 
     # --- playbook_validate (the compiler) ---
     async def _validate(*, name: str = "", definition_yaml: str = "", code: str = "") -> str:
-        import yaml as _yaml
-
+        # plans/023: YAML input removed — steering hint for stale callers.
+        if definition_yaml:
+            return json.dumps({
+                "error": "YAML validation was removed — pass code= (full "
+                         "playbook source) or name= (a saved playbook) instead.",
+            })
         check_keys = False
         if code:
             pb_def, err = _compile_code(code, name=name or "unnamed")
@@ -1330,20 +1326,6 @@ def build_tools(
             # compiler already rejects unknown kwargs; the dump carries
             # cross-kind defaults the key checker would falsely flag.
             check_keys = False
-        elif definition_yaml:
-            try:
-                defn: Any = _yaml.safe_load(definition_yaml)
-            except Exception as e:
-                return json.dumps({
-                    "ok": False,
-                    "errors": [{"severity": "error", "message": f"YAML: {e}"}],
-                })
-            if not isinstance(defn, dict):
-                return json.dumps({
-                    "ok": False,
-                    "errors": [{"severity": "error", "message": "YAML must be a mapping"}],
-                })
-            check_keys = True
         elif name:
             async with session_factory() as session:
                 pb = (await session.execute(
@@ -1353,7 +1335,7 @@ def build_tools(
                 return json.dumps({"error": f"Playbook '{name}' not found"})
             defn = pb.definition
         else:
-            return json.dumps({"error": "Provide 'name', 'code', or 'definition_yaml'."})
+            return json.dumps({"error": "Provide 'name' or 'code'."})
 
         async with session_factory() as session:
             all_pb = await _load_all_playbook_steps(session, exclude=name or None)
@@ -1391,16 +1373,14 @@ def build_tools(
                 "Returns ALL issues at once: compile errors, schema errors, unknown "
                 "keys, undefined {{inputs}}/{{steps}} references, use-before-define, "
                 "bad loops, unknown tools, subtask cycles, and context-economy "
-                "warnings. Pass a saved playbook 'name', playbook 'code' "
-                "(preferred), or a 'definition_yaml'. Run this before saving or "
-                "running."
+                "warnings. Pass a saved playbook 'name' or playbook 'code' "
+                "(preferred). Run this before saving or running."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Saved playbook name"},
                     "code": {"type": "string", "description": "Full playbook code to check"},
-                    "definition_yaml": {"type": "string", "description": "Full YAML to check"},
                 },
             },
             policy="auto_approve",
@@ -2635,36 +2615,43 @@ def build_tools(
         return _shim_playbook(playbook, row), n
 
     async def _spec_add(
-        *, name: str, spec_name: str = "", spec_yaml: str = "", specs: str = "",
-        version: str = "auto",
+        *, name: str, spec_name: str = "", spec: dict | None = None,
+        specs: dict | None = None, version: str = "auto",
+        spec_yaml: str = "",
     ) -> str:
         # plans/012 phase 1: one call carries the whole suite. Two forms —
-        # single (spec_name + spec_yaml, unchanged) or batch (specs= mapping
-        # of spec-name → spec body). Batch upserts everything, then runs the
-        # suite ONCE.
-        single = bool(spec_name or spec_yaml)
+        # single (spec_name + spec) or batch (specs= object of spec-name →
+        # spec body). Batch upserts everything, then runs the suite ONCE.
+        # plans/023: spec_yaml is an undeclared kwarg kept only to steer
+        # stale callers — YAML input was removed.
+        if spec_yaml:
+            return json.dumps({"error": (
+                "YAML specs were removed — pass spec= (a JSON object) with "
+                "spec_name, or specs= (JSON object of spec-name → spec body)."
+            )})
+        single = bool(spec_name or spec is not None)
         if single and specs:
             return json.dumps({"error": (
-                "Provide either spec_name+spec_yaml (one spec) or specs= "
+                "Provide either spec_name+spec (one spec) or specs= "
                 "(batch) — not both."
             )})
-        if single and not (spec_name and spec_yaml):
-            return json.dumps({"error": "A single spec needs both spec_name and spec_yaml."})
+        if single and not (spec_name and spec is not None):
+            return json.dumps({"error": "A single spec needs both spec_name and spec."})
         parse_errors: dict[str, str] = {}
         if single:
             try:
-                parsed = {spec_name: parse_spec_yaml(spec_yaml)}
+                parsed = {spec_name: parse_spec(spec)}
             except ValueError as e:
                 return json.dumps({"error": str(e)})
         else:
             if not specs:
                 return json.dumps({"error": (
-                    "Provide spec_name+spec_yaml (one spec) or specs= — a "
-                    "YAML mapping of spec-name → spec body. Prefer specs=: "
+                    "Provide spec_name+spec (one spec) or specs= — a JSON "
+                    "object of spec-name → spec body. Prefer specs=: "
                     "write ALL the specs you intend to add in ONE call."
                 )})
             try:
-                parsed, parse_errors = parse_spec_batch_yaml(specs)
+                parsed, parse_errors = parse_spec_batch(specs)
             except ValueError as e:
                 return json.dumps({"error": str(e)})
         async with session_factory() as session:
@@ -2746,7 +2733,7 @@ def build_tools(
                 "playbook: fixture inputs, scripted stubs for "
                 "tool/agent/llm steps, and assertions over the dry-run "
                 "trace. PREFER BATCH: write ALL the specs you intend to add "
-                "in ONE call via specs= (a YAML mapping of spec-name → spec "
+                "in ONE call via specs= (a JSON object of spec-name → spec "
                 "body) — never one call per spec. Spec body keys: "
                 "description, inputs {..}, stubs "
                 "{step_id_or_tool_name: scripted_output}, expect {status: "
@@ -2762,15 +2749,15 @@ def build_tools(
                 "properties": {
                     "name": {"type": "string", "description": "Playbook name"},
                     "specs": {
-                        "type": "string",
+                        "type": "object",
                         "description": (
-                            "BATCH (preferred): YAML mapping of spec-name → "
+                            "BATCH (preferred): JSON object of spec-name → "
                             "spec body. All are upserted, then the whole "
                             "suite runs once."
                         ),
                     },
                     "spec_name": {"type": "string", "description": "Single form: spec name (unique per playbook version)"},
-                    "spec_yaml": {"type": "string", "description": "Single form: the spec document (YAML)"},
+                    "spec": {"type": "object", "description": "Single form: the spec body (JSON object)"},
                     "version": {
                         "type": "string",
                         "description": "Which version's test set to write to: 'auto' (default: candidate when one exists, else live) | 'candidate' | 'live' | version number. Specs are duplicated to every new version.",
@@ -3028,7 +3015,7 @@ def build_tools(
             "playbook": name,
             "run_id": str(run.id),
             "run_version": run.playbook_version,
-            "spec_yaml": yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+            "spec": doc,
             "next": (
                 "This is a PROPOSAL built from the recorded run: trim stubs "
                 "and expectations you don't care about (over-tight specs "
@@ -3056,8 +3043,8 @@ def build_tools(
                 "step that DID run, expect documents the failure point. "
                 "Defaults to the latest done run (falls back to the latest "
                 "failed one); pass run_id= to pin a specific run. Returns "
-                "YAML to trim and save via playbook_spec_add — nothing is "
-                "stored yet."
+                "a spec (JSON) to trim and save via playbook_spec_add — "
+                "nothing is stored yet."
             ),
             parameters={
                 "type": "object",

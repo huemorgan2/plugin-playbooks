@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 
-import yaml
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -59,13 +58,13 @@ async def env():
     await engine.dispose()
 
 
-async def _seed(handlers, *, specs: dict[str, str] | None = None) -> None:
+async def _seed(handlers, *, specs: dict[str, dict] | None = None) -> None:
     """Live v1 via the agent's propose tool, plus the given specs on v1."""
     out = json.loads(await handlers["playbook_propose"](name="greeter", code=CODE))
     assert "error" not in out, out
     for name, spec in (specs or {}).items():
         out = json.loads(await handlers["playbook_spec_add"](
-            name="greeter", spec_name=name, spec_yaml=spec,
+            name="greeter", spec_name=name, spec=spec,
         ))
         assert "error" not in out, out
 
@@ -74,7 +73,7 @@ async def _owner_edit(sf, client) -> None:
     """Owner PUT of the live definition → mints v2 (live), v1 restorable."""
     p = await _pb(sf)
     r = await client.put(f"{BASE}/playbooks/greeter", json={
-        "definition_yaml": yaml.safe_dump(p.definition, sort_keys=False),
+        "definition": p.definition,
         "message": "edit",
     })
     assert r.status_code == 200, r.text

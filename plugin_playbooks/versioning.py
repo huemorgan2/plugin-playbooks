@@ -172,7 +172,7 @@ async def mint_version(
 async def heal_duplicate_version_rows(session_factory) -> int:
     """0.38.0: delete redundant duplicate (playbook_id, version) rows.
 
-    The pre-0.32 whole-YAML edit path snapshotted at the current counter even
+    The pre-0.32 whole-source edit path snapshotted at the current counter even
     when that number already had a row, leaving e.g. two v33s — the Versions
     list showed both and version reads 500ed (MultipleResultsFound). Keeps
     the same row `get_version_row` prefers (plans/022 P6: content first —

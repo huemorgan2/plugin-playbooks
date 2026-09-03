@@ -1,7 +1,7 @@
 """PlaybookDef / StepDef — pydantic models for playbook definitions.
 
 These are the user-facing data structures for defining playbooks.
-They validate the YAML/JSON and compile to the DB JSON column.
+They validate the JSON IR and compile to the DB JSON column.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-import yaml
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -264,17 +263,3 @@ def detect_subtask_cycles(
         if result is not None:
             return [playbook_name] + result
     return None
-
-
-def parse_yaml(text: str) -> PlaybookDef:
-    """Parse a YAML playbook definition string."""
-    data = yaml.safe_load(text)
-    if not isinstance(data, dict):
-        raise ValueError("Playbook definition must be a YAML mapping")
-    return PlaybookDef.model_validate(data)
-
-
-def to_yaml(playbook: PlaybookDef) -> str:
-    """Serialize a PlaybookDef to YAML."""
-    data = playbook.model_dump(mode="json", exclude_none=True, by_alias=True)
-    return yaml.dump(data, default_flow_style=False, sort_keys=False)

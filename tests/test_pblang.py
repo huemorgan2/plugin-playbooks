@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from plugin_playbooks.definition import PlaybookDef, StepKind, parse_yaml
+from plugin_playbooks.definition import PlaybookDef, StepKind
 from plugin_playbooks.pblang import (
     PlaybookCompileError,
     compile_playbook,
@@ -279,124 +279,121 @@ def test_syntax_error_is_a_compile_error():
 # --------------------------------------------------------------- round-trip
 
 
-CRAWL_YAML = """
-name: site-crawl
-description: BFS crawl
-inputs:
-  type: object
-  properties:
-    start_url: {type: string}
-steps:
-  - id: seed
-    kind: state
-    state:
-      - {op: set, var: frontier, value: '[ inputs.start_url ]'}
-      - {op: set, var: visited, value: '[]'}
-  - id: crawl
-    kind: loop
-    while: '{{ vars.frontier | length > 0 }}'
-    max_iterations: 200
-    body:
-      - id: take
-        kind: state
-        state:
-          - {op: pop_front, var: frontier, into: cur}
-          - {op: add_unique, var: visited, value: '{{ vars.cur }}'}
-      - id: fetch
-        kind: tool_call
-        tool: web_fetch
-        args: {url: '{{ vars.cur }}'}
-      - id: links
-        kind: llm_step
-        output_schema: {links: array}
-        prompt: "List internal link URLs on this page:\\n{{ steps.fetch.result }}"
-      - id: enqueue
-        kind: loop
-        over: '{{ steps.links.links }}'
-        item_name: link
-        body:
-          - id: gate
-            kind: condition
-            when: '{{ link not in vars.visited and link not in vars.frontier }}'
-            then:
-              - id: push
-                kind: state
-                state: [{op: push_back, var: frontier, value: '{{ link }}'}]
-"""
+CRAWL_DEF: dict = {'name': 'site-crawl',
+ 'description': 'BFS crawl',
+ 'inputs': {'type': 'object',
+            'properties': {'start_url': {'type': 'string'}}},
+ 'steps': [{'id': 'seed',
+            'kind': 'state',
+            'state': [{'op': 'set',
+                       'var': 'frontier',
+                       'value': '[ inputs.start_url ]'},
+                      {'op': 'set', 'var': 'visited', 'value': '[]'}]},
+           {'id': 'crawl',
+            'kind': 'loop',
+            'while': '{{ vars.frontier | length > 0 }}',
+            'max_iterations': 200,
+            'body': [{'id': 'take',
+                      'kind': 'state',
+                      'state': [{'op': 'pop_front',
+                                 'var': 'frontier',
+                                 'into': 'cur'},
+                                {'op': 'add_unique',
+                                 'var': 'visited',
+                                 'value': '{{ vars.cur }}'}]},
+                     {'id': 'fetch',
+                      'kind': 'tool_call',
+                      'tool': 'web_fetch',
+                      'args': {'url': '{{ vars.cur }}'}},
+                     {'id': 'links',
+                      'kind': 'llm_step',
+                      'output_schema': {'links': 'array'},
+                      'prompt': 'List internal link URLs on this page:\n'
+                                '{{ steps.fetch.result }}'},
+                     {'id': 'enqueue',
+                      'kind': 'loop',
+                      'over': '{{ steps.links.links }}',
+                      'item_name': 'link',
+                      'body': [{'id': 'gate',
+                                'kind': 'condition',
+                                'when': '{{ link not in vars.visited and '
+                                        'link not in vars.frontier }}',
+                                'then': [{'id': 'push',
+                                          'kind': 'state',
+                                          'state': [{'op': 'push_back',
+                                                     'var': 'frontier',
+                                                     'value': '{{ link '
+                                                              '}}'}]}]}]}]}]}
 
-SUBSCRIPTIONS_YAML = """
-name: subscription-scan
-display_name: Subscription scan
-description: Scan emails for paid subscriptions
-when_to_use: When the owner asks what subscriptions they pay for
-triggers:
-  - event: email.received
-    filter: {label: receipts}
-    map: {email: '{{ event.payload }}'}
-steps:
-  - id: fetch
-    kind: tool_call
-    tool: gmail__gmail__fetch_emails
-    args: {query: 'after:2024/12/15 (receipt OR invoice)'}
-  - id: scan
-    kind: loop
-    over: '{{ steps.fetch.result.messages }}'
-    item_name: email
-    concurrency: 4
-    collect: '{{ steps.classify }}'
-    body:
-      - id: classify
-        kind: llm_step
-        output_schema: {is_subscription: bool, service: str, amount: number}
-        prompt: 'Is THIS ONE email a paid subscription? {{ email }}'
-  - id: report
-    kind: llm_step
-    output_schema: {report: str}
-    prompt: "Build a report from:\\n{{ steps.scan.collected | selectattr('is_subscription') | list }}"
-    retry: {max: 2, backoff_seconds: 5.0}
-  - id: gate
-    kind: wait_for_approval
-    show: ['{{ steps.report.report }}']
-  - id: notify
-    kind: tool_call
-    tool: send_chat_message
-    args: {message: '{{ steps.report.report }}'}
-    on_error: continue
-"""
+SUBSCRIPTIONS_DEF: dict = {'name': 'subscription-scan',
+ 'display_name': 'Subscription scan',
+ 'description': 'Scan emails for paid subscriptions',
+ 'when_to_use': 'When the owner asks what subscriptions they pay for',
+ 'triggers': [{'event': 'email.received',
+               'filter': {'label': 'receipts'},
+               'map': {'email': '{{ event.payload }}'}}],
+ 'steps': [{'id': 'fetch',
+            'kind': 'tool_call',
+            'tool': 'gmail__gmail__fetch_emails',
+            'args': {'query': 'after:2024/12/15 (receipt OR invoice)'}},
+           {'id': 'scan',
+            'kind': 'loop',
+            'over': '{{ steps.fetch.result.messages }}',
+            'item_name': 'email',
+            'concurrency': 4,
+            'collect': '{{ steps.classify }}',
+            'body': [{'id': 'classify',
+                      'kind': 'llm_step',
+                      'output_schema': {'is_subscription': 'bool',
+                                        'service': 'str',
+                                        'amount': 'number'},
+                      'prompt': 'Is THIS ONE email a paid subscription? '
+                                '{{ email }}'}]},
+           {'id': 'report',
+            'kind': 'llm_step',
+            'output_schema': {'report': 'str'},
+            'prompt': 'Build a report from:\n'
+                      '{{ steps.scan.collected | '
+                      "selectattr('is_subscription') | list }}",
+            'retry': {'max': 2, 'backoff_seconds': 5.0}},
+           {'id': 'gate',
+            'kind': 'wait_for_approval',
+            'show': ['{{ steps.report.report }}']},
+           {'id': 'notify',
+            'kind': 'tool_call',
+            'tool': 'send_chat_message',
+            'args': {'message': '{{ steps.report.report }}'},
+            'on_error': 'continue'}]}
 
-PARALLEL_SUBTASK_YAML = """
-name: fanout
-steps:
-  - id: fan
-    kind: parallel
-    fan_in: all
-    branches:
-      - - id: left
-          kind: tool_call
-          tool: a_tool
-          args: {}
-      - - id: right
-          kind: subtask
-          playbook: other
-          inputs_map: {q: '{{ inputs.q }}'}
-          returns: {v: '{{ steps.x.v }}'}
-  - id: waitmail
-    kind: wait_for_event
-    event: email.received
-    event_filter: {label: x}
-    timeout_seconds: 120
-  - id: maybe_stop
-    kind: halt
-    when: '{{ steps.waitmail.timed_out }}'
-    value: nothing to do
-"""
+PARALLEL_SUBTASK_DEF: dict = {'name': 'fanout',
+ 'steps': [{'id': 'fan',
+            'kind': 'parallel',
+            'fan_in': 'all',
+            'branches': [[{'id': 'left',
+                           'kind': 'tool_call',
+                           'tool': 'a_tool',
+                           'args': {}}],
+                         [{'id': 'right',
+                           'kind': 'subtask',
+                           'playbook': 'other',
+                           'inputs_map': {'q': '{{ inputs.q }}'},
+                           'returns': {'v': '{{ steps.x.v }}'}}]]},
+           {'id': 'waitmail',
+            'kind': 'wait_for_event',
+            'event': 'email.received',
+            'event_filter': {'label': 'x'},
+            'timeout_seconds': 120},
+           {'id': 'maybe_stop',
+            'kind': 'halt',
+            'when': '{{ steps.waitmail.timed_out }}',
+            'value': 'nothing to do'}]}
 
 
-@pytest.mark.parametrize("yaml_src", [
-    CRAWL_YAML, SUBSCRIPTIONS_YAML, PARALLEL_SUBTASK_YAML,
+@pytest.mark.parametrize("def_src", [
+    CRAWL_DEF, SUBSCRIPTIONS_DEF, PARALLEL_SUBTASK_DEF,
 ], ids=["crawl", "subscriptions", "parallel-subtask"])
-def test_roundtrip_from_yaml_fixtures(yaml_src):
-    original = parse_yaml(yaml_src)
+def test_roundtrip_from_def_fixtures(def_src):
+    original = PlaybookDef.model_validate(def_src)
     code = generate_code(original)
     recompiled = compile_playbook(code)
     assert defs_equal(original, recompiled), (
@@ -407,7 +404,7 @@ def test_roundtrip_from_yaml_fixtures(yaml_src):
 
 
 def test_roundtrip_preserves_step_ids_exactly():
-    original = parse_yaml(CRAWL_YAML)
+    original = PlaybookDef.model_validate(CRAWL_DEF)
     code = generate_code(original)
     # ids become variable names / id= kwargs verbatim
     for sid in ("seed", "crawl", "take", "fetch", "links", "enqueue",

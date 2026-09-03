@@ -384,7 +384,7 @@ the spec updated.
 - Write stubs from recorded reality, not memory: after ANY real run — even
 a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
 - BATCH all new specs into ONE `playbook_spec_add(name, specs=...)` call
-(YAML mapping name → body).
+(JSON object name → body).
 - `playbook_spec_run` runs all specs; `playbook_spec_list` shows last
 results. No specs = no safety net — after meaningful changes, propose
 pinning one from a good run.
@@ -619,7 +619,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.39.0",
+        version="0.40.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

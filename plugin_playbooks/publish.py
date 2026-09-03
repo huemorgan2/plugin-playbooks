@@ -126,7 +126,7 @@ async def test_run_gate(
     # 0.27.1 (plans/016 phase 1): for restores/rollbacks the `since` bound
     # is dropped. Version rows are immutable, so ANY completed run of exactly
     # this version ran exactly this content — and snapshot rows are minted at
-    # the NEXT edit ("before whole-YAML edit", `_ensure_live_row`), so their
+    # the NEXT edit ("before whole-source edit", `_ensure_live_row`), so their
     # created_at post-dates every run the version ever had. Keeping the
     # bound made every owner restore fail with "not tested since its last
     # edit" (silently, in the UI). Candidates keep the strict rule: they are

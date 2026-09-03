@@ -50,7 +50,7 @@ export const playbooksApi = {
     name: string
     display_name?: string
     description?: string
-    definition_yaml: string
+    definition: any
     agent_autonomy?: string
   }) =>
     apiFetch<{ id: string; name: string; status: string }>(`${BASE}/playbooks`, {
@@ -58,10 +58,10 @@ export const playbooksApi = {
       body: JSON.stringify(body),
     }),
 
-  update: (name: string, definition_yaml: string, message = '') =>
+  update: (name: string, definition: any, message = '') =>
     apiFetch<{ name: string; version: number }>(`${BASE}/playbooks/${name}`, {
       method: 'PUT',
-      body: JSON.stringify({ definition_yaml, message }),
+      body: JSON.stringify({ definition, message }),
     }),
 
   archive: (name: string) =>

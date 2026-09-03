@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from luna_sdk import get_current_user
 
-from .definition import PlaybookDef, parse_yaml
+from .definition import PlaybookDef
 from .models import (
     Playbook,
     PlaybookDraft,
@@ -540,12 +540,12 @@ class PlaybookCreate(BaseModel):
     display_name: str = ""
     description: str = ""
     when_to_use: str = ""
-    definition_yaml: str
+    definition: dict[str, Any]
     agent_autonomy: str = "agent_must_confirm"
 
 
 class PlaybookUpdate(BaseModel):
-    definition_yaml: str
+    definition: dict[str, Any]
     message: str = ""
 
 
@@ -721,14 +721,13 @@ async def get_playbook(name: str):
 @router.post("/playbooks")
 async def create_playbook(body: PlaybookCreate):
     try:
-        pb_def = parse_yaml(body.definition_yaml)
+        pb_def = PlaybookDef.model_validate(body.definition)
     except Exception as e:
-        raise HTTPException(400, f"Invalid YAML: {e}")
+        raise HTTPException(400, f"Invalid definition: {e}")
 
-    import yaml as _yaml
     tool_registry = getattr(_runner, "_tools", None)
     issues = validate_definition(
-        _yaml.safe_load(body.definition_yaml),
+        body.definition,
         tool_registry=tool_registry, check_unknown_keys=True,
     )
     errors = [i.to_dict() for i in issues if i.severity == "error"]
@@ -770,9 +769,9 @@ async def create_playbook(body: PlaybookCreate):
 @router.put("/playbooks/{name}")
 async def update_playbook(name: str, body: PlaybookUpdate):
     try:
-        pb_def = parse_yaml(body.definition_yaml)
+        pb_def = PlaybookDef.model_validate(body.definition)
     except Exception as e:
-        raise HTTPException(400, f"Invalid YAML: {e}")
+        raise HTTPException(400, f"Invalid definition: {e}")
 
     async with _sf()() as session:
         p = (await session.execute(
@@ -787,8 +786,9 @@ async def update_playbook(name: str, body: PlaybookUpdate):
         # number, and version numbers must stay unique.
         await _ensure_live_row(session, p)
         p.definition = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
-        # 0.8.0: the YAML write invalidates any stored pblang code — regenerate
-        # (or NULL it so reads derive fresh; stale code must never survive).
+        # 0.8.0: a definition write invalidates any stored pblang code —
+        # regenerate (or NULL it so reads derive fresh; stale code must never
+        # survive).
         try:
             from .pblang import generate_code
             p.code = generate_code(pb_def)

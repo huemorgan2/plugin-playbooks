@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 
@@ -54,15 +53,11 @@ class SpecDef(BaseModel):
     carried_from: int | None = None
 
 
-def parse_spec_yaml(text: str) -> SpecDef:
-    """Parse + validate a spec document. Raises ValueError with readable
-    lines on bad YAML or schema violations."""
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as e:
-        raise ValueError(f"Spec is not valid YAML: {e}") from e
+def parse_spec(data: Any) -> SpecDef:
+    """Validate a spec body (JSON object). Raises ValueError with readable
+    lines on schema violations."""
     if not isinstance(data, dict):
-        raise ValueError("Spec must be a YAML mapping (keys: inputs, stubs, expect).")
+        raise ValueError("Spec must be a JSON object (keys: inputs, stubs, expect).")
     try:
         return SpecDef.model_validate(data)
     except ValidationError as e:
@@ -73,20 +68,16 @@ def parse_spec_yaml(text: str) -> SpecDef:
         raise ValueError("Spec is invalid: " + "; ".join(lines)) from e
 
 
-def parse_spec_batch_yaml(text: str) -> tuple[dict[str, SpecDef], dict[str, str]]:
-    """Parse a batch document — a YAML mapping of spec-name → spec body.
+def parse_spec_batch(data: Any) -> tuple[dict[str, SpecDef], dict[str, str]]:
+    """Validate a batch — a JSON object of spec-name → spec body.
 
     Per-spec schema violations land in the errors dict under that spec's
-    name and do NOT abort the sibling specs; only a document that isn't a
-    mapping at the top level raises.
+    name and do NOT abort the sibling specs; only a batch that isn't a
+    non-empty object raises.
     """
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as e:
-        raise ValueError(f"Batch is not valid YAML: {e}") from e
     if not isinstance(data, dict) or not data:
         raise ValueError(
-            "Batch must be a non-empty YAML mapping of spec-name → spec body "
+            "Batch must be a non-empty JSON object of spec-name → spec body "
             "(each body: inputs, stubs, expect)."
         )
     parsed: dict[str, SpecDef] = {}

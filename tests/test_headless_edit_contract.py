@@ -90,6 +90,6 @@ async def test_validate_says_nothing_was_saved(monkeypatch):
 
     monkeypatch.setattr(agent_tools, "_load_all_playbook_steps", _no_steps)
     _, handler = _tools()["playbook_validate"]
-    out = json.loads(await handler(definition_yaml="name: x\nsteps: []"))
+    out = json.loads(await handler(code="playbook(name='x')\n"))
     assert out.get("saved") is False
     assert "NOTHING was saved" in out.get("note", "")

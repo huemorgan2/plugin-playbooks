@@ -3,7 +3,7 @@
 The source is PARSED with ``ast`` and walked against a whitelist — it is
 NEVER executed. Every construct maps 1:1 to a StepDef kind; Python
 expressions referencing steps/inputs/loop items compile to the same Jinja
-expression strings the YAML layer uses, so the runner is untouched.
+expression strings the JSON IR uses, so the runner is untouched.
 
 Errors are collected all-at-once (like validation.py) and raised as one
 ``PlaybookCompileError`` whose ``issues`` carry line numbers and fix hints.
