@@ -32,6 +32,7 @@ from .models import (
     PlaybookSpec,
     PlaybookStepRun,
     PlaybookVersion,
+    PlaybookWatch,
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
@@ -698,6 +699,131 @@ def build_tools(
             },
         ),
         _cancel,
+    ))
+
+    # --- playbook_watch / playbook_watch_cancel (0.46.0, plans/029) ---
+    _WATCH_TTL_DAYS = 7
+
+    async def _watch(*, name: str, note: str = "") -> str:
+        if not _wake_capable:
+            return json.dumps({"error": (
+                "This Luna core cannot deliver watch wakes — poll "
+                "playbook_status instead."
+            )})
+        conv = getattr(ctx, "current_conversation_id", None)
+        if conv is None:
+            return json.dumps({"error": (
+                "playbook_watch only works from a conversation turn."
+            )})
+        from datetime import datetime, timedelta, timezone as _tz
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            expires = datetime.now(_tz.utc) + timedelta(days=_WATCH_TTL_DAYS)
+            existing = (await session.execute(
+                select(PlaybookWatch).where(
+                    PlaybookWatch.playbook_id == playbook.id,
+                    PlaybookWatch.conversation_id == uuid.UUID(str(conv)),
+                    PlaybookWatch.consumed_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if existing:
+                existing.expires_at = expires
+                existing.note = note or existing.note
+            else:
+                session.add(PlaybookWatch(
+                    playbook_id=playbook.id,
+                    conversation_id=uuid.UUID(str(conv)),
+                    note=note or None,
+                    expires_at=expires,
+                ))
+            await session.commit()
+        return json.dumps({
+            "watching": name,
+            "message": (
+                f"You will be WOKEN here when '{name}' next finishes a run — "
+                "any trigger. Do NOT poll playbook_status while waiting; end "
+                "your turn. One-shot: the watch is consumed by the first "
+                f"finished run, and expires after {_WATCH_TTL_DAYS} days. "
+                "Cancel with playbook_watch_cancel."
+            ),
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_watch",
+            description=(
+                "Wake me when an existing playbook's next run finishes. "
+                "One-shot: the first completed run (any trigger — webhook, "
+                "schedule, owner, another chat) delivers a follow-up turn "
+                "here with the outcome, instead of you polling. Use only "
+                "for playbooks that already exist and are run by something "
+                "else."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "Optional reminder-to-self, echoed back in the "
+                            "wake (why you are waiting / what to do next)."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        _watch,
+    ))
+
+    async def _watch_cancel(*, name: str) -> str:
+        conv = getattr(ctx, "current_conversation_id", None)
+        if conv is None:
+            return json.dumps({"error": (
+                "playbook_watch_cancel only works from a conversation turn."
+            )})
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            existing = (await session.execute(
+                select(PlaybookWatch).where(
+                    PlaybookWatch.playbook_id == playbook.id,
+                    PlaybookWatch.conversation_id == uuid.UUID(str(conv)),
+                    PlaybookWatch.consumed_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if not existing:
+                return json.dumps({
+                    "cancelled": False,
+                    "message": f"No active watch on '{name}' from this chat.",
+                })
+            await session.delete(existing)
+            await session.commit()
+        return json.dumps({"cancelled": True, "playbook": name})
+
+    tools.append((
+        ToolDef(
+            name="playbook_watch_cancel",
+            description=(
+                "Cancel this chat's active playbook_watch on a playbook."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+        ),
+        _watch_cancel,
     ))
 
     # plans/018 phase 3: the remaining prompt_always tools carry a `why` —

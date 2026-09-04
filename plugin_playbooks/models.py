@@ -348,3 +348,27 @@ class PlaybookDraft(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
+
+
+class PlaybookWatch(Base):
+    """0.46.0 (plans/029): one-shot 'wake me when this playbook's next run
+    finishes' promise. `conversation_id` is stamped from the calling turn at
+    watch time — never reconstructed at delivery. `consumed_at` is the
+    exactly-once claim (UPDATE … WHERE consumed_at IS NULL)."""
+    __tablename__ = "playbook_watches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

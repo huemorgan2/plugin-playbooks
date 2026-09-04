@@ -27,12 +27,22 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .models import PlaybookStepRun
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(dt: datetime) -> datetime:
+    # sqlite returns naive datetimes; stored values are UTC
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+from .models import PlaybookStepRun, PlaybookWatch
 from .publish import ops_conversation_id
 
 log = logging.getLogger(__name__)
@@ -100,6 +110,11 @@ class RunCompletionWake:
         if send is None:
             return  # old core or headless test ctx: nothing to deliver with
 
+        # 0.46.0 (plans/029): watchers first — any trigger. The pass consumes
+        # watches even when their moment is suppressed by a path that already
+        # delivers to the same conversation (dedupe rules inside).
+        await self._watch_pass(send, payload)
+
         if payload.get("wake_on_complete"):
             await self._wake_moment(send, payload)
             return
@@ -110,6 +125,128 @@ class RunCompletionWake:
             # inline — a wake here would double-report.
             return
         await self._awareness_note(send, payload)
+
+    async def _watch_pass(self, send: Any, payload: dict[str, Any]) -> None:
+        """plans/029: deliver one-shot `playbook_watch` promises.
+
+        Per (run, conversation) at most ONE moment ever fires: a watcher
+        conversation already served by another path — the launcher's 028
+        moment, an agent run's inline tool result, or the fix-proposal
+        service's ops failure moment — gets its watch consumed silently.
+        """
+        pb_id = payload.get("playbook_id")
+        if not pb_id:
+            return
+        try:
+            pb_uuid = uuid.UUID(str(pb_id))
+        except ValueError:
+            return
+        now = _utcnow()
+        async with self._sf() as session:
+            rows = (await session.execute(
+                select(PlaybookWatch).where(
+                    PlaybookWatch.playbook_id == pb_uuid,
+                    PlaybookWatch.consumed_at.is_(None),
+                )
+            )).scalars().all()
+            expired = [w for w in rows if _aware(w.expires_at) <= now]
+            for w in expired:
+                await session.delete(w)
+            if expired:
+                await session.commit()
+            watches = [w for w in rows if _aware(w.expires_at) > now]
+        if not watches:
+            return
+
+        origin = payload.get("conversation_id")
+        failed = (payload.get("status") or "") == "failed"
+        trigger = payload.get("trigger") or ""
+        # Failure moments in the ops chat belong to FixProposalService.
+        ops = await ops_conversation_id(self._ctx) if failed else None
+
+        for w in watches:
+            if not await self._claim_watch(w.id):
+                continue  # another completion consumed it first
+            conv = w.conversation_id
+            silent = (
+                # launcher == watcher: the 028 launcher moment covers it
+                (payload.get("wake_on_complete") and origin
+                 and str(conv) == str(origin))
+                # agent run, same conversation: the tool result was inline
+                or (trigger in ("agent", "agent-candidate") and origin
+                    and str(conv) == str(origin))
+                # failed background run, watcher is the ops chat: the
+                # fix-proposal moment owns it
+                or (failed and ops is not None and str(conv) == str(ops))
+            )
+            if silent:
+                log.info("run_wake.watch_consumed_silently watch=%s", w.id)
+                continue
+            await self._watch_moment(send, payload, conv, w.note)
+
+    async def _claim_watch(self, watch_id: Any) -> bool:
+        from sqlalchemy import update
+
+        async with self._sf() as session:
+            res = await session.execute(
+                update(PlaybookWatch)
+                .where(
+                    PlaybookWatch.id == watch_id,
+                    PlaybookWatch.consumed_at.is_(None),
+                )
+                .values(consumed_at=_utcnow())
+            )
+            await session.commit()
+            return bool(res.rowcount)
+
+    async def _watch_moment(
+        self, send: Any, payload: dict[str, Any], conv: Any, note: str | None,
+    ) -> None:
+        name = payload.get("playbook_name") or "?"
+        run_id = payload.get("run_id") or "?"
+        status = payload.get("status") or "?"
+        lines = [
+            f"The '{name}' playbook you asked to be woken about has "
+            f"finished a run with status '{status}' "
+            f"(trigger: {payload.get('trigger') or '?'}).",
+            f"Run: {run_id}",
+        ]
+        if note:
+            lines.append(f"Your note when you set the watch: {note}")
+        if status == "failed":
+            lines.append(f"Error: {payload.get('error') or 'not recorded'}")
+            lines.append("")
+            lines.append(
+                "Report the failure to the owner honestly — do NOT fabricate "
+                "results. playbook_status(run_id) shows the failing trace."
+            )
+        else:
+            outputs = await self._collect_outputs(run_id)
+            if outputs:
+                lines.append("")
+                lines.append(f"Step outputs:\n{outputs}")
+            lines.append("")
+            lines.append(
+                "Continue what you were waiting on. This was a one-shot "
+                "watch — set playbook_watch again if you need the next run "
+                "too."
+            )
+        try:
+            await send(
+                f"Watched playbook finished: {name}",
+                "\n".join(lines),
+                channel="moment",
+                respond=True,
+                conversation_id=conv,
+                source="playbooks",
+                tools="all",
+                max_turns=_WAKE_MAX_TURNS,
+                token_budget=_WAKE_TOKEN_BUDGET,
+                timeout_s=_WAKE_TIMEOUT_S,
+            )
+            log.info("run_wake.watch_moment run=%s conv=%s", run_id, conv)
+        except Exception:  # noqa: BLE001
+            log.exception("run_wake.watch_moment_failed run=%s", run_id)
 
     async def _wake_moment(self, send: Any, payload: dict[str, Any]) -> None:
         name = payload.get("playbook_name") or "?"

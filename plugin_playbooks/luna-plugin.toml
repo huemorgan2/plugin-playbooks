@@ -1,11 +1,11 @@
 name = "plugin-playbooks"
-version = "0.45.1"
+version = "0.46.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations", "playbook_watches"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -33,8 +33,8 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 28
-tables = 10
+tools = 30
+tables = 11
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
 # agent_tools.build_tools + delegation.build_delegation_tools and pinned by
@@ -68,6 +68,18 @@ risk_level = "low"
 [[tools]]
 name = "playbook_cancel"
 description = "Cancel a running playbook."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_watch"
+description = "Wake me when an existing playbook's next run finishes (one-shot)."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "playbook_watch_cancel"
+description = "Cancel this chat's active playbook_watch on a playbook."
 policy = "auto_approve"
 risk_level = "low"
 
