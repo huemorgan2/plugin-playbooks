@@ -306,7 +306,10 @@ class PlaybookRunner:
         the harness timeout and the CancelledError skipped every completion
         handler. Called at plugin load, where `self._tasks` only contains
         tasks started by THIS runner, so anything else is an orphan. Quiet by
-        design: no bus events for deaths that predate this process.
+        design: no bus events for deaths that predate this process — EXCEPT
+        runs stamped wake_on_complete (plans/028): the agent was promised a
+        wake, so those emit playbook.run.completed and get their failure
+        moment instead of vanishing.
         """
         note = (
             "interrupted — the server restarted or the plugin was upgraded "
@@ -314,6 +317,7 @@ class PlaybookRunner:
         )
         now = datetime.now(timezone.utc)
         swept = 0
+        owed_wakes: list[Any] = []
         async with self._sf() as session:
             runs = (await session.execute(
                 select(PlaybookRun).where(PlaybookRun.status == "running")
@@ -323,6 +327,8 @@ class PlaybookRunner:
                     continue
                 run.status = "failed"
                 run.completed_at = now
+                if getattr(run, "wake_on_complete", False):
+                    owed_wakes.append(run.id)
                 steps = (await session.execute(
                     select(PlaybookStepRun).where(
                         PlaybookStepRun.run_id == run.id,
@@ -336,6 +342,14 @@ class PlaybookRunner:
                 swept += 1
             if swept:
                 await session.commit()
+        # plans/028: deliver the owed completion event (which the wake
+        # service turns into a failure moment) via the normal path — it
+        # re-stamps the same terminal status, so this is idempotent.
+        for run_id in owed_wakes:
+            try:
+                await self._complete_run(run_id, "failed", error=note)
+            except Exception:  # noqa: BLE001 — sweep must never block load
+                log.exception("playbook.runs.sweep_wake_failed run=%s", run_id)
         if swept:
             log.info("playbook.runs.swept_orphans count=%d", swept)
         return swept
@@ -1352,6 +1366,11 @@ class PlaybookRunner:
         playbook_id = None
         playbook_version = None
         is_test = False
+        trigger = None
+        conversation_id = None
+        parent_run_id = None
+        wake_on_complete = False
+        playbook_name = None
         async with self._sf() as session:
             run = await session.get(PlaybookRun, run_id)
             if run:
@@ -1359,6 +1378,13 @@ class PlaybookRunner:
                 playbook_id = run.playbook_id
                 playbook_version = run.playbook_version
                 is_test = bool(run.is_test)
+                trigger = run.trigger
+                conversation_id = run.conversation_id
+                parent_run_id = run.parent_run_id
+                wake_on_complete = bool(getattr(run, "wake_on_complete", False))
+                playbook = await session.get(Playbook, run.playbook_id)
+                if playbook:
+                    playbook_name = playbook.name
 
         if started_at is not None and started_at.tzinfo is None:
             # sqlite returns naive datetimes; stored values are UTC
@@ -1382,6 +1408,12 @@ class PlaybookRunner:
                 "playbook_id": str(playbook_id) if playbook_id else None,
                 "playbook_version": playbook_version,
                 "is_test": is_test,
+                # 0.44.0 (plans/028): identity + routing for the wake service.
+                "playbook_name": playbook_name,
+                "trigger": trigger,
+                "conversation_id": str(conversation_id) if conversation_id else None,
+                "parent_run_id": str(parent_run_id) if parent_run_id else None,
+                "wake_on_complete": wake_on_complete,
             })
         finally:
             _active_run_id.reset(token)

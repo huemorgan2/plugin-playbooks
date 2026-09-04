@@ -163,6 +163,12 @@ class PlaybookRun(Base):
     # version. Test runs are excluded from the failure digest and production
     # stats, and are the evidence playbook_publish's test gate looks for.
     is_test: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 0.44.0 (plans/028): the agent was told it will be WOKEN with the result
+    # (playbook_run outlived its wait window, or fire-and-forget). Durable so
+    # the promise survives a restart — the orphan sweep honors it.
+    wake_on_complete: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

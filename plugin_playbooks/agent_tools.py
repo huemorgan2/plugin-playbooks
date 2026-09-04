@@ -231,6 +231,10 @@ def build_tools(
 
     tools: list[tuple[ToolDef, Any]] = []
 
+    # plans/028: wake-on-completion needs core's send_muted_message; without
+    # it (old core, bare test ctx) playbook_run keeps the poll contract.
+    _wake_capable = getattr(ctx, "send_muted_message", None) is not None
+
     # --- playbook_propose ---
     async def _propose(
         *,
@@ -496,6 +500,22 @@ def build_tools(
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
 
+        # plans/028: the run outlived the wait window (or fire-and-forget) —
+        # promise a wake instead of demanding polls. Stamp is durable; the
+        # RunCompletionWake service delivers on completion, and the orphan
+        # sweep honors it across restarts. Old cores (no send_muted_message)
+        # can't deliver a wake, so they keep the poll contract.
+        wake_promised = False
+        if status == "running" and _wake_capable:
+            async with session_factory() as session:
+                row = await session.get(PlaybookRun, run.id)
+                if row is not None and row.status == "running":
+                    row.wake_on_complete = True
+                    await session.commit()
+                    wake_promised = True
+                elif row is not None:
+                    status = row.status  # finished during the stamp window
+
         result: dict = {
             "run_id": str(run.id),
             "playbook": name,
@@ -510,7 +530,16 @@ def build_tools(
                 "playbook_publish to make it live."
             )
 
-        if status == "running":
+        if status == "running" and wake_promised:
+            result["message"] = (
+                "The playbook is still executing in the background (this is "
+                f"normal for runs longer than {int(wait_seconds)}s). You "
+                "will be WOKEN with the result when it finishes — do NOT "
+                "poll playbook_status, do NOT re-run the playbook, and do "
+                "NOT report results yet. Finish anything else and end your "
+                "turn; a follow-up turn delivers the outcome."
+            )
+        elif status == "running":
             result["message"] = (
                 "The playbook is still executing in the background (this is "
                 f"normal for runs longer than {int(wait_seconds)}s). Poll "
@@ -554,8 +583,9 @@ def build_tools(
                 "wait_seconds (default 55) for completion. Fast playbooks "
                 "return their results directly (status 'done' + step_results). "
                 "If the result says status 'running', the playbook is still "
-                "going — poll playbook_status(run_id) until it reaches "
-                "'done'/'failed'; never re-run it and never invent results."
+                "going and you will be WOKEN with the result when it "
+                "finishes — do not poll, never re-run it, and never invent "
+                "results."
             ),
             parameters={
                 "type": "object",
@@ -566,8 +596,8 @@ def build_tools(
                         "type": "number",
                         "description": (
                             "How long to wait for completion before returning "
-                            "(0–90, default 55). Use 0 to fire-and-forget and "
-                            "poll playbook_status yourself."
+                            "(0–90, default 55). Use 0 to fire-and-forget; "
+                            "you are woken with the result either way."
                         ),
                     },
                 },

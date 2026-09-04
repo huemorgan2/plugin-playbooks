@@ -34,6 +34,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "publish_require_run", "BOOLEAN NOT NULL DEFAULT TRUE"),
     # 0.28.0 (plans/016 phase 5): specs belong to a version
     ("playbook_specs", "playbook_version", "INTEGER NOT NULL DEFAULT 0"),
+    # 0.44.0 (plans/028): wake-on-completion promise flag
+    ("playbook_runs", "wake_on_complete", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 # Indexes whose definition changed — dropped on load so the model's current
@@ -619,7 +621,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.42.0",
+        version="0.44.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -696,6 +698,7 @@ class PlaybooksPlugin(LunaPlugin):
         self._trigger_service = None
         self._binding_service = None
         self._session_factory = None
+        self._run_wake = None
         self._fix_proposals = None
         self._ctx = None
 
@@ -808,6 +811,18 @@ class PlaybooksPlugin(LunaPlugin):
             self._fix_proposals.start()
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: fix-proposal service failed to start: %s", e)
+
+        # 0.44.0 (plans/028): wake the agent when a promised run completes;
+        # awareness rows in the ops chat for background runs.
+        from .wake import RunCompletionWake
+
+        self._run_wake = RunCompletionWake(
+            ctx.db_session_factory, ctx.events, ctx,
+        )
+        try:
+            self._run_wake.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: run-wake service failed to start: %s", e)
 
         # 0.25.0 (plans/013, reinstated by plans/020): delegation tools +
         # restart hygiene for rows a dead process left at "running". Never
@@ -1103,3 +1118,5 @@ class PlaybooksPlugin(LunaPlugin):
             await self._trigger_service.stop()
         if self._fix_proposals:
             self._fix_proposals.stop()
+        if self._run_wake:
+            self._run_wake.stop()
