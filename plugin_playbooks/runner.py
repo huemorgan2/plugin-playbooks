@@ -153,6 +153,23 @@ def _normalize_tool_result(result: Any) -> Any:
     return result
 
 
+# plans/031: same shape as luna.agent.vault_refs.VAULT_REF_RE (keep in sync) —
+# a value is a ref only when the ENTIRE string matches, so prose that merely
+# mentions `vault:x` never triggers resolution.
+_VAULT_REF_RE = re.compile(r"^vault:([A-Za-z0-9][A-Za-z0-9_.\-]{0,127})$")
+
+
+def _iter_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for v in value.values():
+            yield from _iter_strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _iter_strings(v)
+
+
 def _playbook_origin_scope(playbook: Any):
     """Bind the billing origin for a playbook run and everything it derives
     (luna-service 048): root_action_type=playbook_run + a stable playbook id.
@@ -739,6 +756,61 @@ class PlaybookRunner:
             raise ValueError(f"Unknown step kind: {step.kind}")
         return await handler(step, ctx)
 
+    async def _resolve_vault_refs(self, args: Any, *, step_id: str) -> Any:
+        """plans/031: resolve `vault:<name>` argument values through ctx.vault.
+
+        The agent dispatch gate does this for direct tool calls
+        (luna.agent.vault_refs); playbook steps invoke handlers straight from
+        the registry and used to send the literal ref — e.g. an `x-api-key`
+        header of "vault:foo" — which the remote API rightly rejected.
+
+        Resolution happens on a copy handed only to the handler; step_inputs,
+        run transcripts, and events keep the ref, never the secret. ACL: the
+        read is the playbook plugin's own ctx.vault, so cross-plugin
+        credentials need a grant to plugin-playbooks — same rule as playbook
+        code reading them any other way.
+        """
+        if not any(_VAULT_REF_RE.match(s) for s in _iter_strings(args)):
+            return args
+        vault = getattr(self._ctx, "vault", None)
+        if vault is None:
+            raise ValueError(
+                f"Step '{step_id}': arguments use a vault:<name> reference "
+                "but no vault is available to the playbook runtime."
+            )
+        cache: dict[str, str] = {}
+
+        async def resolve(value: Any) -> Any:
+            if isinstance(value, str):
+                m = _VAULT_REF_RE.match(value)
+                if not m:
+                    return value
+                name = m.group(1)
+                if name not in cache:
+                    try:
+                        cred = await vault.get_credential(name)
+                    except KeyError:
+                        raise ValueError(
+                            f"Step '{step_id}': vault credential '{name}' not "
+                            "found. Check the name with list_credentials, or "
+                            "store it first."
+                        ) from None
+                    except PermissionError as e:
+                        raise ValueError(
+                            f"Step '{step_id}': vault ref denied: {e} Grant "
+                            "plugin-playbooks read access to the credential."
+                        ) from None
+                    cache[name] = cred.value
+                return cache[name]
+            if isinstance(value, Mapping):
+                return {k: await resolve(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                resolved = [await resolve(v) for v in value]
+                return tuple(resolved) if isinstance(value, tuple) else resolved
+            return value
+
+        return await resolve(args)
+
     async def _run_tool_call(self, step: StepDef, ctx: _RunContext) -> Any:
         """Execute a tool_call step — calls a registered tool by name."""
         if not step.tool:
@@ -801,7 +873,8 @@ class PlaybookRunner:
                 "the tool registry. The playbook definition references a tool "
                 "that does not exist."
             ) from None
-        result = await rt.handler(**args)
+        call_args = await self._resolve_vault_refs(args, step_id=step.id)
+        result = await rt.handler(**call_args)
         return {"tool": step.tool, "result": _normalize_tool_result(result)}
 
     async def _run_code(self, step: StepDef, ctx: _RunContext) -> Any:
@@ -836,7 +909,7 @@ class PlaybookRunner:
             ) from None
         raw = await rt.handler(
             code=step.source,
-            input_json=rendered,
+            input_json=await self._resolve_vault_refs(rendered, step_id=step.id),
             timeout_sec=step.timeout,
             title=f"playbook code step '{step.id}'",
         )

@@ -1,6 +1,12 @@
 # 031 — tool_call steps never resolve `vault:<name>` refs
 
-Status: OPEN (bug filed 2026-09-04, found via error-log-tracker digest playbook)
+Status: FIXED in code 2026-09-04 (runner resolves refs for tool_call and code
+steps; 5 new tests, suite 392 passed). Rollout to the fleet pending — filed
+via the error-log-tracker digest playbook.
+
+Note: the bug also masked real data — the digest reported "0 feedback in
+24h" while a ticket from 12:52 UTC that day existed; the feedback fetch had
+failed with the 401, it was not an empty window.
 
 ## Symptom
 
