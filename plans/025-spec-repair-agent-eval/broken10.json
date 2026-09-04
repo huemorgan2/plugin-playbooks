@@ -1,0 +1,705 @@
+{
+ "new-candidate-unique": {
+  "description": "New unique candidate -> create job subitem + link",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   }
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "find_dupes",
+    "pick_other",
+    "create_subitem",
+    "link_new_to_job"
+   ],
+   "steps_not_ran": [
+    "old_cols",
+    "merge_fields",
+    "delete_new",
+    "send_conflict_email",
+    "create_subitem_conflict"
+   ],
+   "tool_calls": {
+    "monday_api_mutate": {
+     "count": 3
+    }
+   }
+  }
+ },
+ "happy-path-no-duplicate": {
+  "description": "No duplicate -> subitem created and linked",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   },
+   "find_dupez": {
+    "dupes": {
+     "entries": []
+    }
+   }
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "find_dupes",
+    "pick_other",
+    "create_subitem",
+    "link_new_to_job"
+   ],
+   "steps_not_ran": [
+    "old_cols",
+    "merge_fields",
+    "delete_new",
+    "send_conflict_email",
+    "create_subitem_conflict"
+   ]
+  }
+ },
+ "phone-normalization-972": {
+  "description": "+972 phone normalized to leading 0 in update_phone",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "+972501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   }
+  },
+  "expect": {
+   "status": "done",
+   "output_contains": {
+    "update_phone": "9999999999"
+   }
+  }
+ },
+ "duplicate-exact-name-merge": {
+  "description": "Duplicate with identical name -> merge onto old, delete new",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": true,
+    "id": "2002",
+    "name": "Alice"
+   },
+   "old_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "old@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "check_old_has_job": false,
+   "compute_merge": {}
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "pick_other",
+    "compute_merge",
+    "merge_fields",
+    "old_cols",
+    "link_old_to_job",
+    "delete_new"
+   ],
+   "steps_not_ran": [
+    "create_subitem",
+    "send_conflict_email",
+    "link_new_to_job"
+   ]
+  }
+ },
+ "subitem-already-exists": {
+  "description": "New already has the job subitem -> skip create, still link",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": true,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   }
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "link_new_to_job",
+    "link_to_job"
+   ],
+   "steps_not_ran": [
+    "create_subitem",
+    "merge_fields",
+    "delete_new"
+   ]
+  }
+ },
+ "missing-job-id-empty": {
+  "description": "Empty job id column -> pipeline still completes gracefully",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   }
+  },
+  "expect": {
+   "status": "failed",
+   "steps_ran": [
+    "get_cols",
+    "create_subitem",
+    "link_new_to_job"
+   ],
+   "output_contains": {
+    "create_subitem": "item_ids"
+   }
+  }
+ },
+ "phone-strip-spaces-dashes-parens": {
+  "description": "Local number with separators kept as digits",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": [
+    {
+     "id": "phone_mm6jw2sr",
+     "text": "(050) 123-4567",
+     "type": "phone"
+    },
+    {
+     "id": "short_textmnboddep",
+     "text": "9001",
+     "type": "text"
+    },
+    {
+     "id": "email_mm6r8nmt",
+     "text": "new@ex.com",
+     "type": "email"
+    }
+   ],
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   }
+  },
+  "expect": {
+   "status": "done",
+   "output_contains": {
+    "update_phone": "0501234567"
+   }
+  }
+ },
+ "duplicate-different-name-conflict": {
+  "description": "Duplicate phone, different name -> conflict subitem + email + link",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": true,
+    "id": "2002",
+    "name": "Alice"
+   },
+   "old_cols_email": {
+    "column_values": [
+     {
+      "id": "email_mm6r8nmt",
+      "text": "old@ex.com",
+      "type": "email"
+     }
+    ]
+   }
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "pick_other",
+    "create_subitem_conflict",
+    "old_cols_email",
+    "send_conflict_email",
+    "link_new_conflict"
+   ],
+   "steps_not_ran": [
+    "merge_fields",
+    "delete_new",
+    "create_subitem",
+    "link_new_to_job"
+   ]
+  }
+ },
+ "merge-fills-empty-fields-and-runs-full-pipeline": {
+  "description": "Full merge pipeline: compute -> merge_fields -> link -> delete",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": true,
+    "id": "2002",
+    "name": "Alice"
+   },
+   "old_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "old@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "check_old_has_job": false,
+   "compute_merge": {
+    "text_mm5hqdts": "Senior",
+    "text_mm5x933y": "5y"
+   }
+  },
+  "expect": {
+   "status": "done",
+   "steps_ran": [
+    "get_cols",
+    "pick_other",
+    "old_cols",
+    "compute_merge",
+    "merge_fields",
+    "link_old_to_job",
+    "delete_new"
+   ],
+   "output_contains": {
+    "merge_fields": "text_mm5hqdts"
+   },
+   "tool_calls": {
+    "composio__gmail__send_email": {
+     "count": 1
+    }
+   }
+  }
+ },
+ "phone-monday-object-format": {
+  "description": "update_phone sends Monday phone object with countryShortName",
+  "inputs": {
+   "item_id": "1001",
+   "item_name": "Alice"
+  },
+  "stubs": {
+   "get_cols": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     },
+     {
+      "id": "short_textmnboddep",
+      "text": "9001",
+      "type": "text"
+     },
+     {
+      "id": "email_mm6r8nmt",
+      "text": "new@ex.com",
+      "type": "email"
+     }
+    ]
+   },
+   "normalize_phone": "0501234567",
+   "get_cols_after": {
+    "column_values": [
+     {
+      "id": "phone_mm6jw2sr",
+      "text": "0501234567",
+      "type": "phone"
+     }
+    ]
+   },
+   "get_job": {
+    "id": "9001",
+    "name": "Backend Engineer"
+   },
+   "check_new_has_job": false,
+   "find_dupes": {
+    "dupes": {
+     "entries": []
+    }
+   },
+   "pick_other": {
+    "found": false,
+    "id": "",
+    "name": ""
+   }
+  },
+  "expect": {
+   "status": "done",
+   "output_contains": {
+    "update_phone": "countryShortName"
+   },
+   "error_contains": "simulated failure"
+  }
+ }
+}

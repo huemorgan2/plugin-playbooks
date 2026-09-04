@@ -1,0 +1,62 @@
+[
+ {
+  "spec": "new-candidate-unique",
+  "category": "missing-required-stub",
+  "fuckup": "Deleted the `pick_other` stub. It's a code step; unstubbed it returns a dry-run placeholder, and dupe_branch reads pick_other.result.found -> aborts.",
+  "correct_fix": "Re-add stub pick_other={found:false,id:'',name:''}."
+ },
+ {
+  "spec": "happy-path-no-duplicate",
+  "category": "stub-key-typo",
+  "fuckup": "Renamed stub key `find_dupes`->`find_dupez`; the real step is never stubbed so find_dupes returns a placeholder.",
+  "correct_fix": "Rename the stub key back to `find_dupes`."
+ },
+ {
+  "spec": "phone-normalization-972",
+  "category": "wrong-expected-value",
+  "fuckup": "output_contains.update_phone changed 0501234567 -> 9999999999 (value the run never produces).",
+  "correct_fix": "Restore expected value 0501234567."
+ },
+ {
+  "spec": "duplicate-exact-name-merge",
+  "category": "steps_ran-ordering",
+  "fuckup": "Moved `old_cols` to AFTER `merge_fields` in steps_ran; actual execution order has old_cols before merge_fields.",
+  "correct_fix": "Put old_cols back before compute_merge/merge_fields."
+ },
+ {
+  "spec": "subitem-already-exists",
+  "category": "nonexistent-step-ref",
+  "fuckup": "Added `link_to_job` (a step v46 does not have) to steps_ran.",
+  "correct_fix": "Remove link_to_job from steps_ran."
+ },
+ {
+  "spec": "missing-job-id-empty",
+  "category": "wrong-status",
+  "fuckup": "expect.status changed done -> failed; the path completes successfully (done).",
+  "correct_fix": "Restore status=done."
+ },
+ {
+  "spec": "phone-strip-spaces-dashes-parens",
+  "category": "wrong-stub-shape",
+  "fuckup": "get_cols stub returns a bare list instead of {column_values:[...]}; downstream reads .column_values and fails.",
+  "correct_fix": "Re-wrap the list under a column_values key."
+ },
+ {
+  "spec": "duplicate-different-name-conflict",
+  "category": "branch-routing-mismatch",
+  "fuckup": "pick_other.name set to the new item's name ('Alice') instead of a different name ('SomeoneElse'); name_check now routes MERGE, but steps_ran still asserts the CONFLICT path (send_conflict_email).",
+  "correct_fix": "Restore a differing old name so name_check routes to the conflict branch."
+ },
+ {
+  "spec": "merge-fills-empty-fields-and-runs-full-pipeline",
+  "category": "wrong-tool_calls",
+  "fuckup": "Added tool_calls expectation composio__gmail__send_email count=1; the merge path never emails.",
+  "correct_fix": "Remove the send_email tool_calls expectation."
+ },
+ {
+  "spec": "phone-monday-object-format",
+  "category": "expects-nonexistent-error",
+  "fuckup": "Added error_contains='simulated failure' while the run completes with status done and no error.",
+  "correct_fix": "Remove error_contains."
+ }
+]

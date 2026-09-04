@@ -2047,15 +2047,28 @@ def build_tools(
         summary = (
             f"{verb} playbook '{name}' version {target_version}: {headline}"
         )
-        ops = await ops_conversation_id(ctx)
+        # plans/030: wake-on-decision. On cores with request_nowait (luna
+        # plans/103) the card is raised WITHOUT parking this handler under the
+        # ToolDef timeout — the tool returns "awaiting the owner" and the
+        # engine's orphan-resume wake continues the conversation when the
+        # owner decides (the re-issued publish auto-approves against the
+        # short-TTL pre-grant). The wake targets the conversation this turn
+        # runs in; ops is the headless fallback. Old cores keep the parked
+        # request() contract (hence timeout_seconds=900 stays on the tools).
+        wake_conv = (
+            getattr(ctx, "current_conversation_id", None)
+            or await ops_conversation_id(ctx)
+        )
+        nowait = getattr(approvals, "request_nowait", None)
         try:
-            decision = await approvals.request(
+            requester = nowait if nowait is not None else approvals.request
+            decision = await requester(
                 kind="playbook_change",
                 summary=summary,
                 payload=payload,
                 requested_by_plugin="plugin-playbooks",
                 risk_level="medium",
-                conversation_id=ops,
+                conversation_id=wake_conv,
                 presentation=presentation,
             )
         except Exception as e:  # noqa: BLE001 — plans/022 P2: fail CLOSED
@@ -2077,6 +2090,25 @@ def build_tools(
             })
         if getattr(decision, "decision", None) == "approved":
             return None
+        if getattr(decision, "decision", None) == "pending":
+            # plans/030: nothing published yet — the owner has the card. Do
+            # NOT phrase this as a failure the agent should work around.
+            return json.dumps({
+                "status": "awaiting_owner_approval",
+                "error": (
+                    f"Not published yet — the {action} of '{name}' version "
+                    f"{target_version} is awaiting the owner's approval."
+                ),
+                "approval_id": str(getattr(decision, "request_id", "")),
+                "hint": (
+                    "You will be WOKEN automatically when the owner decides "
+                    "— do NOT retry this call and do NOT poll for the "
+                    "decision. Finish anything else you were doing, tell "
+                    "the owner the change awaits their approval, and end "
+                    "your turn. If woken with an approval, re-issue this "
+                    "exact call — it is pre-approved and will execute."
+                ),
+            })
         return json.dumps({
             "error": f"The owner did not approve this {action}.",
             "owner_reason": getattr(decision, "reason", None),
