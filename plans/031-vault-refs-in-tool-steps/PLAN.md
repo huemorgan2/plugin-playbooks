@@ -1,12 +1,23 @@
 # 031 — tool_call steps never resolve `vault:<name>` refs
 
-Status: FIXED in code 2026-09-04 (runner resolves refs for tool_call and code
-steps; 5 new tests, suite 392 passed). Rollout to the fleet pending — filed
-via the error-log-tracker digest playbook.
+Status: SHIPPED 2026-09-04. 0.45.1 published to marketplaces.com.ai
+(official) and hot-upgraded onto the reporting agent
+(vaselin-error-log-tracker) via /api/p/plugin-marketplace/upgrade.
+Verified E2E: digest run's fetch_feedback resolved
+`vault:luna_service_feedback_key` and returned 200 with tickets; the
+persisted step row still shows the ref, not the secret. Rest of the fleet
+stays on baked 0.45.1-less 0.45.0 until the next image build
+(rollout_image.py) or a per-agent marketplace upgrade.
 
 Note: the bug also masked real data — the digest reported "0 feedback in
 24h" while a ticket from 12:52 UTC that day existed; the feedback fetch had
-failed with the 401, it was not an empty window.
+failed with the 401, it was not an empty window. A second, independent bug
+in the agent's own digest playbook produced the same "0": parse_data
+compared aware API timestamps against naive `datetime.utcnow()` — the
+TypeError was swallowed by a bare `except: pass`, dropping every ticket
+from the 24h window (and the errors branch expected a list where the admin
+API returns `{"groups": [...]}`). Fixed in playbook version 23 the same
+day.
 
 ## Symptom
 
