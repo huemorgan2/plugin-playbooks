@@ -31,7 +31,13 @@ without executing it; `tests/test_v2_loop.py` runs it through the real jail.
 
 from __future__ import annotations
 
-SHIM_SOURCE = r'''
+from .dry import DRY_CLASSES_SOURCE
+
+# phase 05: the in-jail `DryStub`/`DryStubError` classes are shared text
+# with `v2/dry.py` (the host executes the same source); spliced in below.
+_DRY_MARK = "# @@DRY_CLASSES@@"
+
+_SHIM_TEMPLATE = r'''
 import sys as _pb_sys, os as _pb_os
 # --- hash-seed pin, option A (inline-code-run-plan §3): the jail starts
 # python with -I, which ignores PYTHONHASHSEED; re-exec once without it.
@@ -130,6 +136,9 @@ _pb_FAILED_CLASSES = {
 class _pb_ArgsNotSerializable(Exception): ...
 
 
+# @@DRY_CLASSES@@
+
+
 class _pb_Request:
     """What an effect awaitable yields to the driver: one pending effect."""
 
@@ -225,7 +234,9 @@ def _pb_caller_site(frame):
 
 
 def _pb_json_norm(value):
-    return _pb_json.loads(_pb_json.dumps(value))
+    # phase 05: a DryStub handed to the next effect journals as its
+    # `<dry:...>` string (stable across segments, so replay compares equal)
+    return _pb_json.loads(_pb_json.dumps(value, default=_pb_dry_json_default))
 
 
 class _pb_Ctx:
@@ -324,6 +335,13 @@ _pb_handled = []
 
 def _pb_decode_result(kind, entry):
     result = entry.get("result")
+    if entry.get("dry") and kind in ("tool", "llm", "agent", "subtask"):
+        # phase 05: rebuild the placeholder (or wrap the provided stub) from
+        # the dry journal row: {dry, stubbed, stub_key, schema, effect}
+        effect = entry.get("effect") or f"{entry.get('id')}#{entry.get('occurrence')}"
+        if entry.get("stubbed"):
+            return _pb_dry_wrap(result, effect, entry.get("stub_key") or effect)
+        return DryStub(effect, "", entry.get("schema"))
     if kind == "now" and isinstance(result, str):
         return _pb_datetime.fromisoformat(result)
     if kind == "log":
@@ -475,7 +493,7 @@ def _pb_main():
                 thrown_seqs = []
                 value = stop.value
                 try:
-                    _pb_json.dumps(value)
+                    value = _pb_json_norm(value)
                 except (TypeError, ValueError) as e:
                     return {"kind": "error", "error_type": "ResultNotSerializable",
                             "message": f"run() returned a value that is not JSON: {e}",
@@ -531,3 +549,6 @@ def _pb_main():
 
 return _pb_main()
 '''
+
+SHIM_SOURCE = _SHIM_TEMPLATE.replace(_DRY_MARK, DRY_CLASSES_SOURCE.strip("\n"), 1)
+assert _DRY_MARK not in SHIM_SOURCE

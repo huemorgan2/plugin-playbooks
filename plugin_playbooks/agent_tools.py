@@ -45,6 +45,7 @@ from .runner import InputTypeError
 from .runner import active_run_id as _active_playbook_run
 from .v2.checker import check as v2_check
 from .v2.checker import resolve_format, sniff_format
+from .v2.skill import PUBLISH_RULE
 from .validation import validate_definition
 from .versioning import ensure_live_row, live_version_of, mint_version
 from .versioning import get_version_row as _tolerant_get_version_row_fn
@@ -1956,23 +1957,33 @@ def build_tools(
             if isinstance(resolved, str):
                 return json.dumps({"error": resolved})
             target, tested = resolved
-            if getattr(target, "format", "pblang") == "python":
-                # plans/032 phase 04: the dry-run harness walks a PlaybookDef
-                # graph; python gets its own in plugin/05.
-                return json.dumps({
-                    "ok": False,
-                    "error": "dry run for python playbooks is not available "
-                             "yet — use playbook_run_candidate",
-                    "format": "python",
-                    "tested_version": tested,
-                })
+            fmt = "python" if getattr(target, "format", "pblang") == "python" else "pblang"
 
-        trace = await runner.dry_run(target, inputs=input_data, stubs=stub_data)
+        is_candidate = bool(
+            playbook.candidate_version and tested == playbook.candidate_version
+        )
+        try:
+            if fmt == "python":
+                # plans/032 phase 05: the same segment loop in dry mode
+                # (docs/v2.md §10) — stubs keyed `<call-site id>#<n>`.
+                trace = await runner._v2.dry_run(
+                    target, inputs=input_data, stubs=stub_data, version=tested,
+                )
+            else:
+                trace = await runner.dry_run(target, inputs=input_data, stubs=stub_data)
+        except InputTypeError as e:
+            # plans/032 phase 04's loud intake, caught here for both formats:
+            # a bad input fails before anything is simulated.
+            return json.dumps({
+                "status": "rejected", "error": str(e),
+                "input": e.input, "expected": e.expected,
+                "dry_run": True, "format": fmt, "tested_version": tested,
+                "is_candidate": is_candidate,
+            })
         if isinstance(trace, dict):
+            trace["format"] = fmt
             trace["tested_version"] = tested
-            trace["is_candidate"] = bool(
-                playbook.candidate_version and tested == playbook.candidate_version
-            )
+            trace["is_candidate"] = is_candidate
         return json.dumps(trace)
 
     tools.append((
@@ -1980,14 +1991,22 @@ def build_tools(
             name="playbook_dry_run",
             timeout_seconds=60,
             description=(
-                "Simulate a playbook run WITHOUT side effects — real loops, "
-                "conditions, branches, and templates, but tool/LLM/wait steps are "
-                "stubbed. Returns a trace of resolved args, branches taken, and loop "
-                "iterations. Use to check logic before a real run. The outputs are "
-                "SIMULATED — never report them to the user as real results. "
-                "Pass `stubs` to script what stubbed steps return. "
-                "Exercises the CANDIDATE version by default when one exists "
-                "(version='live' or a number overrides)."
+                "Simulate a playbook run WITHOUT side effects. Real control "
+                "flow runs; every effect is stubbed. The outputs are SIMULATED "
+                "— never report them as real results. Python playbooks "
+                "(`async def run(ctx, inputs)`): the same segment loop in dry "
+                "mode — each `ctx.*` effect is answered from `stubs` keyed per "
+                "occurrence `\"<call-site id>#<n>\"` (`\"fetch#1\"`; `\"fetch\"` "
+                "for every occurrence; the id is the `_id=` you passed, else "
+                "the assigned name) or by a placeholder that is truthy and "
+                "iterates once; the result lists `steps_ran` per occurrence "
+                "and `unreached_call_sites` (effects no branch reached), and a "
+                "read the stubs do not cover is a `DryStubError` naming the "
+                "stubs key to add. pblang playbooks: tool/LLM/wait steps are "
+                "stubbed by step id or tool name and the result is a trace of "
+                "resolved args, branches and loop iterations. Exercises the "
+                "CANDIDATE version by default when one exists (version='live' "
+                "or a number overrides)."
             ),
             parameters={
                 "type": "object",
@@ -1997,9 +2016,11 @@ def build_tools(
                     "stubs": {
                         "type": "string",
                         "description": (
-                            "JSON object of scripted results keyed by step id "
-                            "or tool name (step id wins); values are the raw "
-                            "result payload"
+                            "JSON object of scripted results. Python: keyed "
+                            "\"<call-site id>#<n>\" per occurrence, or "
+                            "\"<call-site id>\" for every occurrence. pblang: "
+                            "keyed by step id or tool name (step id wins). "
+                            "Values are the raw result payload."
                         ),
                     },
                     "version": {
@@ -2978,7 +2999,7 @@ def build_tools(
                 "whole change: ✓/✗ check bullets and your `explanation` in "
                 "plain language up front, the technical diff collapsed "
                 "behind it. Every publish is announced in the ops chat "
-                "with its evidence."
+                "with its evidence. " + PUBLISH_RULE
             ),
             parameters={
                 "type": "object",

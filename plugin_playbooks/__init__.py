@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 
 from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, SkillDef
 
+from .v2.skill import V2_SKILL_BODY
+
 logger = logging.getLogger(__name__)
 
 
@@ -644,7 +646,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.48.0",
+        version="0.49.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -664,7 +666,8 @@ class PlaybooksPlugin(LunaPlugin):
                 name="playbook-authoring",
                 description=(
                     "how to build, edit, and debug playbooks INLINE, in this "
-                    "conversation — load only when the owner asked to work "
+                    "conversation, for pblang playbooks (`playbook(` source) "
+                    "— load only when the owner asked to work "
                     "through the playbook together step by step (or told you "
                     "not to hand it off); for any other create/fix/change job "
                     "load playbook-delegation instead. The authoring tools "
@@ -686,6 +689,38 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_list_available_triggers",
                     "playbook_preflight",
                     "playbook_language_reference",
+                ],
+            ),
+            # 0.49.0 (plans/032 phase 05): the v2 skill — python playbooks on
+            # the segment loop. Same tools minus the pblang language
+            # reference (the skill IS the reference, docs/v2.md).
+            SkillDef(
+                name="playbook-authoring-v2",
+                description=(
+                    "how to build, edit, and debug playbooks INLINE, in this "
+                    "conversation, for python playbooks (`async def run(ctx, "
+                    "inputs)`), the default for new playbooks — load only "
+                    "when the owner asked to work through the playbook "
+                    "together step by step (or told you not to hand it off); "
+                    "for any other create/fix/change job load "
+                    "playbook-delegation instead. The authoring tools "
+                    "(propose, edit, dry_run, run_candidate, publish, …) "
+                    "unlock on your next turn"
+                ),
+                body=V2_SKILL_BODY,
+                tools=[
+                    "playbook_propose",
+                    "playbook_edit",
+                    "playbook_manifest_set",
+                    "playbook_publish",
+                    "playbook_rollback",
+                    "playbook_run_candidate",
+                    "playbook_get_definition",
+                    "playbook_validate",
+                    "playbook_dry_run",
+                    "playbook_set_autonomy",
+                    "playbook_list_available_triggers",
+                    "playbook_preflight",
                 ],
             ),
             # 0.25.0 (plans/013, reinstated by plans/020): small skill, big

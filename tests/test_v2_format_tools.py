@@ -220,8 +220,15 @@ async def test_python_definition_summary_serves_readers():
         assert _derive_code(pb) == PY_CODE
         assert json.loads(await e.tools["playbook_get_definition"](name="py", format="json")) == d
         assert await e.tools["playbook_get_definition"](name="py") == PY_CODE
+        # plans/032 phase 05: python dry-runs on the segment loop (v2 shape);
+        # the harness's scripted code_run returns straight away, so nothing
+        # is exercised — the shape, not the semantics, is pinned here
+        # (tests/test_v2_dry_run.py runs the real jail).
         dry = json.loads(await e.tools["playbook_dry_run"](name="py"))
-        assert dry["ok"] is False and "not available yet" in dry["error"]
-        assert dry["format"] == "python"
+        assert dry["dry_run"] is True and dry["format"] == "python"
+        assert dry["status"] == "simulated_nothing_exercised"
+        assert dry["steps_ran"] == {} and dry["tested_version"] == 1
+        assert {s["id"] for s in dry["unreached_call_sites"]} == {"rows", "s", "approve", "send_message"}
+        assert "ok" not in dry and "error" in dry and dry["error"] is None
     finally:
         await e.dispose()

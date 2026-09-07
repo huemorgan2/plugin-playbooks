@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.48.0"
+version = "0.49.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -139,7 +139,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_dry_run"
-description = "Simulate a pblang playbook run with tool/LLM steps stubbed (scriptable via stubs) — no side effects; python dry run arrives later."
+description = "Simulate a playbook run with every effect stubbed (scriptable via stubs) — no side effects; python playbooks dry-run on the segment loop, pblang on the step graph."
 policy = "auto_approve"
 risk_level = "low"
 

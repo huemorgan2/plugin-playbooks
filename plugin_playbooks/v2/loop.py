@@ -20,14 +20,16 @@ import json
 import logging
 import secrets
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from random import SystemRandom
+from random import Random, SystemRandom
 from typing import Any
 
 from . import DEFAULT_TIMEOUTS as _DEFAULT_TIMEOUTS
 from . import MAX_EFFECTS
-from .journal import JournalStore, make_effect_entry, make_entry0
+from .dry import DRY_BANNER, dry_answer
+from .journal import JournalStore, MemoryJournalStore, make_effect_entry, make_entry0
 from .shim import SHIM_SOURCE
 
 log = logging.getLogger("luna.playbooks.v2")
@@ -108,6 +110,18 @@ class _RunState:
     chain: list[str]
 
 
+@dataclass
+class _DryRun:
+    """The transient run a dry drive uses instead of a `PlaybookRun` row
+    (phase 05): a uuid4 id for the envelope and journal, nothing persisted."""
+
+    id: uuid.UUID
+    playbook_version: int
+    is_test: bool = True
+    report_to: Any = None
+    parent_run_id: Any = None
+
+
 def _parse_retry(retry: Any) -> tuple[int, float]:
     """`_retry` → (extra attempts, backoff base seconds); docs/v2.md §3/§6."""
     if retry is None or retry is False:
@@ -168,7 +182,10 @@ class SegmentLoop:
         self, session_factory: Any, tools: Any, events: Any, ctx: Any,
         journal: JournalStore, *, segment_timeout: int = 60,
         max_effects: int = MAX_EFFECTS, agent: Any = None, start_run: Any = None,
+        mode: str = "live", stubs: dict[str, Any] | None = None,
     ) -> None:
+        if mode not in ("live", "dry"):
+            raise ValueError(f"SegmentLoop mode must be 'live' or 'dry', got {mode!r}")
         self._sf = session_factory
         self._tools = tools
         self._events = events
@@ -180,12 +197,79 @@ class SegmentLoop:
         self.journal = journal
         self.segment_timeout = segment_timeout
         self.max_effects = max_effects
+        # phase 05 (docs/v2.md §10): in dry mode every effect is answered by
+        # `dry_answer` from `stubs`, every journal row carries `dry: true`,
+        # and no run/step row or step event is written.
+        self.mode = mode
+        self._stubs: dict[str, Any] = dict(stubs or {})
+        self._dry_rng: dict[str, Random] = {}
         self.last_result: LoopResult | None = None
         # phase 03: `run()` return values of finished CHILD runs, keyed by run
         # id — `start_run` hands back the row, not the value; the parent pops
         # its child's value here (one loop per runner, so both share it).
         self._values: dict[str, Any] = {}
         self._runs: dict[str, _RunState] = {}
+
+    @property
+    def dry(self) -> bool:
+        return self.mode == "dry"
+
+    # ------------------------------------------------------------ dry run
+    async def dry_run(
+        self, playbook: Any, inputs: dict[str, Any] | None = None,
+        stubs: dict[str, Any] | None = None, *, version: int | None = None,
+    ) -> dict[str, Any]:
+        """Dry-run `playbook` (docs/v2.md §10) on a sibling loop in dry mode
+        with its own throwaway `MemoryJournalStore`. Intake coercion runs
+        first (`InputTypeError` propagates: a bad input fails before segment
+        1). Returns the result dict: `status` (`simulated` /
+        `simulated_nothing_exercised`), `dry_run`, `banner`, `steps_ran`,
+        `unreached_call_sites`, `journal`, `result`, `error`, `error_type`."""
+        from ..runner import _coerce_inputs
+        from .checker import check
+
+        coerced = _coerce_inputs(playbook, dict(inputs or {}))
+        loop = SegmentLoop(
+            self._sf, self._tools, self._events, self._ctx,
+            MemoryJournalStore(keep_completed=True),
+            segment_timeout=self.segment_timeout, max_effects=self.max_effects,
+            agent=self._agent, start_run=self._start_run, mode="dry", stubs=stubs,
+        )
+        version_n = int(version or getattr(playbook, "live_version", 0) or 1)
+        run = _DryRun(id=uuid.uuid4(), playbook_version=version_n)
+        name = playbook.name
+        call_sites = check(playbook.code or "", name=name, version=version_n).summary.get("call_sites", [])
+        error = error_type = None
+        value = None
+        try:
+            value = (await loop.drive(run, playbook, coerced)).value
+        except V2RunError as e:
+            error, error_type = e.error, e.error_type
+        journal = await loop.journal.read(str(run.id))
+        effects = journal[1:]
+        steps_ran = {
+            f"{e['id']}#{e['occurrence']}": {
+                "kind": e.get("kind"), "args": e.get("args"), "result": e.get("result"),
+                "stubbed": bool(e.get("stubbed")),
+            }
+            for e in effects
+        }
+        reached = {e["id"] for e in effects}
+        unreached = [
+            {"id": s["id"], "kind": s.get("kind"), "line": s.get("line")}
+            for s in call_sites if s.get("id") not in reached
+        ]
+        return {
+            "status": "simulated" if effects else "simulated_nothing_exercised",
+            "dry_run": True,
+            "banner": DRY_BANNER,
+            "steps_ran": steps_ran,
+            "unreached_call_sites": unreached,
+            "journal": journal,
+            "result": value,
+            "error": error,
+            "error_type": error_type,
+        }
 
     # ------------------------------------------------------------ drive
     async def drive(self, run: Any, playbook: Any, inputs: dict[str, Any]) -> LoopResult:
@@ -197,11 +281,14 @@ class SegmentLoop:
         source = playbook.code or ""
         filename = f"playbook:{name}@v{version}"
         call_sites = check(source, name=name, version=version).summary.get("call_sites", [])
-        hash_seed = secrets.randbelow(2**32)
+        # dry: fixed seeds (docs/v2.md §10) — two dry runs of one version agree
+        hash_seed = 0 if self.dry else secrets.randbelow(2**32)
         await self.journal.start(run_id, make_entry0(
             hash_seed=hash_seed, inputs=dict(inputs or {}), playbook=name, version=version,
-            max_effects=self.max_effects,
+            max_effects=self.max_effects, mode="dry" if self.dry else "real",
         ))
+        if self.dry:
+            self._dry_rng[run_id] = Random(0)
         result = LoopResult()
         parent_id = getattr(run, "parent_run_id", None)
         parent_chain = self._runs[str(parent_id)].chain if parent_id is not None and str(parent_id) in self._runs else []
@@ -256,6 +343,7 @@ class SegmentLoop:
             # before its parent, so the parent's result is what stays here
             self.last_result = result
             self._runs.pop(run_id, None)
+            self._dry_rng.pop(run_id, None)
             await self.journal.drop(run_id)
 
     # ------------------------------------------------------------ segments
@@ -354,7 +442,7 @@ class SegmentLoop:
         # journal FIRST (docs/v2.md §6) — the row exists before anything runs
         seq = await self.journal.append_in_flight(run_id, make_effect_entry(
             run_id=run_id, seq=int(eff.get("seq") or 0), kind=kind, id=site_id,
-            occurrence=occurrence, name=eff.get("name"), args=args,
+            occurrence=occurrence, name=eff.get("name"), args=args, dry=self.dry,
         ))
         if eff.get("seq") is not None and int(eff["seq"]) != seq:
             await self.journal.fail(run_id, seq, "JournalDivergence", "seq mismatch", [])
@@ -363,6 +451,9 @@ class SegmentLoop:
                 "code edited under a run, or non-journaled randomness",
                 "JournalDivergence",
             )
+        if self.dry:
+            # no step row, no step event (docs/v2.md §10)
+            return eff, seq, None
         try:
             step_run_id = await self._create_step(run.id, key, kind)
             await self._events.emit("playbook.step.started", {
@@ -405,9 +496,12 @@ class SegmentLoop:
                 n += 1
                 t_a = time.monotonic()
                 try:
-                    journal_result, outputs, fields = await self._perform(
-                        run, seq, kind, key, eff.get("name"), args, options,
-                    )
+                    if self.dry:
+                        journal_result, outputs, fields = self._perform_dry(run_id, eff, kind, args)
+                    else:
+                        journal_result, outputs, fields = await self._perform(
+                            run, seq, kind, key, eff.get("name"), args, options,
+                        )
                 except _EffectFailure as e:
                     attempts.append({
                         "n": n, "error": f"{e.error_type}: {e}",
@@ -431,6 +525,8 @@ class SegmentLoop:
                 break
             ms = int((time.monotonic() - t_row) * 1000)
             await self.journal.complete(run_id, seq, journal_result, attempts, ms, extra=fields)
+            if self.dry:
+                return
             await self._complete_step(step_run_id, "done", outputs=outputs, inputs=args)
             await self._events.emit("playbook.step.completed", {
                 "run_id": run_id, "step_id": key, "outputs": outputs,
@@ -440,12 +536,26 @@ class SegmentLoop:
             # flight fails RunCancelled; _drive_run marks the run cancelled.
             try:
                 await self.journal.fail(run_id, seq, "RunCancelled", "run cancelled", attempts)
-                await self._complete_step(step_run_id, "failed", error="run cancelled", inputs=args)
+                if not self.dry:
+                    await self._complete_step(step_run_id, "failed", error="run cancelled", inputs=args)
             except Exception:  # noqa: BLE001 — never mask the cancellation
                 log.exception("playbook.v2.cancel_bookkeeping_failed run_id=%s", run_id)
             raise
         finally:
             _active_run_id.reset(token)
+
+    def _perform_dry(
+        self, run_id: str, eff: dict[str, Any], kind: str, args: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """Dry mode (docs/v2.md §10): the answer comes from `stubs` or is a
+        placeholder the jail rebuilds; `extra` stamps the row with
+        `stubbed`/`stub_key`/`schema`/`effect`. Never raises `_EffectFailure`."""
+        site_id, occurrence = self._split_key(eff, str(eff.get("id")))
+        result, extra = dry_answer(
+            str(kind), site_id, occurrence, self._stubs, args=args,
+            rng=self._dry_rng.get(run_id),
+        )
+        return result, None, extra
 
     async def _perform(
         self, run: Any, seq: int, kind: str, key: str, name: str | None, args: dict[str, Any],
