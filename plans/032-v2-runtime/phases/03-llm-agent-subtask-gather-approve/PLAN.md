@@ -1,7 +1,7 @@
 # 032 — Phase 03: Effects: ctx.llm, ctx.agent, ctx.subtask, ctx.gather, ctx.approve (in-process form)
 Status: pending
 Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §2 Language (effect contracts, `Rejected`/`ApprovalExpired`, `failed_handled` + its hoisting exclusion), §2 Execution model, §2 Effect execution semantics, §2 Sub-agents, §2 Lifecycle (`result` column), §3 P1; master phase M1
-Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0 — 0.47.0 since phase 00's 18b9ebe; phase 01 landed as 0f61ba6 with `plugin_playbooks/v2/__init__.py` (`CTX_EXCEPTIONS` incl. `SubtaskFailed`, `APPROVE_RESULT_KEYS`) and `v2/checker.py`). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
+Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; phase 02 landed as `12e425f` — `v2/loop.py`, `v2/journal.py`, `v2/shim.py`, `tests/_jail.py`, `tests/test_v2_loop.py`; runner.py anchors after it: `_playbook_origin_scope` :220, `_drive_run` :496 with the v2 branch :541-548, `except asyncio.CancelledError` ~:571-577, `cancel_run` :687-704, `_complete_run` :1463 — the runner.py line numbers below cite 8c31a60, locate by symbol; origin/main 749f126; version 0.46.0 — 0.47.0 since phase 00's 18b9ebe; phase 01 landed as 0f61ba6 with `plugin_playbooks/v2/__init__.py` (`CTX_EXCEPTIONS` incl. `SubtaskFailed`, `APPROVE_RESULT_KEYS`) and `v2/checker.py`). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
 Depends on: plugin/01 (checker admits `ctx.llm/agent/subtask/gather/approve`, rejects `ctx.wait_event` and `ctx.sleep`), plugin/02 (host segment loop in `v2/loop.py`, in-memory `JournalStore` in `v2/journal.py`, shim exit/replay in `v2/shim.py`, `ctx.tool`, the `ctx.EffectError` family)
 Unblocks: plugin/04, plugin/05 (dry stubs for these kinds), plugin/07 (park form of `ctx.approve`), plugin/08 (persisted subtask `result`, `failed_handled` hoisting exclusion)
 
@@ -48,11 +48,14 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   `json.dumps`-ed). Cost: the entry gets `cost_cents` under the
   `_record_step_cost` rule (runner.py:1382-1397: only when `usage` has a
   truthy `cost_cents` attribute, :1389). Billing scope: the call runs inside
-  `_playbook_origin_scope(playbook)` (runner.py:173-189), as v1's
-  `_drive_run` does at runner.py:489-490; phase 02's v2 branch sits before
-  that `with` block (:484-488), so the loop imports the name into
-  `v2/loop.py` (`from ..runner import _playbook_origin_scope`) and calls it
-  through its own module global — which is what exit test 3 monkeypatches.
+  `_playbook_origin_scope(playbook)` (runner.py:220 after phase 02), as
+  v1's `_drive_run` does. Phase 02 as landed: the v2 branch already runs
+  `await self._v2.drive(run, playbook, inputs)` INSIDE
+  `with _playbook_origin_scope(playbook):` (runner.py:541-548; proven by
+  `tests/test_v2_loop.py::test_tool_effect_runs_in_billing_scope`), so
+  every effect kind is in scope for the whole run — no import into
+  `v2/loop.py`, no per-effect wrapper; exit test 3 monkeypatches the
+  runner-level name (revised by phase 02).
 - `ctx.agent(prompt, output=None, tools=None)`. Host calls
   `self._agent.run_turn(prompt, output_schema=output, tools=tools,
   memory_write=False, conversation_id=run.report_to,
@@ -122,7 +125,7 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   `_effect_subtask` enforces `_timeout` only when the author gives one
   (default None): the awaited `start_run` runs in its own task under the
   same deadline; on expiry the host cancels that task, which reaches
-  `_drive_run`'s `except asyncio.CancelledError` (runner.py:504-510) and
+  `_drive_run`'s `except asyncio.CancelledError` (runner.py:504-510 at 8c31a60, ~:571-577 after phase 02) and
   marks the child row `cancelled` — that handler SWALLOWS the
   cancellation, so the cancelled `start_run` returns its row normally and
   `asyncio.wait_for` alone would not raise (see Risks 12); the host
@@ -130,20 +133,24 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   raises `EffectTimeout` from it, never from the child's status. No
   `cancel_run` call: blocking `start_run` registers nothing in
   `PlaybookRunner._tasks` (only `start_run_background` does,
-  runner.py:279-300), so `cancel_run` (:614-631) would only take the DB
+  runner.py:279-300), so `cancel_run` (:614-631 at 8c31a60; :687-704 after phase 02) would only take the DB
   fallback. `ctx.approve` is the exception: its `_timeout` maps to
   `ttl_seconds` (below, Risks 2), not to a host-side `wait_for`.
 - `ctx.gather(*handles)`. Shim: each `ctx.<effect>(...)` call returns an
   un-awaited effect handle; `gather` assigns `seq` to the handles in
   argument order, replays every seq present in the journal, and exits
   with the list of the missing ones as pending effects in one
-  `outputs/result.json` of `kind: "gather"` (phase 02 Risks 1: one
+  `outputs/result.json` of `kind: "gather"` (phase 02 as landed: one
   `result.json` with `kind: effect | gather | return | error`; the
-  `gather` kind carries `effects: [{seq, id, effect_kind, args}, …]`
-  in argument order). Host: runs
-  the pending list concurrently (`asyncio.gather(...,
-  return_exceptions=True)`, one task per effect so `_active_run_id` is
-  per task), journals each entry as it settles, then re-runs the segment.
+  `gather` kind carries `{seq, effects: [{seq, id, call_site_id,
+  occurrence, effect_kind, name, args, options}, …]}` in argument order —
+  `docs/v2.md` §6 kind table). Host: phase 02 already ships
+  `SegmentLoop._gather(run, res)` (`v2/loop.py:277-290`: journals every
+  effect `in_flight` in order, then `asyncio.gather(...,
+  return_exceptions=False)`, one `_execute_and_finish` task per effect so
+  `_active_run_id` is per task); this phase switches it to
+  `return_exceptions=True` + first-failure-after-all-settle and adds the
+  shim-side `ctx.gather` (the shim never emits `gather` yet).
   Replay returns results in argument order; if any entry is `failed`, the
   lowest-seq failure is raised after all have settled. Each element
   counts toward `MAX_EFFECTS` (master §2 Execution model). `gather` itself
@@ -177,17 +184,15 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   `failed` → `failed_handled`. An uncaught failure propagates out of
   `run()`, the segment exits with an error and the run fails as phase 02
   defines; the entry stays `failed`.
-- `send_chat_message` rule for `ctx.tool` (assigned to this phase; phase
-  02's plan does not carry it — its tool path is vault resolution →
-  `rt.handler(**args)` only): copy runner.py:856-867 into the `tool`
-  handler — no `conversation_id` in args → inject `str(run.report_to)`
-  when set (v1 reads `ctx.conversation_id`, which is `run.report_to`,
-  :474) and journal the injected args as the entry's `args`; else when
-  not `run.is_test` fail the effect (`failed`, `ToolError`) with the v1
-  text "this run has no chat to report to — scheduled/background runs no
-  longer deliver to the ops chat…" (:861-867); test runs need no fallback
-  here because `_create_run` already stamps `report_to` = origin chat or
-  the ops conversation for `is_test` rows (runner.py:401-402).
+- `send_chat_message` rule for `ctx.tool` — ALREADY LANDED by phase 02 in
+  `SegmentLoop._perform_tool` (`v2/loop.py:406-425`): no `conversation_id`
+  in args → inject `str(run.report_to)` when set; else when not
+  `run.is_test` fail the effect (`failed`, `ToolError`) with the text
+  "effect '<key>': this run has no chat to report to — scheduled/background
+  runs do not deliver to the ops chat. Give send_chat_message an explicit
+  conversation_id." This phase only pins it (exit test 16; step 9). Test
+  runs need no fallback because `_create_run` already stamps `report_to`
+  = origin chat or the ops conversation for `is_test` rows.
 - Journal entry fields added (in-memory; phase 06 persists them):
   `cost_cents`, `transcript`, `child_run_id`, and the `handled` re-stamp.
 - `docs/v2.md`: one subsection per effect (signature, return rule,
@@ -238,9 +243,13 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
    holds `_EventFeed` instances.
 4. Host (`v2/loop.py`): `_effect_llm`, `_effect_agent`,
    `_effect_subtask`, `_effect_approve` registered in the dispatch table;
-   `_playbook_origin_scope` around llm/agent/subtask execution;
-   `_active_run_id` set/reset around every effect (verify phase 02 did it
-   for `ctx.tool`; keep one place); cost and transcript on the entry;
+   (phase 02 landed `_perform` as an if/elif on kind, `v2/loop.py:386-404`,
+   unknown kinds → `_EffectFailure("… not wired until plugin/03")` — extend
+   it or lift it into a table, executor's call); no `_playbook_origin_scope`
+   wrapper — the runner-level scope already covers the whole run (phase
+   02); `_active_run_id` is set/reset per effect in `_execute_and_finish`
+   (`v2/loop.py:337`, phase 02 — keep that one place); cost and transcript
+   on the entry;
    `asyncio.wait_for(…, _timeout or DEFAULT_TIMEOUTS[kind])` around the
    llm and agent facade calls. Done when: exit tests 1-5 pass and the
    `llm`/`agent` cases of exit test 17 pass.
@@ -261,9 +270,9 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
    exit tests 12-14 pass.
 8. `failed_handled` re-stamp from the `handled` list. Done when: exit
    tests 7, 10, 13, 15 and the catchable variant of 17 show the status.
-9. `send_chat_message` rule in the `tool` handler (phase 02's plan does
-   not carry it; if its summary shows it was added anyway, step 9 only
-   pins it). Done when: exit test 16 passes.
+9. `send_chat_message` rule: phase 02 landed it in `_perform_tool`
+   (`v2/loop.py:406-425`), so this step only pins it. Done when: exit
+   test 16 passes.
 10. `docs/v2.md` effect subsections. Done when: each of the five effects
     lists its exceptions and journal fields, and the doc states that a
     caught effect failure is journaled `failed_handled`.
@@ -324,8 +333,11 @@ Tests and assertions:
    value `"hi"`; the journal entry has `kind == "llm"`, `status == "done"`.
 3. `test_llm_records_cost_and_billing_scope`: usage
    `SimpleNamespace(cost_cents=3)` → entry `cost_cents == 3`;
-   `monkeypatch` `plugin_playbooks.v2.loop._playbook_origin_scope` with a
-   recorder → called once with the playbook. Missing agent (`agent=None`)
+   `monkeypatch` `plugin_playbooks.runner._playbook_origin_scope` with a
+   recording context manager (as phase 02's
+   `test_tool_effect_runs_in_billing_scope`) → entered exactly once per
+   run, with the playbook, and the fake facade runs while it is entered
+   (revised by phase 02). Missing agent (`agent=None`)
    → run `failed`, error contains "requires an injected agent".
 4. `test_agent_transcript_on_entry_and_nested_guard`: `FakeAgent` with
    script `[FunctionToolCallEvent("t", "c1"), FunctionToolResultEvent("t",
@@ -425,11 +437,12 @@ Existing suite: `pytest -q` from the repo root — every pre-existing test
 plugin/02's summary records as green stays green (plugin/00 removed
 `tests/test_specs.py` and `tests/test_versioned_specs.py` and added
 `tests/test_no_spec_feature.py`, so the 8c31a60 figures 403/410 no
-longer apply — phase 00's summary records 378 green + 7 red = 385);
+longer apply — phase 00's summary records 378 green + 7 red = 385; phase
+02's summary records 494 green + 7 red = 501 at `12e425f`);
 `tests/test_manifest_drift.py::test_version_stamps_agree`
-green with the three stamps unchanged from plugin/02's summary (0.47.0
-if plugin/01-02 did not bump further; pyproject.toml:3, luna-plugin.toml:2,
-`plugin_playbooks/__init__.py:616` at 18b9ebe).
+green with the three stamps unchanged from plugin/02's summary (0.47.0,
+confirmed at `12e425f` — phases 01 and 02 did not bump;
+pyproject.toml:3, luna-plugin.toml:2, `plugin_playbooks/__init__.py`).
 
 Repro tests: this phase flips
 `test_repro_fixplaybooks_runtime.py::test_wait_for_approval_actually_gates`
@@ -519,14 +532,18 @@ and additions — see Existing suite above).
    settled and the code proceeded past them). Un-awaited handles are
    never executed (as un-awaited coroutines); a checker warning is a
    later phase.
-10. Phase 02 names used here (`SegmentLoop`, `MemoryJournalStore` entry
-    fields, the `kind: "gather"` payload in `result.json`, the dispatch
-    table, `tests/_jail.py::real_code_run`) are taken from phase 02's
-    plan, not its summary, and may differ once it has run; step 1
-    reconciles them. Phase 02 defines no run-creation helper — this plan
-    uses `PlaybookRunner.start_run` — and no `send_chat_message` rule;
-    if its summary shows either was added anyway, step 6 / step 9 only
-    pin them.
+10. Phase 02 names used here — confirmed at `12e425f` (phase 02 summary
+    "Learned"): `SegmentLoop(session_factory, tools, events, ctx, journal,
+    *, segment_timeout=60, max_effects=MAX_EFFECTS)`, `drive(run, playbook,
+    inputs) -> LoopResult(value, segments, segment_latency_ms)`,
+    `MemoryJournalStore(*, keep_completed=False)`, `make_effect_entry`,
+    `JournalStore` with 7 methods incl. `drop`, host errors
+    `_EffectFailure`/`_ToolError`/`_EffectTimeout`, `_perform` if/elif
+    (not a table), `_gather` reading `res["effects"]`,
+    `tests/_jail.py::real_code_run` + `real_jail` marker. Phase 02 defines
+    no run-creation helper — this plan uses `PlaybookRunner.start_run` —
+    but DID land the `send_chat_message` rule (`_perform_tool`); step 9
+    only pins it.
 11. Cost lands on the journal entry, not on a `PlaybookStepRun` row (v2
     writes none); `_record_step_cost`'s extraction rule is copied, its
     UPDATE target is not. Cost totals surfaced in results are plugin/08+.

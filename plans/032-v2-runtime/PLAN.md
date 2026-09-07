@@ -234,6 +234,9 @@ in the summary of the phase that meets it.
 
 1. `luna-fixer plans/2026-09-06-fix-playbooks/inline-code-run-plan.md` (master
    §4) does not exist at writing time; phase 02 creates or updates it.
+   Corrected by phase 02: the file existed (luna-fixer `687e4ad`); phase 02
+   filled its §6 decision record (option A) and set it `withdrawn` at
+   luna-fixer `ea38242` — nothing was created.
 2. Phase layout is `phases/NN-<slug>/PLAN.md` + `execution_summary.md`, not
    the repo skill's `phase-N-<slug>/PHASE.md`; the skill's per-phase push +
    publish step is suspended by the no-auto-ship rule.
