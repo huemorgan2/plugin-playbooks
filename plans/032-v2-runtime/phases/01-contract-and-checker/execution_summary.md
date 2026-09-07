@@ -146,3 +146,9 @@ checker: agent_tools, runner, triggers, v2.checker all failed; green after), plu
 `from plugin_playbooks` / `import plugin_playbooks` line. Also confirmed through luna's real `_import_module` in
 luna's venv (`loaded as luna_plugin_plugin_playbooks`, `.agent_tools`, `.v2.checker`, `.runner`, `.triggers` ok).
 Version stays 0.49.0 (nothing published yet).
+
+Re-check at HEAD `9fd01f2` (2026-09-08): the phase's five files are byte-identical to `0f61ba6` except the two
+import lines in `v2/checker.py`; `.venv/bin/python -m pytest -q tests/test_v2_checker.py
+tests/test_v2_contract_doc.py tests/test_loader_style_import.py` → `92 passed` (82 + 8 + 2). Independent
+verifier at `0f61ba6` (detached worktree, removed afterwards): 82 + 8 passed, full suite `7 failed, 468 passed`,
+0 fix rounds.
