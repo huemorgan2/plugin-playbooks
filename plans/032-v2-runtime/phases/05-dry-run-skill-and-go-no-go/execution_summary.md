@@ -1,6 +1,6 @@
 # 032 — Phase 05: Dry run on the same loop, the v2 skill, and the bench go/no-go — execution summary
 
-Status: done (code, Steps 1-8 and 12; independent verifier green, 0 fix rounds). Stamps 0.48.0 → 0.49.0. Bench Steps 9-11 not run here — VERDICT: pending (see Results, "Bench"); plugin/06 stays blocked on it.
+Status: done (code, Steps 1-8 and 12; independent verifier green, 0 fix rounds). Stamps 0.48.0 → 0.49.0. Bench Steps 9-11 ran in dojoP run 0059 — verdict stop (see Results, "Bench"); plugin/06 stays blocked until luna-fixer re-plans.
 
 ## Ran
 - Date: 2026-09-08 (commit 01:38 +0300). Repo `luna-plugins/plugins/plugin-playbooks`, branch `v2-runtime`. HEAD before `2227a83` (plugin/04 summary), HEAD after `92cb5f6` — one commit "0.49.0 (plans/032 phase 05): dry run on the segment loop + v2 skill", not pushed (`v2-runtime` has no remote tracking branch; origin has only `main`). luna and dojoP untouched. ` M uv.lock` left as found, not staged.
@@ -35,7 +35,23 @@ Exit tests `tests/test_v2_skill.py`:
 
 Existing suite gate: 7 red, exactly plugin/04's list — `tests/test_repro_fixplaybooks_lifecycle.py` ×3 (`test_publish_success_carries_verified_readback`, `test_approved_then_regated_same_payload_trips_loop_guard`, `test_manifest_set_does_not_flip_live`), `tests/test_repro_fixplaybooks_runtime.py` ×4 (`test_interrupted_run_survives_restart_instead_of_failing`, `test_wait_for_approval_actually_gates`, `test_wait_for_event_actually_waits`, `test_tool_step_timeout_is_enforced`). None flipped. `_StubRunner` (lifecycle `:38-44`, manifest_drift) still imports and builds tools — the python dispatch needs no runner attribute at construction. `tests/test_v2_format_tools.py`: the "not available yet" python dry-run pin rewritten to the v2 shape (assertions strengthened, none removed); no skip/xfail added, no test deleted. No rider (`LANGUAGE_CHEATSHEET`/`LANGUAGE_MINIREF`/`references`) attaches on the python dry path.
 
-Bench (Steps 9-11): NOT run in this part. Step 9 (side-load / `run.json.plugin_versions["plugin-playbooks"] == "0.49.0"`), Step 10 (dojop/01 `authoring-stateful-queue-v2`, `editing-cross-cutting-v2`, `authoring-within-budget`, `--trials 5`) and Step 11 (STOP RULE) are handed to the bench agent; the dojop/01 `summary.md` verdict block is to be appended below this line when it exists. Cross-repo checks (dojoP twin task existence, luna) not performed. Until then: **VERDICT: pending** — plugin/06 is not unblocked.
+Bench (Steps 9-11): NOT run in this part. Step 9 (side-load / `run.json.plugin_versions["plugin-playbooks"] == "0.49.0"`), Step 10 (dojop/01 `authoring-stateful-queue-v2`, `editing-cross-cutting-v2`, `authoring-within-budget`, `--trials 5`) and Step 11 (STOP RULE) are handed to the bench agent; the dojop/01 `summary.md` verdict block is to be appended below this line when it exists. Cross-repo checks (dojoP twin task existence, luna) not performed. Outcome (appended below by the bench agent): verdict stop — plugin/06 is not unblocked.
+
+### dojop/01 bench verdict (copied verbatim from dojoP `plans/0002-fix-playbooks-bench/phases/01-v2-twin-tasks-and-go-no-go/execution_summary.md`)
+
+Run `results/0059-run` (hermetic, `--trials 5 --tags fix-playbooks --ids playbooks.authoring-stateful-queue-v2,playbooks.editing-cross-cutting-v2,playbooks.authoring-within-budget`; 2026-09-07T23:06:21Z → 23:17:26Z, 665 s). Build under test: plugin-playbooks working tree at `6f49a97` (v2-runtime), loaded from the `LUNA_PLUGIN_SET_DIR` image-set `~/.luna/bench-set-0002-01` — `run.json plugin_versions["plugin-playbooks"] = "0.49.0"`, `plugin_upgrades = {"ok": true, "upgraded": [], "errors": [], "skipped": []}`, serve.log `plugins.winner_load_failed` 0 hits (the `plugins.source_winner` INFO line is dropped by alembic's root-WARN `fileConfig`; `resolve_plugin_winners` reproduced server-free: winner image-set 0.49.0, loser managed 0.46.0). luna `fix-playbooks` at `ecff9cd`; judge claude-haiku-4-5-20251001 (advisory).
+
+| task | n | c | pass^5 | pass^2 | class | tool_calls_mean | failing_checks | 0055 (n, c, pass^2) |
+|---|---|---|---|---|---|---|---|---|
+| playbooks.authoring-stateful-queue-v2 | 5 | 5 | 1.0 | 1.0 | reliable | 1.0 | — | 2, 1, 0.0 |
+| playbooks.editing-cross-cutting-v2 | 5 | 0 | 0.0 | 0.0 | broken | 2.1 | `playbook_edit|playbook_agent args match /ctx\.gather\(/` (turn 2, 5/5) | 2, 2, 1.0 |
+| playbooks.authoring-within-budget | 5 | 5 | 1.0 | 1.0 | reliable | 1.0 | — | not in 0055 |
+
+Rule applied: k=5 (the run's own `pass_hat_k`), pass^2 restated — same outcome under both. `playbook_validate` calls: 0 in all 15 trials; edit-turn tool calls 2, 2, 2, 2, 5; no hard timeouts. editing-v2 failure: all five edit bodies implement "4 at a time" as sequential slicing (`for i in range(0, len(entries), 4): batch = entries[i:i + 4]; for entry in batch:`), no `ctx.gather(` — the turn-1 seed is a pure-compute loop with nothing to gather (task-design finding for luna-fixer's re-plan; task not edited).
+
+VERDICT: stop — authoring-stateful-queue-v2 beat 0055 (5/5, pass^5 1.0 and pass^2 1.0 vs 0055's n=2 c=1 pass^2 0.0) and authoring-within-budget is reliable (5/5), but editing-cross-cutting-v2 did not beat 0055 (0/5, pass^5 0.0 and pass^2 0.0 vs 0055's n=2 c=2 pass^2 1.0; sole failing check `ctx\.gather\(` on turn 2 in all five trials) — no P2 work (plugin/06, luna/02, M2) until luna-fixer re-plans in test-report.md.
+
+dojoP commit: `512b1a53ce63933c4e6a595ce800fd4265e62d4b` (origin/main, subject `0002/01: v2 twin tasks and go/no-go`, verdict stop).
 
 ## Deviations from this plan
 1. Comparison on a placeholder does not raise: `<`, `<=`, `>`, `>=` return `True` and `in` returns `True` (`v2/dry.py:181-199`). Required by this phase's own exit test — doc example 1 (`r["score"] > 3`) must dry-run to `simulated` with `stubs={}`. Arithmetic, `int()`, `float()`, index still raise `DryStubError`. §Scope item 1 and Risks 6 said "arithmetic/comparison"; the exit test won. Documented in `docs/v2.md` §10.
