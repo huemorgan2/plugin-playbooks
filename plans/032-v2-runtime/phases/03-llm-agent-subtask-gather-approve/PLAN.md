@@ -1,7 +1,7 @@
 # 032 — Phase 03: Effects: ctx.llm, ctx.agent, ctx.subtask, ctx.gather, ctx.approve (in-process form)
 Status: pending
 Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §2 Language (effect contracts, `Rejected`/`ApprovalExpired`, `failed_handled` + its hoisting exclusion), §2 Execution model, §2 Effect execution semantics, §2 Sub-agents, §2 Lifecycle (`result` column), §3 P1; master phase M1
-Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0 — 0.47.0 since phase 00's 18b9ebe). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
+Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0 — 0.47.0 since phase 00's 18b9ebe; phase 01 landed as 0f61ba6 with `plugin_playbooks/v2/__init__.py` (`CTX_EXCEPTIONS` incl. `SubtaskFailed`, `APPROVE_RESULT_KEYS`) and `v2/checker.py`). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
 Depends on: plugin/01 (checker admits `ctx.llm/agent/subtask/gather/approve`, rejects `ctx.wait_event` and `ctx.sleep`), plugin/02 (host segment loop in `v2/loop.py`, in-memory `JournalStore` in `v2/journal.py`, shim exit/replay in `v2/shim.py`, `ctx.tool`, the `ctx.EffectError` family)
 Unblocks: plugin/04, plugin/05 (dry stubs for these kinds), plugin/07 (park form of `ctx.approve`), plugin/08 (persisted subtask `result`, `failed_handled` hoisting exclusion)
 
@@ -98,7 +98,8 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   finished run's `LoopResult.value` in a per-instance dict keyed by run id
   and the parent pops it after `start_run` returns (one `SegmentLoop` per
   `PlaybookRunner`, so parent and child share the dict); the entry records
-  `child_run_id`. Child failure (row `failed`, no value) → `EffectError`
+  `child_run_id`. Child failure (row `failed`, no value) → `ctx.SubtaskFailed`
+  (phase 01: the `EffectError` subclass in `CTX_EXCEPTIONS`, docs/v2.md §2/§4 — so `except ctx.EffectError` still catches it)
   carrying the child's `run.error` text and run id. Cycle guard: the loop
   carries the ancestor playbook-name chain per run id (parent chain + own
   name, handed to the child before `start_run`); a target already in the
@@ -249,7 +250,7 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
 6. Subtask: `start_run=` injected into `SegmentLoop`, child run through
    `start_run` → `_create_run` → `_drive_run`'s v2 branch (awaited
    in-process), the per-run value dict, ancestor chain + cycle guard,
-   child failure → `EffectError`; `_timeout` (when given) as a host-side
+   child failure → `ctx.SubtaskFailed` (phase 01); `_timeout` (when given) as a host-side
    deadline over the `start_run` task with the deadline-expired flag
    (Scope, Risks 12). Done when: exit tests 8-11 pass, the `subtask` case
    of exit test 17 passes, and `active_run_id()` inside the parent's next
@@ -362,7 +363,8 @@ Tests and assertions:
 10. `test_subtask_child_failure_is_catchable`: child raises
     `ValueError("boom")`; parent `except ctx.EffectError as e: return
     str(e)` → run `done`, return value contains "boom" and the child run
-    id; entry `failed_handled`; child row `failed`.
+    id; entry `failed_handled` with error type `SubtaskFailed` (phase 01:
+    the raised class is `ctx.SubtaskFailed`); child row `failed`.
 11. `test_subtask_unknown_playbook_uses_v1_message`: error text
     `"Subtask playbook 'nope' not found"`, entry `failed`, run `failed`.
 12. `test_approve_blocks_until_decided` (v2 twin of
@@ -375,7 +377,11 @@ Tests and assertions:
     "plugin-playbooks"`, `payload["run_id"] == str(run.id)`,
     `payload["seq"] == 1`, `presentation["changes"]` non-empty; decide
     `approved` → run `done`, `"fast" in calls`, effect result
-    `{"approved": True, ...}`.
+    `{"approved": True, ...}` and `set(entry["result"]) ==
+    plugin_playbooks.v2.APPROVE_RESULT_KEYS` (phase 01: `{approved,
+    request_id, reason, decided_by}` — the shim half of the doc↔runtime
+    sync; `tests/test_v2_contract_doc.py::test_doc_approve_result_keys_match_constant`
+    is the doc half).
 13. `test_approve_rejected_raises_ctx_rejected_catchable`: decision
     `_Decision("rejected", reason="no")`; code `except ctx.Rejected as e:
     return f"rejected: {e}"` → run `done`, return value contains "no",

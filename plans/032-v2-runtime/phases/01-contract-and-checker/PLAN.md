@@ -1,5 +1,5 @@
 # 032 — Phase 01: v2 contract doc, static checker and format sniff
-Status: pending
+Status: done
 Master: §2 "Language" (effect table, exceptions, underscore options, gather/retry/handled-failure rules, ctx.sleep deferred), §2 "Static checker", §2 "Error contract", §2 "Prompt surface", §2 "Properties", §2 "Dry run" (documented here, implemented in plugin/05), §3 P1 "Write docs/v2.md"; master phase M1
 Repo / branch: plugin-playbooks `v2-runtime` (code HEAD 8c31a60 at writing, plus the plan-only commit 5306f7f; phase 00's commit lands first)
 Depends on: plugin/00 (M0 gate — its `execution_summary.md` exists; the suite baseline is the count recorded there)
