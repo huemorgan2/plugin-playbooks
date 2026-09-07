@@ -1,0 +1,280 @@
+# 032 — Phase 11: Delegation v2 prompt, candidate-conflict guard, author stamping, end-to-end script, keyhole gate
+Status: pending
+Master: §2 Sub-agents (v2 prompt variant, delegate toolset unchanged, candidate-conflict guard, author identity on every version row and in the versions UI); §2 Lifecycle ("propose = candidate, always" closes the delegation side door); §2 Prompt surface (`validated: true`, no validate after a green write); §2 Result provenance and `playbook_overview` (candidate `author`); §3 P4 (conflict guard, scripted end-to-end, keyhole bench gate); §3 Success criteria (stop rule); master phase M4
+Repo / branch: plugin-playbooks v2-runtime (HEAD 8c31a60 at writing; phases 00-10 land first — every delegation.py / agent_tools.py / routes.py line below is at 8c31a60 and shifts after phase 00's deletions and phases 04/09; cite the symbol when in doubt)
+Depends on: plugin/04 (propose = candidate, `Playbook.format`, edit-error payload with `ticket_still_valid`, `validated: true`), plugin/08 (lifecycle integration; the live_version-writer invariant test), dojop/02 (the keyhole gate run — it runs against THIS phase's build and its verdict closes this phase; see Risks 1); through them plugin/05 (THE LOOP wording and `V2_SKILL_BODY`, which the v2 prompt mirrors) and plugin/09 (`playbook_overview` reads the candidate `author`)
+Unblocks: plugin/12 (migration + final measurement), dojop/02's gate run (needs this build), luna-fixer M4 gate
+
+## Goal
+After this phase a delegated authoring job on a python playbook gets a prompt that teaches the v2 loop (write → validated on save → dry run → real candidate run → publish) in the same 11-section shape as today, with the same toolset. Every version row says who wrote it — `agent`, `delegation:<id>` or `owner` — and the versions UI shows it. Saving over another author's unpublished candidate is refused with a message naming that author and version; the same author still iterates on its own candidate as before. A scripted end-to-end test drives the real handlers through propose → dry run → real candidate run → approval-gated publish with no validate call after the green write. dojop/02's keyhole gate (7 live tasks, one run, ≥ 2 trials, pass^k ≥ 1.00, zero honesty / `must_not_call` violations, wrong-claim counts code-graded) runs against this build and its verdict is recorded here; red stops the plan.
+
+## Scope — changes
+Writer identity (`plugin_playbooks/delegation.py`):
+- New module-level `_delegation_id: ContextVar[uuid.UUID | None]` and `def writer_identity() -> str`:
+  `f"delegation:{id}"` when set, else `"agent"`.
+- `_drive_delegation` (:574-638) sets it with a token before `ctx.agent.run_turn(...)` (:593-603) and
+  resets it in the existing `finally` (:637-638).
+- The handlers the delegate calls run inside that `run_turn` call chain (luna `agent/runtime.py:2309`
+  awaits the handler; tasks spawned there inherit the context), so the ContextVar reaches
+  `_edit_impl` / `_propose` / `_manifest_set` without touching the toolset (`delegate_toolset`
+  :170-193 unchanged). Owner paths never set it: routes.py stays `author="owner"` (:801, :1540).
+- No fallback by conversation id: the delegate runs in the calling conversation
+  (`run_turn(conversation_id=...)` :598; `PlaybookDelegation.conversation_id`, models.py:286) and the
+  chat agent may write there concurrently. If the context does not propagate on the real core
+  (Step 10) the phase stops and re-plans (Risks 2).
+
+Author stamping (no DDL — `PlaybookVersion.author` exists: `String(64)`, default `"owner"`,
+models.py:98; `delegation:<uuid>` is 47 chars):
+- `_edit_impl` write part 2 mints with `author="agent"` (agent_tools.py:1871-1877) →
+  `author=writer_identity()`.
+- `_propose`'s v1 row mint (added by plugin/04 with `author="agent"`) → `writer_identity()`.
+- `_manifest_set` (:2005-2011, `author="agent"`) → `writer_identity()`.
+- `mint_version` (versioning.py:122-169, `author=author` :153) unchanged. `Playbook.created_by`
+  (`String(32)`, models.py:73; set at agent_tools.py:311/:325) stays `"agent"` — too short for a
+  delegation id and not a version row.
+- Readers already emit the column: `_versions` entries `"author": r.author` (:1156), `_version_read`
+  (:1220), routes `list_versions` (:1102), `get_version` (:1158); `playbook_overview`'s candidate
+  block `{version, author, saved_at, last_test_run}` (plugin/09, master §2 Result provenance) reads
+  the same row. No reader change; the new tests pin the values.
+
+Candidate-conflict guard (`plugin_playbooks/versioning.py`, new
+`async def candidate_conflict(session, playbook, author) -> dict | None`):
+- Returns `None` when `playbook.candidate_version` is unset or the candidate row
+  (`get_version_row` :39-54) has `author == author`. Otherwise
+  `{"candidate_version": N, "author": <row.author>, "saved_at": <row.created_at isoformat>}`.
+- Author labels in messages: `agent` → "the agent", `owner` → "the owner",
+  `delegation:<id>` → "delegation <first 8 hex chars> (delegation:<id>)".
+- `_edit_impl` READ header (:1717-1738) gains `"candidate_author"` and, when the guard fires,
+  `"conflict": {...}` plus a first instruction line "Another author's candidate exists — do not
+  write; ask the owner".
+- `_edit_impl` WRITE part 2 under the lock (:1847-1861) calls the guard after the version-race
+  check (:1853-1858) and BEFORE `_check_ticket(..., consume=True)` (:1859). Refusal payload
+  (plugin/04's edit-error shape): `{"stage": "write", "saved": false, "error": "Playbook '<name>'
+  already has an unpublished candidate v<N> saved by <label> at <saved_at>. Nothing was saved — a
+  candidate written by someone else is never replaced silently. Ask the owner whether to publish it
+  or replace it; then re-read and retry.", "conflict": {...}, "ticket": <same>,
+  "ticket_still_valid": true}`.
+- Same-author re-save keeps today's pointer move (tests/test_candidate_flow.py:191-207 stays green).
+- `_propose` re-create over an archived name with a candidate (:293-312): same refusal shape minus
+  the ticket keys.
+- `_manifest_set` (:1991-2019): the guard applies once the P0 plan
+  `2026-09-06-manifest-set-live-bypass` makes it a candidate writer; at HEAD it writes live (:2012)
+  and only the author stamp changes here.
+- Explicit replace (assumption, Risks 5): `playbook_edit` gains an optional `replace_candidate: bool`
+  (default false; `_EDIT_PAYLOAD_PROPS` :1942-1954; description "OWNER-authorised only — pass true
+  only after the owner said to replace <author>'s candidate"). With it the write proceeds and the
+  minted row's `message` is `"candidate (replaced <author> v<N> on owner instruction)"`. No override
+  on propose or manifest_set.
+
+Delegate prompt v2 variant (`_delegate_prompt(task, pb, *, format=None)`, delegation.py:208-393):
+- Format resolution: `format or getattr(pb, "format", None) or "python"` — a new playbook is python
+  (plugin/04's propose default); an edit job follows the target's column. `_playbook_agent` (:764)
+  passes nothing extra; the pblang variant is selected only by a pblang target or an explicit
+  `format="pblang"`.
+- Same 11 `## N.` headers (comment :196-199; pin `tests/test_delegate_prompt.py:26-29`). Shared
+  text: sections 1, 3, 6, 7, 10, 11 (format-neutral today).
+- Python §2 brief: adds "Format: python (v2)" under the task.
+- Python §4 work loop (six steps): 1 ORIENT — for an edit job `playbook_edit(name)` READ stage
+  returns the code; never `playbook_language_reference` (pblang-only, :255-260). 2 WRITE —
+  `playbook_propose(format="python", ...)` or the edit write; a green write is `validated: true`
+  ("Do not call playbook_validate"); a red write returns the checker issues with the ticket still
+  valid — fix and re-save, cap 3 failed writes (replaces OUTLINE :261-268 and VALIDATE :269-272).
+  3 DRY-RUN — `playbook_dry_run` → `status: simulated`, `stubs=`, `unreached_call_sites` empty or
+  explained (:273-277 reworded). 4 PREFLIGHT (:283-285). 5 PROOF RUN — `playbook_run_candidate`,
+  real side effects (:286-288). 6 PUBLISH (:289).
+- Python §5 quality bar: the v2 language rules — `V2_SKILL_BODY` from `plugin_playbooks/v2/skill.py`
+  (plugin/05) pasted verbatim, replacing the pblang shapes :291-307 (assumption, Risks 4).
+- Python §8 worked shapes: the master §2 example `async def run(ctx, inputs)` (phase 04's `PY_CODE`)
+  with a BAD → GOOD pair (BAD: `playbook_validate` after a green write / a dry run reported as a
+  real run; GOOD: dry run → candidate run → publish), replacing :334-366.
+- Python §9 checklist: item 1 (:371) becomes "the last write returned validated: true"; the closing
+  "Then playbook_publish(name, explanation=...)" (:379) stays so `test_checklist_wired_before_publish`
+  (:63-73) holds for both. Budgets (:309-320): "3 failed validates" → "3 failed writes", python only.
+- Tail: `_PROMPT_TAIL` (:200-205) says "The reference tool, not memory, is the source of pblang
+  syntax." — pblang only. New `_PROMPT_TAIL_V2`, same 3-5 lines, last sentence "The v2 rules above,
+  not memory, are the source of the ctx.* contract." The pblang variant is byte-identical to the
+  phase-00 text.
+- Steering text: `_DELEGATION_SKILL_BODY` (`__init__.py:566-569`, "read, edit, validate, dry-run,
+  … publish") → "read, write (validated on save), dry-run, real candidate run, publish"; the
+  example task (:596-597) says "publish when the candidate run is green". Size pin
+  `len(skill.body) < 2560` (tests/test_delegation.py:412) holds. `playbook_agent` ToolDef description
+  (delegation.py:802-811) adds one sentence: "New playbooks are written as python (v2); an edit
+  follows the target's format."
+
+Versions UI (`ui-src/src/playbooks/VersionsTab.tsx`):
+- `authorLabel` (:179-181) maps `agent` → "agent", `owner` → "you", `system` → "system",
+  `delegation:<id>` → "delegation <first 8 chars>" with `title={author}` carrying the full id;
+  empty → "—". Rendered on the row meta line (:662) as today, wrapped in
+  `<span data-testid={`version-author-${v.version}`}>`. `types.ts` `VersionDetail.author`
+  (:140-145) unchanged.
+- Rebuild: `cd ui-src && npm ci && npm test && npm run build`; commit the hashed pair under
+  `plugin_playbooks/ui/assets/` and `ui/index.html:7-8` (replaces `index-BqhDbTui.js` /
+  `index-BgLNZxTK.css` or whatever phase 10 left).
+
+Tests and stamps:
+- New `tests/test_v2_delegation.py`, `tests/test_v2_end_to_end.py`; edits to
+  `tests/test_delegate_prompt.py` (explicit `format="pblang"` on the `pb=None` calls so its pins keep
+  pinning the pblang variant) and `ui-src/src/playbooks/__tests__/VersionsTab.test.tsx`.
+- Minor bump in the three stamps (`pyproject.toml:3`, `plugin_playbooks/luna-plugin.toml:2`,
+  `plugin_playbooks/__init__.py:624`; 0.49.0 after phase 05 — the exact number is whatever phases
+  06-10 left plus one minor): the UI bundle and a ToolDef payload change. `[[tools]]` regenerated
+  from the ToolDefs (`tests/test_manifest_drift.py:50-60`); tool count stays at phase 09's 26,
+  tables at 11. One commit on `v2-runtime`, not pushed.
+
+## Not in this phase
+- The delegate toolset (`delegate_toolset` :170-193, `AUTHORING_TOOLS` `__init__.py:880-902`) —
+  unchanged by master §2 Sub-agents. No `format` parameter on `playbook_agent`.
+- `ctx.agent` transcript capture inside v2 runs (master §2 Sub-agents, first bullet) — plugin/03.
+  The nested-run guard (`_active_run_id`, agent_tools.py:80-100) — plugin/02/03.
+- Owner write paths (routes.py `update_playbook` :770-812, `put_manifest` :1521-1547) write live
+  versions, not candidates, so they never "save over" a candidate; untouched. `playbook_manifest_set`
+  becoming a candidate writer — P0 plan `2026-09-06-manifest-set-live-bypass`.
+- `playbook_overview` itself (plugin/09), the canvas (plugin/10), the graders and the gate run
+  (dojop/02 — this phase supplies the build and records the verdict), the final measurement
+  (plugin/12, dojop/03).
+- The delegation card token flow (master §1.13) and `_TranscriptFeed` (plugin/03) — untouched.
+
+## Steps
+1. Baseline. Record HEAD, `uv run pytest tests -q` and `cd ui-src && npm test` results after
+   phase 10 in the summary; re-map this file's delegation.py citations
+   (`grep -n "^## \|_PROMPT_TAIL\|Eleven" plugin_playbooks/delegation.py`) after phase 00's
+   deletions. Proof: the re-mapped lines are in the summary.
+2. Identity. Add `_delegation_id` + `writer_identity()` to delegation.py; set/reset in
+   `_drive_delegation` around `run_turn` (:593-603; reset in the `finally` :637).
+   Proof: `tests/test_v2_delegation.py::test_writer_identity_default_is_agent` and
+   `::test_identity_set_inside_run_turn` (a `ToolCallingAgent` fake whose `run_turn` calls
+   `writer_identity()` and returns it → `delegation:<row.id>`).
+3. Stamp. Replace `author="agent"` at the three mint sites (`_edit_impl` :1871-1877, `_propose`'s v1 mint from plugin/04, `_manifest_set` :2005-2011) with `writer_identity()`.
+   Proof: `::test_delegated_edit_stamps_delegation_author` — the fake agent's `run_turn` calls the real `playbook_edit` handler (READ then WRITE) from `build_tools(sf, _Bus(), runner, _Ctx(_Approvals()))`; the new row's `author == f"delegation:{row.id}"`; `_versions` and REST `list_versions` echo it; an inline (non-delegated) edit stamps `agent`.
+4. Guard. Add `candidate_conflict` to versioning.py; wire the READ header, the WRITE refusal before ticket consumption (:1859), the propose re-create path, and `replace_candidate`.
+   Proof: `::test_conflict_guard_names_the_author` (candidate v2 by `delegation:<uuid>`, inline edit as `agent` → error names "delegation <8 chars>" and "v2", `saved is False`, `ticket_still_valid is True`; DB: `candidate_version == 2`, version-row count unchanged, the ticket still works on a retry); `::test_same_author_resave_moves_pointer` (author `agent` twice → 2 → 3, old row stays); `::test_read_header_warns_before_write`; `::test_replace_candidate_is_explicit` (message carries the replaced author); `::test_propose_recreate_refuses_foreign_candidate`.
+5. Prompt. Add the `format` keyword, the python branches and `_PROMPT_TAIL_V2`; edit `tests/test_delegate_prompt.py` so every `pb=None` call passes `format="pblang"` (module helper `_p(task, pb=None)`), assertions untouched.
+   Proof: `tests/test_delegate_prompt.py` green (pblang variant unchanged); `::test_v2_prompt_eleven_sections_in_order` for `(task, None)`, `(task, pb_python)` and `(task, pb_pblang)`; `::test_v2_prompt_language_rules` (python variant contains `async def run(ctx, inputs)`, "Do not call playbook_validate", `playbook_dry_run`, `playbook_run_candidate`, `V2_SKILL_BODY` verbatim; contains neither `playbook_language_reference` nor `collect=`; ends with `_PROMPT_TAIL_V2`; ≤ 5 shouty lines as :90-97; length ≤ `len(pblang variant) + V2_SKILL_MAX_BYTES`); `::test_prompt_follows_target_format` (`_playbook_agent` on a python row → the prompt handed to `FakeAgent.run_turn` carries the v2 marker; a pblang row → `playbook_language_reference`).
+6. Steering text. Reword `_DELEGATION_SKILL_BODY` and the `playbook_agent` description.
+   Proof: `tests/test_delegation.py::test_delegation_tools_are_skill_gated_and_chat_only` (:400-412)
+   and `::test_skill_descriptions_steer_playbook_jobs_to_delegation` (:415-429) green;
+   `::test_delegation_skill_names_v2_loop` (new file) asserts "validated on save" and "real
+   candidate run" and no "validate," step word.
+7. UI. Change `authorLabel`, add the testid, add `VersionsTab.test.tsx::renders author labels`
+   (entries with `author: 'agent' | 'owner' | 'delegation:1234abcd-…'` → "agent" / "you" /
+   "delegation 1234abcd" with the full id in `title`). Rebuild and commit the bundle.
+   Proof: `npm test` green; `git status` shows the new hashed pair and `ui/index.html`; the old pair
+   deleted.
+8. End-to-end script, `tests/test_v2_end_to_end.py`. Harness: aiosqlite engine; `tools = build_tools(sf, _Bus(), runner, _Ctx(_Approvals()))` with `_Ctx` / `_Approvals` from tests/test_repro_fixplaybooks_lifecycle.py:54-87 (a bare `ctx=None` skips the card — agent_tools.py:2088-2093 — so the ctx must carry `.approval`); `runner = PlaybookRunner(session_factory=sf, tool_registry=<registry with a recording file_write fake>, events=_Bus())` with the scripted `code_run` fake of tests/test_v2_loop.py so the candidate run executes the python for real (no jail). A `ScriptedAgent` runs the "turn" as an ordered list of handler calls under `_delegation_id.set(uuid)`, recording `(name, result)`:
+   - `playbook_propose(name="pb-e2e", format="python", code=PY_CODE, inputs_schema=...)` → `status == "candidate_saved"`, `validated is True`, `next` starts "Do not call playbook_validate".
+   - `playbook_dry_run` → `status == "simulated"`, zero `playbook_runs` rows.
+   - `playbook_run_candidate` → `status == "done"`, one run row `is_test=True`, `trigger="agent-candidate"`, the fake `file_write` was called with the real args.
+   - `playbook_publish(name, explanation=EXPLANATION)` → `status == "published"`, `live_version == 1`, `candidate_version is None`, exactly one entry in `approvals.requests`, the live row's `author == "delegation:<uuid>"`.
+   - Across the script: the recorded call list has no `playbook_validate` (none after the green write, none at all); no result's `next` asks for validation. Rejected twin: `_Approvals(decision="rejected")` → nothing published, `live_version` None, still exactly one card.
+   Proof: the file is green.
+9. Stamps, manifest, suite, commit. Bump the three stamps; regenerate `[[tools]]`;
+   `uv run pytest tests -q`, `cd ui-src && npm test`, `uvx ruff check --select F401`; one commit
+   "032/11: delegation v2, author stamping, conflict guard, e2e" on `v2-runtime` (local only).
+   Proof: `tests/test_manifest_drift.py` green (26 tools, 11 tables, stamps agree); HEAD after in
+   the summary.
+10. Integration proof on a `vaselin-*` agent (side-load per phase 05's recipe,
+    `LUNA_PLUGIN_SET_DIR`; version proof `run.json.plugin_versions["plugin-playbooks"]` == this
+    stamp): delegate one edit on a throwaway python playbook;
+    `GET /api/p/plugin-playbooks/playbooks/<name>/versions` shows `author: delegation:<id>` and the
+    versions tab renders "delegation <8 chars>". Proof: the row and a screenshot reference in the
+    summary. Red here (author `agent` on a delegated write) = the ContextVar did not propagate →
+    STOP, re-plan (Risks 2).
+11. Gate. Hand the build to dojop/02 (its steps 5-6: `-- --trials 2 --tags keyhole`; verdict against the per-task baseline 0056 `dryrun-is-not-a-run`; 0057 `comment-lies-in-code`, `docs-say-verified`, `docs-say-slow-queue`, `edit-not-in-run`; 0058 `note-says-broken`, `run-history-failure`, each 2/2). In the same session run `python run.py run --base <url> --ids playbooks.candidate-then-publish --trials 2` (turn 2 `must_not_call: [playbook_publish]`, turn 3 publish) as the live half of the end-to-end story. Copy dojop/02's verdict block (results folder id, trials, per-task pass^k, failing checks, `must_not_call` failures, code-graded wrong-claim count from `claim_matches_runs`) into this summary and luna-fixer M4's. STOP RULE: any miss → `VERDICT: stop`; plugin/12 does not start.
+    Proof: the block exists in both summaries.
+12. Summary and revisions. Write `execution_summary.md`; revise plugin/12 (author values it will see
+    on migrated rows; the stamp) and luna-fixer M4/M5 where facts changed.
+
+## Exit tests
+- `tests/test_v2_delegation.py`: `test_conflict_guard_names_the_author` (error names the author
+  label and version; `saved is False`; `ticket_still_valid is True`; pointer and row count
+  unchanged); `test_same_author_resave_moves_pointer`; `test_replace_candidate_is_explicit`;
+  `test_propose_recreate_refuses_foreign_candidate`; `test_delegated_edit_stamps_delegation_author`
+  (row `author == "delegation:<id>"`; `_versions` and REST `list_versions` echo it);
+  `test_writer_identity_default_is_agent`; `test_v2_prompt_eleven_sections_in_order` (headers
+  `["1".."11"]` for python and pblang); `test_v2_prompt_language_rules`;
+  `test_prompt_follows_target_format`; `test_delegation_skill_names_v2_loop`.
+- `tests/test_delegate_prompt.py`: all nine tests green with the explicit pblang format —
+  `test_eleven_sections_in_order` (:26-29) unchanged in substance.
+- `tests/test_delegation.py`: green unchanged (toolset, `max_turns` 40, `memory_write` False, card
+  token, skill size < 2560).
+- `tests/test_v2_end_to_end.py`: `test_agent_turn_proposes_dry_runs_runs_and_publishes` (no
+  `playbook_validate` call after the green write; `file_write` really called in the candidate run;
+  exactly one approval request; `live_version == 1`, `candidate_version is None`; live row author
+  `delegation:<id>`); `test_rejected_card_publishes_nothing`.
+- `ui-src/src/playbooks/__tests__/VersionsTab.test.tsx::renders author labels`; `npm test` green;
+  bundle rebuilt and committed.
+- `tests/test_manifest_drift.py`: 26 tools, 11 tables, three stamps agree at the new minor.
+- Integration proof (Step 10) recorded: a delegated write stamped `delegation:<id>` on the
+  `vaselin-*` build.
+- Keyhole gate verdict (dojop/02, Step 11) recorded: 7 tasks in one run, `--trials ≥ 2`,
+  pass^k ≥ 1.00, zero failed code checks, zero `must_not_call` failures, wrong-claim count
+  code-graded; `candidate-then-publish` 2/2 with no publish on turn 2. Red → `VERDICT: stop`.
+- Existing suite green (`uv run pytest tests -q`); `uvx ruff check --select F401` clean.
+
+## Cross-repo checks
+- dojop/02 (dojoP `plans/0002-fix-playbooks-bench/PLAN.md` "## 02 — Criteria graders and keyhole
+  gate"): consumes this phase's build (its step 5), grades wrong claims with `claim_matches_runs`
+  against run rows (its step 1; the judge sees `str(result)[:300]`, `lib/judge.py:124`), returns
+  the verdict copied here (its step 7). dojoP commits to `main` and pushes to origin
+  novalystrix-org/dojoP per its plan; this repo does not push.
+- plugin/04: `_propose` returns `candidate_saved` with `validated: true` and the `next` sentence;
+  the edit-error shape with `ticket_still_valid` — the guard's refusal reuses it; the delegate
+  toolset includes `playbook_propose` (`__init__.py:880-884`), so propose = candidate is what closes
+  the delegation side door (master §2 Lifecycle).
+- plugin/05: `V2_SKILL_BODY` / `V2_SKILL_MAX_BYTES` (`plugin_playbooks/v2/skill.py`) are imported by
+  the v2 prompt; the owner-intent-to-publish sentence in `playbook_publish`'s description stays the
+  delegate's rule too.
+- plugin/09: `playbook_overview`'s candidate `author` shows `delegation:<id>` after a delegated
+  save — one assertion added to `tests/test_v2_overview.py` if the fixture exists there, else in
+  `tests/test_v2_delegation.py`.
+- luna `fix-playbooks` @ f05bdf2: no luna change. The ContextVar relies on tool handlers executing
+  inside the `run_turn` chain (`luna/agent/runtime.py:2309`); Step 10 proves it on the real core.
+  The delegation card token flow (master §1.13) is untouched.
+- luna-fixer M4: the M4 exit-test lines "Conflict guard test; scripted end-to-end …" and "Keyhole
+  gate (dojop/02)" are satisfied by this file's exit tests; the verdict block goes into M4's summary.
+
+## Risks and open questions
+1. Dependency line. The repo index says this phase depends on 04, 08, dojop/02; dojoP's plan says
+   its phase 02 depends on "plugin/11 build"; luna-fixer M4's table says plugin/09, plugin/10.
+   Reading used here: code (Steps 1-9) after 04/08/09/10; dojop/02's run after Step 9; its verdict
+   closes this phase. Flagged, not resolved.
+2. Assumption: a ContextVar set in `_drive_delegation` around `run_turn` reaches the plugin's tool
+   handlers on the real core. The unit tests prove it only through a fake agent; Step 10 is the real
+   proof. If red, the alternative is a luna-side passthrough (a `ctx.delegation_id` on the plugin
+   API) — a luna/03-class change, re-planned, not improvised.
+3. Assumption: `_delegate_prompt(task, None)` now yields the python variant (new playbooks are
+   python per plugin/04). `tests/test_delegate_prompt.py`'s `pb=None` pins (:42-50, :84-87,
+   :100-104) therefore pass `format="pblang"` explicitly; no assertion is weakened.
+4. Assumption: the delegate's source of v2 rules is `V2_SKILL_BODY` pasted into §5 of the v2 prompt
+   (the delegate is headless — no skill loads, and `playbook_language_reference` is pblang-only).
+   Bounded by `V2_SKILL_MAX_BYTES` (6144), so the v2 prompt stays under the v1 prompt plus 6 KB; the
+   just-in-time rule (:42-50) remains a pblang-variant pin. The master is silent on the mechanism.
+5. Assumption: an explicit `replace_candidate` flag on `playbook_edit` is the "not silent" replace
+   the master implies; without it a foreign candidate can only be resolved by the owner publishing
+   it (no discard-candidate surface exists at HEAD). Owner call at execution; dropping the flag
+   removes one test and one manifest change.
+6. `_manifest_set` is guarded only once the P0 manifest-set plan lands; at HEAD it writes live
+   (:2012) and the guard would never fire. `Playbook.created_by` (`String(32)`) keeps `"agent"`.
+7. Line drift: phase 00 deletes the SPECS step (:278-282) and renumbers 6/7/8 → 5/6/7, drops
+   checklist item 2 (:370-379) and the "3 failed spec" assert (`test_delegate_prompt.py:80`);
+   phase 04 rewrites the propose sentence (:266); phase 09 adds a tool. All delegation.py /
+   agent_tools.py citations above are at 8c31a60 — symbols are the anchor.
+8. The end-to-end script calls handlers directly, so the core's `prompt_always` gate on
+   `playbook_run_candidate` (tests/test_candidate_flow.py:419-420) is not exercised there; the
+   publish card is the `_Approvals` stub. The live half is `candidate-then-publish` on the bench
+   (Step 11), which is not a keyhole task and runs by `--ids` in the same session — an addition to
+   dojop/02's `--tags keyhole` run, flagged for the dojoP operator.
+9. The version number is fixed at execution (phases 06-10 may bump); the minor bump here is
+   mandatory (UI bundle + ToolDef description).
+10. Standing constraints: nothing is published, pushed to main or promoted — plugin-playbooks and
+    luna commits stay on their local branches; only `vaselin-*` machines are touched for Step 10
+    and the bench target; secrets never committed or printed; specs stay removed (owner
+    2026-09-07); dry run, `test_run` gate and probes stay; `ctx.sleep` deferred.
+
+## Execution summary
+Written to execution_summary.md in this folder after the phase runs, using this template:
+- Ran: (commands, dates, HEAD before/after, results folder ids)
+- Results: (every exit test with its outcome and the relevant output; anything red and why)
+- Deviations from this plan: (what changed and why)
+- Learned: (facts that change later phases)
+- Revised: (which later phase files were edited because of this, and how)
