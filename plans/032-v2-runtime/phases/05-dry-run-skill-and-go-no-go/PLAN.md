@@ -1,6 +1,6 @@
 # 032 — Phase 05: Dry run on the same loop, the v2 skill, and the bench go/no-go
 
-Status: pending
+Status: done
 
 Master: §2 Dry run; §2 Prompt surface; §3 P1 (exit tests, "Bench go/no-go", STOP RULE); §3 Success criteria; master phase M1
 
