@@ -2,8 +2,8 @@
 
 Authoring moved to Python (pblang) and every API surface is JSON. The only
 YAML allowed in the package is the refusal shims that steer stale callers
-(undeclared `definition_yaml=` / `spec_yaml=` kwargs answered with a
-steering error, never a parse) and comments about them. This gate greps the
+(undeclared `definition_yaml=` kwargs answered with a steering error, never
+a parse) and comments about them. This gate greps the
 package so a YAML path can never quietly return.
 """
 
@@ -82,7 +82,6 @@ async def test_yaml_kwargs_steer_never_parse():
             ("playbook_propose", {"name": "x", "definition_yaml": "name: x"}),
             ("playbook_validate", {"definition_yaml": "name: x"}),
             ("playbook_edit", {"name": "x", "definition_yaml": "name: x"}),
-            ("playbook_spec_add", {"name": "x", "spec_yaml": "inputs: {}"}),
         ]:
             out = json.loads(await handlers[tool](**kwargs))
             assert "removed" in out["error"], (tool, out)

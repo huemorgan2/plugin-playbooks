@@ -24,27 +24,28 @@ be:
   The graph, not the model's mood, decides what happens next. Where a step needs
   judgment, the judgment is fenced inside that step; the shape of the run is
   fixed.
-- **Reliable.** A playbook that ran green yesterday runs green today. Specs
-  (dry-run behavioral tests) and probes (are its tools installed and answering)
-  hold the floor; the publish gate refuses anything that cannot prove itself.
+- **Reliable.** A playbook that ran green yesterday runs green today. A green
+  real test run of the exact candidate and probes (are its tools installed and
+  answering) hold the floor; the publish gate refuses anything that cannot
+  prove itself.
 - **Trusted in execution.** Trust is never a promise from the model — it is
   architecture, in Luna's spirit of *real approvals, not LLM promises*. Changes
   land as candidates, invisible to production. Only `publish` makes content
-  live, through machine-checked gates: validation → specs → a green test run of
-  that exact candidate → probes. The plan gate gives the owner one honest
+  live, through machine-checked gates: validation → a green test run of that
+  exact candidate → probes. The plan gate gives the owner one honest
   window per change — a plan row recording intent, one approval card showing
   plan and change together (`plans_full_power` may skip the card, never the
   row). The gates answer "is it safe?" mechanically; the owner is never asked
   to verify what a machine can verify.
 - **Traceable.** "Why did you do that?" always has an answer. Every run, every
-  version, every publish and rollback, every spec verdict is recorded and
+  version, every publish and rollback, every gate verdict is recorded and
   queryable — the database is the brain. History is symmetric: rollback goes
   through the same gate as publish, so the audit trail never has a gap.
 - **Able to improve over time.** Versioned, rollback-able, never
   self-destructive. Failures of live runs surface as fix proposals — Luna finds
   its own problems and proposes its own fixes; the owner decides once per
-  problem. Every improvement that survives becomes a spec, so quality only
-  ratchets forward. A playbook a year old should be *better* than the day it
+  problem. Every improvement that survives is proven by a real run before it
+  goes live, so quality only ratchets forward. A playbook a year old should be *better* than the day it
   was written, and provably so.
 
 ## The agent builds the playbooks
@@ -58,7 +59,7 @@ The **authoring subagent** (`playbook_agent`) is how that stays excellent. It is
 our way to buy clarity without overloading the main agent's context:
 
 - Authoring a good playbook is a craft — reading intent, decomposing, writing
-  pblang, validating, dry-running, spec-ing, passing the gates. Done in the
+  pblang, validating, dry-running, test-running, passing the gates. Done in the
   owner's conversation it floods the context with dozens of tool calls and
   drowns the assistant the owner was actually talking to.
 - The subagent runs the job in a **fresh, dedicated context** with a
@@ -90,8 +91,6 @@ dropped in the dojoP bench until it was reinstated — plans/020.)
 4. **The manifest read-stage + drift check** — intent in plain text, read
    before every edit; silent drift from intent is the root of trust rot.
    `playbook_edit_force` is the deliberate, visible override — keep it loud.
-5. **Specs as the regression floor** — the publish gate and `playbook_spec_run`
-   stay the same code path, so "specs pass" always means what the gate means.
 
 ## Principles for changes
 
@@ -101,6 +100,10 @@ dropped in the dojoP bench until it was reinstated — plans/020.)
 - **Move forward, not backward.** Undo mistakes, keep improvements. A removal
   needs the same evidence bar as an addition: bench proof the product is better
   without it.
+  - 2026-09-07: the specs feature was removed on the owner's decision
+    (luna-fixer `plans/2026-09-06-fix-playbooks/PLAN.md` §2 Specs removal);
+    the evidence bar is met after the fact by the P1 go/no-go and the P4
+    keyhole gate, both measured without specs.
 - **The bench is the referee.** Quality is measured by the dojoP playbooks
   suite (opt-in/opt-out, delegation, artifact quality), across models — green
   on one model while degrading others is not done.

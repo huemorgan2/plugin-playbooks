@@ -347,8 +347,7 @@ def test_mode_declarations():
     assert planning_ok == {
         "playbook_list", "playbook_status", "playbook_cancel",
         "playbook_get_definition", "playbook_validate",
-        "playbook_language_reference", "playbook_spec_list",
-        "playbook_spec_from_run", "playbook_preflight",
+        "playbook_language_reference", "playbook_preflight",
         "playbook_publish", "playbook_rollback",
         # plans/022 P4: coding-agent-grade reads are mode-free
         "playbook_versions", "playbook_version_read",
@@ -357,8 +356,7 @@ def test_mode_declarations():
     # everything else (draft authoring, runs, autonomy, acks) is
     # building-only by default — absent while the owner is planning.
     for name in ("playbook_propose", "playbook_edit",
-                 "playbook_manifest_set", "playbook_spec_add",
-                 "playbook_spec_delete", "playbook_spec_run",
+                 "playbook_manifest_set",
                  "playbook_dry_run", "playbook_run_candidate",
                  "playbook_run", "playbook_set_autonomy",
                  "playbook_ack_failures"):
@@ -370,14 +368,13 @@ def test_artifact_ref_declarations():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
     for name in ("playbook_propose", "playbook_edit",
                  "playbook_manifest_set", "playbook_publish",
-                 "playbook_rollback", "playbook_run_candidate",
-                 "playbook_spec_add", "playbook_spec_delete"):
+                 "playbook_rollback", "playbook_run_candidate"):
         assert getattr(tds[name], "artifact_ref", None) == "playbook:{name}", name
     assert getattr(tds["playbook_publish"], "artifact_verb", None) == "publishing"
     assert getattr(tds["playbook_run_candidate"], "artifact_verb", None) == "testing"
     # read/inspect tools never claim work
     for name in ("playbook_list", "playbook_status", "playbook_get_definition",
-                 "playbook_validate", "playbook_spec_list"):
+                 "playbook_validate"):
         assert getattr(tds[name], "artifact_ref", None) is None, name
 
 

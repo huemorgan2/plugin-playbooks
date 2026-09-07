@@ -1,6 +1,6 @@
 import type {
   PlaybookSummary, PlaybookRunSummary, PlaybookRunDetail,
-  SpecEntry, ProbeEntry, VersionDetail,
+  ProbeEntry, VersionDetail,
 } from './types'
 import { getToken, getTokenAsync, invalidateToken } from '../lib/auth'
 
@@ -85,9 +85,9 @@ export const playbooksApi = {
       body: JSON.stringify({ agent_autonomy }),
     }),
 
-  // plans/016 phase 6: Settings → Publish switches.
-  patchPublishSettings: (name: string, body: { require_specs?: boolean; require_run?: boolean }) =>
-    apiFetch<{ name: string; publish_require_specs: boolean; publish_require_run: boolean }>(
+  // plans/016 phase 6: Settings → Publish switch.
+  patchPublishSettings: (name: string, body: { require_run?: boolean }) =>
+    apiFetch<{ name: string; publish_require_run: boolean }>(
       `${BASE}/playbooks/${name}/publish-settings`,
       { method: 'PATCH', body: JSON.stringify(body) },
     ),
@@ -122,14 +122,13 @@ export const playbooksApi = {
       current: boolean
       live?: boolean
       candidate?: boolean
-      specs?: { total: number; failed: number; green: number }
     }[]>(`${BASE}/playbooks/${name}/versions`),
 
   getVersion: (name: string, n: number) =>
     apiFetch<VersionDetail>(`${BASE}/playbooks/${name}/versions/${n}`),
 
   // 021: the owner's click is the consent — the server never blocks a
-  // promote on specs or test-run (static validation and broken tools
+  // promote on test-run evidence (static validation and broken tools
   // still 422). The confirm dialog shows the ✓/✗ state first.
   promoteVersion: (name: string, version: number) =>
     apiFetch<{ name: string; live_version: number; promoted_from: number; status: string }>(
@@ -151,27 +150,7 @@ export const playbooksApi = {
       { method: 'POST' },
     ),
 
-  // Specs + probes (phase 6 Tests tab)
-  // plans/016 phase 5: specs belong to a version (`?version=N`; the server
-  // defaults to candidate-else-live when omitted).
-  getSpecs: (name: string, version?: number) =>
-    apiFetch<{ name: string; version: number; specs: SpecEntry[] }>(
-      `${BASE}/playbooks/${name}/specs${version != null ? `?version=${version}` : ''}`,
-    ),
-
-  runSpecs: (name: string, version?: number) =>
-    apiFetch<{
-      name: string
-      ran_against_version: number
-      total: number
-      passed: number
-      failed: number
-      results: { spec: string; passed: boolean; failures: string[]; checked: number }[]
-    }>(
-      `${BASE}/playbooks/${name}/specs/run${version != null ? `?version=${version}` : ''}`,
-      { method: 'POST' },
-    ),
-
+  // Probes (phase 6 Connections tab)
   getProbes: (name: string) =>
     apiFetch<{ name: string; probes: ProbeEntry[] }>(`${BASE}/playbooks/${name}/probes`),
 

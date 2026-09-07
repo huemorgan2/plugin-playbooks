@@ -14,7 +14,16 @@ from __future__ import annotations
 import plugin_playbooks  # noqa: F401 — luna_sdk stub via conftest
 from plugin_playbooks.agent_tools import build_tools
 
-from test_versioned_specs import _Bus  # noqa: E402
+
+class _Bus:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    async def emit(self, name: str, payload: dict) -> None:
+        self.events.append((name, payload))
+
+    def subscribe(self, name, handler, background: bool = False):
+        return lambda: None
 
 
 def _tooldefs():

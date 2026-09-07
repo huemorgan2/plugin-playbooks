@@ -27,7 +27,7 @@ import { findStepById } from './explain/dataflow'
 export { promoteRefusalMessage } from './VersionsTab'
 
 // plans/016 phase 4: a playbook is its versions. Everything that used to be a
-// top-level tab (Canvas, Code, Manifest, Tests, Runs) is a view of the
+// top-level tab (Canvas, Code, Manifest, Connections, Runs) is a view of the
 // selected version inside `Versions`. Drafts have no history and keep
 // Canvas | Code.
 type PlaybookMode = 'versions' | 'settings'
@@ -57,9 +57,9 @@ export function PlaybookEditor(props: Props) {
   const [promoting, setPromoting] = useState(false)
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
   const [autonomy, setAutonomy] = useState<string>('agent_must_confirm')
-  // plans/016 phase 6: Settings → Publish switches (default on).
+  // plans/016 phase 6: Settings → Publish switch (default on).
   const [publishSettings, setPublishSettings] = useState<PublishSettingsValue>({
-    require_specs: true, require_run: true,
+    require_run: true,
   })
   // Bumped on every reload so the Versions tab re-lists and re-fetches.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -106,7 +106,6 @@ export function PlaybookEditor(props: Props) {
           defRef.current = def
           setAutonomy(pb.agent_autonomy)
           setPublishSettings({
-            require_specs: pb.publish_require_specs ?? true,
             require_run: pb.publish_require_run ?? true,
           })
           setMeta({
@@ -233,9 +232,7 @@ export function PlaybookEditor(props: Props) {
     setPublishSettings({ ...before, ...patch })
     try {
       const r = await playbooksApi.patchPublishSettings(props.name, patch)
-      setPublishSettings({
-        require_specs: r.publish_require_specs, require_run: r.publish_require_run,
-      })
+      setPublishSettings({ require_run: r.publish_require_run })
     } catch (e) {
       console.error('Failed to update publish settings', e)
       setPublishSettings(before)

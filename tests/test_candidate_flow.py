@@ -48,7 +48,7 @@ class _Runner:
         self.dry_ran: list = []
         self.started: list = []
 
-    async def dry_run(self, playbook, inputs=None):
+    async def dry_run(self, playbook, inputs=None, stubs=None):
         self.dry_ran.append(playbook)
         return {"ok": True, "playbook": playbook.name}
 
@@ -253,7 +253,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
     assert out["previous_live_version"] == 1
     # 021: the manifest drift gate is gone — context, not law.
     assert [g["gate"] for g in out["gates"]] == [
-        "static_validation", "specs", "test_run", "probes",
+        "static_validation", "test_run", "probes",
     ]
     assert all(g["ok"] for g in out["gates"])
     pb = await _get(sf)

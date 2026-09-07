@@ -122,6 +122,71 @@ async def test_unstubbed_code_step_result_is_navigable():
     assert out["references"]["c"]["_note"] == "simulated — code was NOT executed"
 
 
+# --- runner-level stub seam (relocated from the removed specs suite, 0.47.0) --
+
+@pytest.mark.asyncio
+async def test_dry_run_stub_by_step_id_and_tool_name():
+    runner = _bare_runner({"t": object(), "send_chat_message": object()})
+    pb = _pb([
+        {"id": "fetch", "kind": "tool_call", "tool": "t", "args": {}},
+        {"id": "say", "kind": "tool_call", "tool": "send_chat_message",
+         "args": {"message": "{{ steps.fetch.result.city }}"}},
+    ])
+    out = await runner.dry_run(pb, stubs={"fetch": {"city": "Haifa"}})
+    assert out["status"] == "done", out["error"]
+    fetch = out["references"]["fetch"]
+    assert fetch["stubbed"] is True
+    assert fetch["result"] == {"city": "Haifa"}
+    # the stubbed value flowed into the downstream template
+    assert out["references"]["say"]["resolved_args"] == {"message": "Haifa"}
+
+    # tool-name key works too; step-id wins when both are present
+    out2 = await runner.dry_run(pb, stubs={"t": {"city": "Oslo"}})
+    assert out2["references"]["fetch"]["result"] == {"city": "Oslo"}
+    out3 = await runner.dry_run(
+        pb, stubs={"t": {"city": "Oslo"}, "fetch": {"city": "Rome"}},
+    )
+    assert out3["references"]["fetch"]["result"] == {"city": "Rome"}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_stubs_agent_and_llm_steps():
+    runner = _bare_runner({"t": object(), "send_chat_message": object()})
+    pb = _pb([
+        {"id": "judge", "kind": "llm_step", "prompt": "classify",
+         "output_schema": {"label": "string"}},
+        {"id": "act", "kind": "tool_call", "tool": "t",
+         "args": {"v": "{{ steps.judge.label }}"}},
+    ])
+    out = await runner.dry_run(pb, stubs={"judge": {"label": "urgent"}})
+    assert out["status"] == "done", out["error"]
+    assert out["trace"][0]["output"] == {"label": "urgent"}
+    assert out["trace"][1]["output"]["resolved_args"] == {"v": "urgent"}
+    # without a stub the schema placeholder is used
+    out2 = await runner.dry_run(pb)
+    assert out2["trace"][0]["output"].get("label") != "urgent"
+
+
+@pytest.mark.asyncio
+async def test_loop_over_unstubbed_dry_output_iterates_zero_times():
+    # a loop over a path inside an (unstubbed) dry output no longer fails
+    # with UndefinedError — the navigable dry stub resolves the path to an
+    # empty placeholder and the loop simply runs zero iterations.
+    runner = _bare_runner({"t": object(), "send_chat_message": object()})
+    pb = _pb([
+        {"id": "fetch", "kind": "tool_call", "tool": "t", "args": {}},
+        {"id": "crawl", "kind": "loop",
+         "over": "steps.fetch[\"result\"][\"rows\"]",
+         "body": [
+             {"id": "inner", "kind": "tool_call", "tool": "t", "args": {}},
+         ]},
+    ])
+    out = await runner.dry_run(pb)
+    assert out["status"] == "done", out["error"]
+    assert out["references"]["crawl"]["iterations"] == 0
+    assert out["references"]["crawl"]["results"] == []
+
+
 @pytest.mark.asyncio
 async def test_missing_step_id_stays_loud():
     """Only UNSTUBBED DRY VALUES are forgiving — a typo'd step id is still a

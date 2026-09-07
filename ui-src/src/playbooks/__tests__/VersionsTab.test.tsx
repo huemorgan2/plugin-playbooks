@@ -18,7 +18,7 @@ vi.mock('../../lib/events', () => ({
 }))
 // Heavy siblings with their own fetches — not under test here.
 vi.mock('../ManifestTab', () => ({ ManifestTab: () => <div data-testid="manifest-tab" /> }))
-vi.mock('../TestsTab', () => ({ TestsTab: () => <div data-testid="tests-tab" /> }))
+vi.mock('../ConnectionsTab', () => ({ ConnectionsTab: () => <div data-testid="connections-tab" /> }))
 vi.mock('../RunsTab', () => ({ RunsTab: () => <div data-testid="runs-tab" /> }))
 
 import { playbooksApi } from '../api'
@@ -50,7 +50,7 @@ const def: PlaybookDef = {
 
 function entry(
   version: number,
-  extra: Partial<{ current: boolean; candidate: boolean; specs: { total: number; failed: number; green: number } }> = {},
+  extra: Partial<{ current: boolean; candidate: boolean; runs: number }> = {},
 ) {
   return {
     version, title: `v${version} edit`, author: 'agent',
@@ -67,11 +67,12 @@ function detailOf(version: number, live: boolean, candidate = false): VersionDet
   }
 }
 
-function setup({ candidate = false, redV1 = false }: { candidate?: boolean; redV1?: boolean } = {}) {
+function setup({ candidate = false, neverRanV1 = false }: { candidate?: boolean; neverRanV1?: boolean } = {}) {
   api.listVersions.mockResolvedValue([
-    ...(candidate ? [entry(3, { candidate: true })] : []),
-    entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
-    entry(1, redV1 ? { specs: { total: 2, failed: 1, green: 1 } } : {}),
+    // the candidate has never run — the confirm's ✗ case
+    ...(candidate ? [entry(3, { candidate: true, runs: 0 })] : []),
+    entry(2, { current: true }),
+    entry(1, neverRanV1 ? { runs: 0 } : {}),
   ])
   api.getVersion.mockImplementation((_n: string, v: number) =>
     Promise.resolve(detailOf(v, v === 2, candidate && v === 3)),
@@ -151,7 +152,7 @@ describe('VersionsTab', () => {
     expect(onPromoted).not.toHaveBeenCalled()
   })
 
-  it('view switch: Code / Manifest / Tests / Runs render per version', async () => {
+  it('view switch: Code / Manifest / Connections / Runs render per version', async () => {
     setup()
     await screen.findByTestId('version-toolbar')
     fireEvent.click(screen.getByTestId('view-code'))
@@ -160,39 +161,44 @@ describe('VersionsTab', () => {
     expect(await screen.findByTestId('manifest-tab')).toBeTruthy()   // live → editable
     fireEvent.click(screen.getByTestId('version-row-1'))
     expect(await screen.findByTestId('manifest-snapshot')).toBeTruthy()  // older → snapshot
-    fireEvent.click(screen.getByTestId('view-tests'))
-    expect(await screen.findByTestId('tests-tab')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('view-connections'))
+    expect(await screen.findByTestId('connections-tab')).toBeTruthy()
     fireEvent.click(screen.getByTestId('view-runs'))
     expect(await screen.findByTestId('runs-tab')).toBeTruthy()
+    // 0.47.0: the Tests view went with the specs feature
+    expect(screen.queryByTestId('view-tests')).toBeNull()
   })
 })
 
 describe('VersionsTab — the ✓/✗ promote confirm (021)', () => {
-  it('a candidate with no tests: button stays enabled, confirm shows ✗ and Publish anyway', async () => {
+  it('a candidate that never ran: button stays enabled, confirm shows ✗ and Publish anyway', async () => {
     setup({ candidate: true })
     await screen.findByTestId('version-toolbar')
-    // v3 candidate: no specs cache → ✗ "No tests defined", but never disabled
+    // v3 candidate: no run yet → ✗ "Never run", but never disabled
     fireEvent.click(screen.getByTestId('version-row-3'))
     const btn = await screen.findByTestId('promote-btn')
     expect((btn as HTMLButtonElement).disabled).toBe(false)
     fireEvent.click(btn)
     const confirm = await screen.findByTestId('promote-confirm')
     expect(confirm.textContent).toContain('✗')
+    expect(confirm.textContent).toContain('Never run')
     expect(screen.getByTestId('promote-confirm-btn').textContent).toBe('Publish anyway')
   })
 
-  it('a red version still promotes — Publish anyway, owner click is the consent', async () => {
-    const { onPromoted } = setup({ redV1: true })
+  it('a never-run version still promotes — Publish anyway, owner click is the consent', async () => {
+    const { onPromoted } = setup({ neverRanV1: true })
     await screen.findByTestId('version-toolbar')
-    expect(screen.getByTestId('version-specs-2').textContent).toBe('2 tests · 2 green')
-    expect(screen.getByTestId('version-specs-1').textContent).toBe('2 tests · 1 red')
+    // 0.47.0: no per-version test badge any more
+    expect(screen.queryByTestId('version-specs-2')).toBeNull()
+    expect(screen.queryByTestId('version-specs-1')).toBeNull()
     fireEvent.click(screen.getByTestId('version-row-1'))
     const btn = await screen.findByTestId('promote-btn')
     expect((btn as HTMLButtonElement).disabled).toBe(false)
     api.promoteVersion.mockResolvedValue({ name: 'greeter', live_version: 1, promoted_from: 2, status: 'promoted' })
     fireEvent.click(btn)
     const confirm = await screen.findByTestId('promote-confirm')
-    expect(confirm.textContent).toContain('1 of 2 tests red')
+    expect(confirm.textContent).toContain('Never run')
+    expect(confirm.textContent).not.toContain('tests')
     const go = screen.getByTestId('promote-confirm-btn')
     expect(go.textContent).toBe('Publish anyway')
     fireEvent.click(go)
@@ -200,10 +206,10 @@ describe('VersionsTab — the ✓/✗ promote confirm (021)', () => {
     expect(api.promoteVersion).toHaveBeenCalledWith('greeter', 1)
   })
 
-  it('a green version with runs shows all-✓ and a plain Publish button', async () => {
+  it('a version with runs shows all-✓ and a plain Publish button', async () => {
     api.listVersions.mockResolvedValue([
-      entry(2, { current: true, specs: { total: 2, failed: 0, green: 2 } }),
-      entry(1, { specs: { total: 3, failed: 0, green: 3 } }),
+      entry(2, { current: true }),
+      entry(1),
     ])
     api.getVersion.mockImplementation((_n: string, v: number) =>
       Promise.resolve(detailOf(v, v === 2)),
@@ -219,7 +225,7 @@ describe('VersionsTab — the ✓/✗ promote confirm (021)', () => {
     const btn = await screen.findByTestId('promote-btn')
     fireEvent.click(btn)
     const confirm = await screen.findByTestId('promote-confirm')
-    expect(confirm.textContent).toContain('Tests: 3/3 green')
+    expect(confirm.textContent).not.toContain('tests')
     expect(confirm.textContent).toContain('Has run 1 time')
     expect(confirm.textContent).not.toContain('✗')
     expect(screen.getByTestId('promote-confirm-btn').textContent).toBe('Publish')
@@ -232,7 +238,7 @@ describe('VersionsTab — the ✓/✗ promote confirm (021)', () => {
     expect(screen.queryByTestId('version-list')).toBeNull()
     expect(screen.getByTestId('version-list-collapsed')).toBeTruthy()
     // the view tabs never disappear with the list open or closed
-    for (const v of ['canvas', 'code', 'manifest', 'tests', 'runs']) {
+    for (const v of ['canvas', 'code', 'manifest', 'connections', 'runs']) {
       expect(screen.getByTestId(`view-${v}`)).toBeTruthy()
     }
     fireEvent.click(screen.getByTestId('versions-expand'))
@@ -245,7 +251,7 @@ describe('promoteRefusalMessage', () => {
   it('prefers message, then error, then gate', () => {
     expect(promoteRefusalMessage(new Error('422: {"detail":{"message":"m","error":"e"}}'))).toBe('m')
     expect(promoteRefusalMessage(new Error('422: {"detail":{"error":"e"}}'))).toBe('e')
-    expect(promoteRefusalMessage(new Error('422: {"detail":{"gate":"specs"}}'))).toContain("'specs'")
+    expect(promoteRefusalMessage(new Error('422: {"detail":{"gate":"probes"}}'))).toContain("'probes'")
     expect(promoteRefusalMessage(new Error('boom'))).toBe('boom')
   })
 })

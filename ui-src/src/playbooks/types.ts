@@ -91,22 +91,11 @@ export interface PlaybookDef {
 
 // 0.13.0 (plans/002 phase 6): per-playbook trust data for the list badges.
 export interface TrustSummary {
-  specs: { total: number; failed: number; last_run_at: string | null }
   probes: { total: number; failed: number; probed_at: string | null }
   manifest_present: boolean
 }
 
 export type ProbeStatus = 'ok' | 'unprobeable' | 'failed'
-
-export interface SpecEntry {
-  name: string
-  spec: Record<string, any>
-  created_by: string | null
-  last_result: Record<string, any> | null
-  last_run_at: string | null
-  last_version: number | null
-  updated_at: string | null
-}
 
 export interface ProbeEntry {
   tool: string
@@ -123,8 +112,7 @@ export interface PlaybookSummary {
   description: string | null
   status: string
   agent_autonomy: string
-  // plans/016 phase 6: owner-switchable publish gates (Settings → Publish).
-  publish_require_specs?: boolean
+  // plans/016 phase 6: owner-switchable publish gate (Settings → Publish).
   publish_require_run?: boolean
   version: number
   live_version?: number

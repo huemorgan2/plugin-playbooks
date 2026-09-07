@@ -4,10 +4,9 @@ The **Playbooks engine** for [Luna](https://github.com/huemorgan/luna): durable,
 multi-step agent workflows. A playbook is written as **code** (pblang — a
 restricted Python subset that is compiled to a step graph, never executed),
 carries a plain-text **manifest** stating its intent, and is guarded by
-**specs** (dry-run behavioral tests) and **probes** (are the tools it uses
-actually installed and answering). Changes land as **candidates** and only go
-live through `publish`, which runs validation → specs → a green test run →
-probes as gates.
+**probes** (are the tools it uses actually installed and answering). Changes
+land as **candidates** and only go live through `publish`, which runs
+validation → a green test run → probes as gates.
 
 Extracted from Luna core in 009.001 (Luna ≥ 0.29). History up to Luna 0.29.006
 lives in the main luna repo.
@@ -33,16 +32,13 @@ the next turn):
 | `playbook_edit_force` | Escape hatch past the drift check; gates still run at publish |
 | `playbook_get_definition` | Read code / compiled definition / manifest |
 | `playbook_validate` | Static-check code or YAML without saving |
-| `playbook_dry_run` | Simulate a run (no tools/LLMs executed), returns the trace |
+| `playbook_dry_run` | Simulate a run (no tools/LLMs executed; scriptable via `stubs`), returns the trace |
 | `playbook_manifest_set` | Write the plain-text intent manifest |
-| `playbook_publish` | Candidate → live, through validation/specs/test-run/probes gates |
+| `playbook_publish` | Candidate → live, through validation/test-run/probes gates |
 | `playbook_rollback` | Point live back to an earlier version |
 | `playbook_run_candidate` | Live-run the candidate version once |
 | `playbook_set_autonomy` | Ask-first / autonomous execution modes |
 | `playbook_list_available_triggers` | Cron/webhook/connector trigger catalog |
-| `playbook_spec_add` / `playbook_spec_list` / `playbook_spec_delete` | Manage specs |
-| `playbook_spec_run` | Run all specs (same evaluation the publish gate uses) |
-| `playbook_spec_from_run` | Propose a spec from a recorded real run |
 | `playbook_preflight` | Probe the playbook's tools: installed and answering? |
 
 YAML authoring was removed in 0.14.0 — `playbook_propose` / `playbook_edit`
@@ -59,66 +55,41 @@ e.g. "Never send more than one chat message per run." Update it in the same
 breath as any change that shifts intent — a stale manifest blocks future
 edits for the wrong reason.
 
-## Spec cookbook
+## Dry-run stubs
 
-Specs are YAML documents (`inputs`, `stubs`, `expect`) evaluated against a
-**dry run** — templates render and branching executes, but tools and LLMs are
-stubbed. They run on every candidate save, via `playbook_spec_run`, and as a
-publish gate.
+`playbook_dry_run` is a **simulation** — templates render and branching
+executes, but tools and LLMs are stubbed. Pass `stubs` (a JSON object) to
+script what the stubbed steps return:
 
-Happy path with a scripted tool result:
-
-```yaml
-description: greets and notifies
-inputs: {user: "roy"}
-stubs:
-  fetch_weather: {temp_c: 31, sky: "clear"}   # tool-name or step-id key
-expect:
-  status: done
-  steps_ran: [fetch, compose, notify]          # exact order
-  tool_calls:
-    send_chat_message:
-      count: 1
-      args_contain: {message: "31"}            # substring/subset match
-  output_contains:
-    compose: "clear"                           # substring of the step output
-```
-
-Failure branch:
-
-```yaml
-description: refuses on missing input
-inputs: {}
-expect:
-  status: failed
-  error_contains: "user is required"
-  steps_not_ran: [notify]
+```json
+{"fetch_weather": {"temp_c": 31, "sky": "clear"}}
 ```
 
 Notes:
 
 - `stubs` values ARE the result payload (no `result:` wrapper). Step-id keys
   win over tool-name keys.
-- `args_contain` matches resolved args: strings by substring, dicts by
-  recursive subset, everything else by equality.
-- `playbook_spec_from_run` drafts a spec from a real run's recorded inputs,
-  outputs, and tool calls — trim the proposal before saving.
+- After a real run (even a failed one), the recorded step outputs from
+  `playbook_status` make good stubs — copy them in keyed by step id to
+  reproduce the run's path.
+- A dry run is never run evidence: the publish gate wants a green **real**
+  test run of the candidate (`playbook_run_candidate`).
 
 ## UI
 
 A **Playbooks** sidebar section (full-pane iframe, prebuilt
 `plugin_playbooks/ui/`, source in `ui-src/` — Vite + React + react-flow). List
-shows per-playbook trust rows (tests · tools · intent) and pending-candidate
+shows per-playbook trust rows (tools · intent) and pending-candidate
 chips; the editor has five tabs: Canvas (live/candidate graph, past-run
-projection), Code (read-only pblang), Manifest, Tests (specs + probes),
+projection), Code (read-only pblang), Manifest, Connections (tool probes),
 Runs (stats + per-step execution rows). Live agent edits stream in over
 Luna's E12 `ui.plugin.event` bridge; run/step activity rides `activity.*` SSE.
 
 ## Owns its own DB tables (SDK enabler E4)
 
 Tables (`playbooks`, `playbook_versions`, `playbook_runs`,
-`playbook_step_runs`, `playbook_drafts`, `playbook_specs`) are created on
-enable via `ctx.engine`, on the plugin's own `MetaData`:
+`playbook_step_runs`, `playbook_drafts`, …) are created on enable via
+`ctx.engine`, on the plugin's own `MetaData`:
 
 ```python
 from luna_sdk import declarative_base, JSONB, UUID
@@ -139,7 +110,7 @@ before loading.
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # engine/tools/specs/probes tests, no Luna runtime needed
+pytest                      # engine/tools/probes tests, no Luna runtime needed
 ```
 
 UI development:

@@ -1,6 +1,6 @@
 """Preflight probes — will this playbook's tools work right now? (plans/002 phase 5)
 
-Specs stub the outside world by design, so they can't catch a dead
+Dry runs stub the outside world by design, so they can't catch a dead
 credential or a vanished resource. Probes can: each tool's owning plugin
 may declare a cheap, side-effect-free ``probe`` on its ToolDef (luna plans
 038); the preflight engine runs the probes for every tool a playbook

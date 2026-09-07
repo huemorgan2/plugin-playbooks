@@ -15,7 +15,6 @@ import contextvars
 import json
 import logging
 import re
-import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -81,8 +80,8 @@ class _DryStub(dict):
     times. ``_dry``/``_note`` answer via access (self-description, plans/022)
     without being real keys, so iteration and JSON serialization (``{}``)
     stay clean; the step WRAPPER carries the real ``_dry``/``_note`` markers.
-    Spec stubs still script results verbatim — this only covers the unstubbed
-    path, so a playbook smoke-tests before any stubs are written.
+    Scripted stubs still script results verbatim — this only covers the
+    unstubbed path, so a playbook smoke-tests before any stubs are written.
     """
 
     def __init__(self, path: str = "dry", note: str = "simulated") -> None:
@@ -139,8 +138,8 @@ def _normalize_tool_result(result: Any) -> Any:
     """Parse JSON-string tool results into structured data.
 
     Most Luna tool handlers return json.dumps(...) strings. Stored raw, they
-    leak quoted JSON into step outputs, spec_from_run stubs, and the run
-    view (plans/002 phase 7). Only strings that parse to a dict or list are
+    leak quoted JSON into step outputs, dry-run stubs, and the run view
+    (plans/002 phase 7). Only strings that parse to a dict or list are
     converted — plain text passes through untouched.
     """
     if isinstance(result, str) and result.lstrip()[:1] in ("{", "["):
@@ -564,7 +563,7 @@ class PlaybookRunner:
         conditions, parallel, subtask, templates, expressions) but every
         effectful leaf (tool_call / agent_step / llm_step / wait_*) is stubbed.
         Writes nothing to the DB. Returns a trace of resolved args / branches /
-        iteration counts — the playbook "test run".
+        iteration counts — the playbook simulation.
         """
         definition = PlaybookDef.model_validate(playbook.definition)
         ctx = _RunContext(
@@ -834,7 +833,7 @@ class PlaybookRunner:
                 ) from None
             # No execution. Stub the result from the tool's output hints if any,
             # but always surface the RESOLVED args (proves templates rendered).
-            # Phase 4: a spec stub (step-id wins over tool-name) scripts the
+            # Phase 4: a scripted stub (step-id wins over tool-name) sets the
             # result so downstream templates see fixture-shaped data.
             if step.id in ctx.stubs or step.tool in ctx.stubs:
                 scripted = ctx.stubs.get(step.id, ctx.stubs.get(step.tool))
@@ -1819,8 +1818,8 @@ def _is_dry_placeholder(out: Any) -> bool:
     (an *unstubbed* tool_call or code step during dry_run).
 
     A stubbed step's wrapper also carries top-level ``_dry: True`` (the run is
-    still a dry run) but is NOT a placeholder — its ``result`` is scripted from
-    the spec. Those wrappers set ``stubbed: True``, so exclude them; otherwise a
+    still a dry run) but is NOT a placeholder — its ``result`` is scripted by
+    the caller. Those wrappers set ``stubbed: True``, so exclude them; otherwise a
     stubbed-but-wrong-shape stub (e.g. a bare list where a dict was expected)
     would be falsely reported as "not stubbed"."""
     return (
@@ -1835,7 +1834,7 @@ def _dry_stub_hint(expr: str, ctx: "_RunContext") -> str:
     name those steps and tell the author to stub them. Empty string otherwise.
 
     This is the actionable form of the otherwise-cryptic "keys: _dry, _note"
-    failure: in a dry-run/spec, an unstubbed tool_call or code step returns a
+    failure: in a dry run, an unstubbed tool_call or code step returns a
     simulated placeholder, so any template reading a field off it fails."""
     hits: list[str] = []
     for m in _STEP_PATH.finditer(expr):
@@ -1847,7 +1846,7 @@ def _dry_stub_hint(expr: str, ctx: "_RunContext") -> str:
     uniq = ", ".join(sorted(set(hits)))
     return (
         f" Step(s) [{uniq}] were not stubbed and returned a simulated dry-run "
-        "placeholder — in a spec, add a `stubs` entry for each so its output "
+        "placeholder — add a `stubs` entry for each so its output "
         "is defined."
     )
 
@@ -1874,7 +1873,7 @@ def _undefined_ref_detail(expr: str, ctx: "_RunContext") -> str:
                     details.append(
                         f"{path}.{seg} does not exist — {path} is a simulated "
                         f"dry-run placeholder because step '{sid}' was not "
-                        "stubbed; add a `stubs` entry for it in the spec"
+                        "stubbed; add a `stubs` entry for it"
                     )
                     break
                 have = (

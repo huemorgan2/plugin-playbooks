@@ -1,10 +1,10 @@
-"""0.39.0 (plans/022) — truthful evidence, fail-closed approvals, spec
-provenance, coding-agent reads, honest dry runs, history integrity.
+"""0.39.0 (plans/022) — truthful evidence, fail-closed approvals,
+coding-agent reads, honest dry runs, history integrity.
 
 Meltdown 2026-09-01/02: a FAILED run was announced as green evidence, a
-broken approval wait read as approval, carried specs vanished silently, the
-agent could not read old versions, dry runs green-lit nonexistent tools, and
-the duplicate-row healer kept rows by age instead of content.
+broken approval wait read as approval, the agent could not read old
+versions, dry runs green-lit nonexistent tools, and the duplicate-row
+healer kept rows by age instead of content.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import plugin_playbooks  # noqa: F401 — luna_sdk stub via conftest
 from plugin_playbooks import publish, versioning
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import (
-    Base, Playbook, PlaybookRun, PlaybookSpec, PlaybookStepRun, PlaybookVersion,
+    Base, Playbook, PlaybookRun, PlaybookStepRun, PlaybookVersion,
 )
 from plugin_playbooks.runner import PlaybookRunner, _coerce_inputs
 
@@ -272,76 +272,6 @@ async def test_approval_wait_exception_aborts_publish():
         assert "TimeoutError" in out["error"]
         pb = await _pb(sf)
         assert pb.live_version == 1
-    finally:
-        await engine.dispose()
-
-
-# --- P3: carried specs carry provenance -------------------------------------
-
-@pytest.mark.asyncio
-async def test_carried_specs_keep_original_author_version():
-    engine, sf, tools, _ = await _env(_Ctx(_Approvals()))
-    try:
-        await _candidate(sf, tools)  # v2 candidate
-        async with sf() as s:
-            pb = (await s.execute(select(Playbook))).scalar_one()
-            s.add(PlaybookSpec(
-                playbook_id=pb.id, playbook_version=2, name="greets",
-                spec={"given": {}, "expect": []}, created_by="agent",
-            ))
-            await s.commit()
-        # two more mints: v2 → v3 → v4; carried_from must stay 2 (original)
-        async with sf() as s:
-            pb = (await s.execute(select(Playbook))).scalar_one()
-            await versioning.mint_version(
-                s, pb, definition=pb.definition, code=pb.code,
-                manifest=pb.manifest or "", author="agent", message="v3",
-                source_version=2,
-            )
-            await s.commit()
-        async with sf() as s:
-            pb = (await s.execute(select(Playbook))).scalar_one()
-            await versioning.mint_version(
-                s, pb, definition=pb.definition, code=pb.code,
-                manifest=pb.manifest or "", author="agent", message="v4",
-                source_version=3,
-            )
-            await s.commit()
-            v4_spec = (await s.execute(
-                select(PlaybookSpec).where(PlaybookSpec.playbook_version == 4)
-            )).scalar_one()
-        assert v4_spec.spec["carried_from"] == 2
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_deleting_a_carried_spec_requires_a_reason():
-    engine, sf, tools, _ = await _env(_Ctx(_Approvals()))
-    try:
-        await _candidate(sf, tools)
-        async with sf() as s:
-            pb = (await s.execute(select(Playbook))).scalar_one()
-            s.add(PlaybookSpec(
-                playbook_id=pb.id, playbook_version=2, name="greets",
-                spec={"given": {}, "expect": [], "carried_from": 1},
-                created_by="agent",
-            ))
-            await s.commit()
-        out = json.loads(await tools["playbook_spec_delete"](
-            name="greeter", spec_name="greets", version="2",
-        ))
-        assert "requires a reason" in out["error"]
-        out = json.loads(await tools["playbook_spec_delete"](
-            name="greeter", spec_name="greets", version="2",
-            why="tool was removed from the playbook",
-        ))
-        assert out["status"] == "deleted"
-        assert out["carried_from"] == 1
-        listed = json.loads(await tools["playbook_spec_list"](
-            name="greeter", version="2",
-        ))
-        assert all(s_["name"] != "greets" for s_ in listed["specs"])
     finally:
         await engine.dispose()
 

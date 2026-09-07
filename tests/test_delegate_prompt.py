@@ -77,7 +77,6 @@ def test_budgets_named_with_rationale_and_losing_exits():
     assert "40" in p and "15 min" in p
     assert "why:" in p  # the numeric limit carries its rationale
     assert "3 failed validates" in p
-    assert "3 failed spec" in p
     assert "likeliest causes" in p  # rank hypotheses before retrying
 
 

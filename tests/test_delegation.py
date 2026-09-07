@@ -288,8 +288,8 @@ async def test_events_recorded_with_inferred_phases(env):
             PartStartEvent("The bug is in the phone step.\nMore detail."),
             FunctionToolCallEvent("playbook_edit", "c2"),
             FunctionToolResultEvent("playbook_edit", "c2", "candidate_saved"),
-            FunctionToolCallEvent("playbook_spec_run", "c3"),
-            FunctionToolResultEvent("playbook_spec_run", "c3", "8/8 pass"),
+            FunctionToolCallEvent("playbook_dry_run", "c3"),
+            FunctionToolResultEvent("playbook_dry_run", "c3", "8/8 pass"),
             FunctionToolCallEvent("playbook_publish", "c4"),
             FunctionToolResultEvent("playbook_publish", "c4", "v4 live"),
         ],
@@ -324,8 +324,8 @@ async def test_v2_result_events_still_stamp_duration_and_detail(env):
     agent = FakeAgent(
         result="ok",
         events=[
-            FunctionToolCallEvent("playbook_spec_run", "c1"),
-            _FunctionToolResultEventV2("playbook_spec_run", "c1", "2/2 pass"),
+            FunctionToolCallEvent("playbook_dry_run", "c1"),
+            _FunctionToolResultEventV2("playbook_dry_run", "c1", "2/2 pass"),
         ],
     )
     tools = _tools(FakeCtx(agent), env)
@@ -333,7 +333,7 @@ async def test_v2_result_events_still_stamp_duration_and_detail(env):
     out = json.loads(await run(task="check", wait_seconds=10))
     async with env() as s:
         row = await s.get(PlaybookDelegation, uuid.UUID(out["delegation_id"]))
-    runs = [e for e in row.events if e["label"] == "playbook_spec_run"]
+    runs = [e for e in row.events if e["label"] == "playbook_dry_run"]
     assert len(runs) == 1  # call + result still collapse to one line
     assert runs[0]["ms"] is not None
     assert runs[0]["detail"] == "2/2 pass"

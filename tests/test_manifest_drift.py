@@ -83,8 +83,7 @@ def test_owner_facing_tools_lead_with_why():
     the owner reads carry an optional `why`, FIRST in the schema so the
     presentation leads with plain language."""
     real = _code_tooldefs()
-    for name in ("playbook_manifest_set",
-                 "playbook_spec_delete", "playbook_set_autonomy"):
+    for name in ("playbook_manifest_set", "playbook_set_autonomy"):
         props = real[name].parameters["properties"]
         assert next(iter(props)) == "why", name
         assert "OWNER" in props["why"]["description"], name

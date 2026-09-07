@@ -66,9 +66,8 @@ class Playbook(Base):
     # governed by the machine gates + one approval card (021).
     # Kept only so old rows keep loading.
     publish_autonomy: Mapped[str] = mapped_column(String(16), default="ask", nullable=False)
-    # 0.28.0 (plans/016 phase 6): owner-switchable publish gates (Settings →
+    # 0.28.0 (plans/016 phase 6): owner-switchable publish gate (Settings →
     # Publish). Off = the gate still runs and is reported, but never refuses.
-    publish_require_specs: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     publish_require_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
@@ -197,50 +196,6 @@ class PlaybookStepRun(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
-    )
-
-
-class PlaybookSpec(Base):
-    """0.11.0 (plans/002 phase 4): playbook tests.
-
-    A spec is fixture inputs + scripted stubs + assertions over the dry-run
-    trace (see specs.SpecDef). Specs auto-run on every candidate save and
-    gate playbook_publish. `last_*` cache the most recent evaluation for the
-    list tool, the publish gate report, and UI badges.
-    """
-    __tablename__ = "playbook_specs"
-
-    # plans/016 phase 5: specs belong to a VERSION (duplicated on mint), so
-    # the key is (playbook, version, name). 0 = pre-phase-5 row awaiting the
-    # load-time backfill (`backfill_spec_versions`).
-    __table_args__ = (
-        Index(
-            "ix_playbook_specs_playbook_version_name",
-            "playbook_id", "playbook_version", "name", unique=True,
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(), primary_key=True, default=_uuid)
-    playbook_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(), ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False
-    )
-    playbook_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    spec: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    created_by: Mapped[str] = mapped_column(String(64), default="agent", nullable=False)
-    last_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    last_run_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    # the playbook version number the last evaluation ran against
-    last_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
 

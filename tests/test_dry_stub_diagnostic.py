@@ -1,6 +1,6 @@
 """Dry-run stub diagnostic (plans/016 follow-up).
 
-When a spec leaves a tool_call/code step unstubbed, that step returns a
+When a dry run leaves a tool_call/code step unstubbed, that step returns a
 simulated dry-run placeholder ({_dry, _note}). Any downstream template that
 reads a field off it fails. Previously the error said only
 "a dict with keys: _dry, _note", which never told the author WHAT to do.

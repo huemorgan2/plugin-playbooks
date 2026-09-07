@@ -22,7 +22,8 @@ Core seams used (all shipped, no core changes):
 - luna 049: ``max_turns`` (hard step budget — breach returns ``{"_aborted"}``),
   ``timeout_s``, and ``event_stream_handler`` (the live event feed).
 - luna 0.40.003: headless tools run the same dispatch gate as chat, so
-  ``prompt_always`` tools (publish, spec_delete) still raise approval cards.
+  ``prompt_always`` tools (set_autonomy, run_candidate) still raise approval
+  cards, and publish/rollback raise the owner's approval card themselves.
 """
 
 from __future__ import annotations
@@ -65,7 +66,6 @@ _PHASE_BY_TOOL = {
     "playbook_list": "Understand",
     "playbook_status": "Understand",
     "playbook_language_reference": "Understand",
-    "playbook_spec_list": "Understand",
     "playbook_propose": "Change",
     "playbook_edit": "Change",
     "playbook_manifest_set": "Change",
@@ -73,10 +73,6 @@ _PHASE_BY_TOOL = {
     "playbook_list_available_triggers": "Understand",
     "playbook_validate": "Prove",
     "playbook_dry_run": "Prove",
-    "playbook_spec_add": "Prove",
-    "playbook_spec_run": "Prove",
-    "playbook_spec_from_run": "Prove",
-    "playbook_spec_delete": "Prove",
     "playbook_preflight": "Prove",
     "playbook_run_candidate": "Prove",
     "playbook_publish": "Ship",
@@ -89,14 +85,14 @@ def phase_for_tool(tool_name: str) -> str:
     return _PHASE_BY_TOOL.get(tool_name, "Understand")
 
 
-# Our own prompt_always tools — the calls that park the delegate on an
-# approval card. Kept in sync with agent_tools.py by a drift test.
+# The calls that park the delegate on an approval card: our prompt_always
+# tools plus publish/rollback, which raise the owner's card from inside the
+# handler. Kept in sync with agent_tools.py by a drift test.
 _GATED_TOOLS = frozenset({
     "playbook_set_autonomy",
     "playbook_publish",
     "playbook_rollback",
     "playbook_run_candidate",
-    "playbook_spec_delete",
 })
 
 # A gated call normally resolves in well under a second; one still pending
@@ -109,7 +105,6 @@ _WAITING_THRESHOLD_S = 8.0
 _GATED_TOOL_OWNER_WORDS = {
     "playbook_publish": "make the change live",
     "playbook_rollback": "roll back the live version",
-    "playbook_spec_delete": "delete a spec",
     "playbook_set_autonomy": "change how it runs on its own",
     "playbook_run_candidate": "test-run the draft version",
 }
@@ -275,11 +270,12 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "steps.<id>... paths from its `references` block — that block is "
         "the API; the trace's per-step `output` label is not a path. Its "
         "outputs are simulated.",
-        "5. SPECS — pin behavior from recorded reality: after any real "
-        "run (even a failed one) start from playbook_spec_from_run; batch "
-        "new specs into ONE playbook_spec_add call. Cap: 3 failed spec "
-        "runs in a row means the data path is wrong — re-derive it from "
-        "dry_run's references instead of bending the spec.",
+        "5. STUBS FROM REALITY — after any real run (even a failed one) "
+        "copy the recorded step outputs from playbook_status into "
+        "playbook_dry_run's `stubs` (keyed by step id) so the simulation "
+        "sees real shapes. Cap: 3 failed dry runs in a row means the data "
+        "path is wrong — re-derive it from dry_run's references instead "
+        "of bending the stubs.",
         "6. PREFLIGHT — playbook_preflight probes every tool the playbook "
         "touches. A `failed` probe (dead credential, missing tool) blocks "
         "publish — report it; `unprobeable` is common and fine.",
@@ -321,11 +317,11 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "## 7. Actions and their weight",
         "",
-        "- FREE: reads, validate, dry_run, spec_run, preflight — use "
+        "- FREE: reads, validate, dry_run, preflight — use "
         "freely within budget.",
         "- SIDE-EFFECTING: playbook_run and playbook_run_candidate touch "
         "the real world — only when the job needs real proof.",
-        "- OWNER-DECISION: publish, rollback, spec_delete, run_candidate, "
+        "- OWNER-DECISION: publish, rollback, run_candidate, "
         "set_autonomy raise a real approval card in the owner's chat. "
         "Call them and WAIT — the pause is the owner deciding. A decline "
         "is an answer: respect it in your report; never work around a "
@@ -361,7 +357,7 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "A good final report:",
         "\"PUBLISHED v3 of digest-open-prs. Added the per-PR judgment "
-        "loop and a typed digest step. validate clean, 4/4 specs pass, "
+        "loop and a typed digest step. validate clean, "
         "dry-run traces the loop over stubbed PRs (simulated), preflight "
         "ok, test run green. Nothing needs you.\"",
         "",
@@ -369,7 +365,7 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "Immediately before publishing, confirm every line:",
         "1. playbook_validate is clean on the candidate.",
-        "2. Specs pass, and at least one spec pins the changed behavior.",
+        "2. A dry run with stubs from a real run traces the changed path.",
         "3. A green test run of THIS exact candidate exists since its "
         "last edit (playbook_run_candidate).",
         "4. preflight shows no `failed` tools (external-service "
@@ -800,10 +796,10 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                 chat_only=True,
                 timeout_seconds=120,
                 description=(
-                    "Delegate a playbook authoring job (create, fix, edit, "
-                    "add specs) to a focused background agent. It works "
+                    "Delegate a playbook authoring job (create, fix, edit) "
+                    "to a focused background agent. It works "
                     "through the full loop (read, edit, validate, dry-run, "
-                    "specs, publish) in its own context; a live "
+                    "test run, publish) in its own context; a live "
                     "progress card appears in the chat. Returns within "
                     "wait_seconds (default 25): either the finished report "
                     "or status 'running' — then tell the owner the card "
@@ -817,8 +813,8 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                             "description": (
                                 "The job, phrased with goal + acceptance, "
                                 "e.g. 'Fix the phone format in "
-                                "candidate-intake: normalize to E.164; all "
-                                "specs must pass; publish when green.'"
+                                "candidate-intake: normalize to E.164; "
+                                "publish when the test run is green.'"
                             ),
                         },
                         "playbook": {

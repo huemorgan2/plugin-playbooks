@@ -1,6 +1,6 @@
 // 0.13.0 (plans/002 phase 6): pure label logic for the list trust row and
-// the Tests tab headlines. Plain words only — internal failure classes are
-// translated before a human sees them.
+// the Connections tab headline. Plain words only — internal failure classes
+// are translated before a human sees them.
 import type { TrustSummary } from './types'
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'dim'
@@ -8,13 +8,6 @@ export type Tone = 'ok' | 'warn' | 'bad' | 'dim'
 export interface TrustLabel {
   text: string
   tone: Tone
-}
-
-export function specsLabel(t?: TrustSummary): TrustLabel {
-  const s = t?.specs
-  if (!s || s.total === 0) return { text: 'untested', tone: 'warn' }
-  if (s.failed > 0) return { text: `${s.failed} failing`, tone: 'bad' }
-  return { text: `tests ${s.total}/${s.total}`, tone: 'ok' }
 }
 
 export function probesLabel(t?: TrustSummary): TrustLabel {
@@ -47,13 +40,7 @@ export function failureWords(failureClass: string | null | undefined): string {
   return FAILURE_WORDS[failureClass] ?? failureClass.replace(/_/g, ' ')
 }
 
-// Tests tab headlines — the bottom line, not the category name.
-export function specsHeadline(total: number, failed: number): TrustLabel {
-  if (total === 0) return { text: 'No tests yet', tone: 'warn' }
-  if (failed > 0) return { text: `${failed} of ${total} failing`, tone: 'bad' }
-  return { text: `${total}/${total} passing`, tone: 'ok' }
-}
-
+// Connections tab headline — the bottom line, not the category name.
 export function probesHeadline(
   total: number, ok: number, failed: number,
 ): TrustLabel {

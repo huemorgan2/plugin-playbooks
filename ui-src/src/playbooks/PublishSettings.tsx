@@ -1,10 +1,9 @@
 // plans/016 phase 6: "Publish / Promote settings" — the owner-switchable
-// publish gates. Rendered inside SettingsTab. Off = the gate still runs and
+// publish gate. Rendered inside SettingsTab. Off = the gate still runs and
 // is reported on the version, but never refuses a promote.
 import { cn } from '../lib/cn'
 
 export interface PublishSettingsValue {
-  require_specs: boolean
   require_run: boolean
 }
 
@@ -41,12 +40,6 @@ export function Switch({
 }
 
 const ROWS: { key: keyof PublishSettingsValue; label: string; hint: string; testId: string }[] = [
-  {
-    key: 'require_specs',
-    label: 'Pushing a version requires all tests to be green',
-    hint: 'The tests of the version being pushed run first; one red test refuses the promote.',
-    testId: 'switch-require-specs',
-  },
   {
     key: 'require_run',
     label: 'Pushing a version requires at least one successful run',

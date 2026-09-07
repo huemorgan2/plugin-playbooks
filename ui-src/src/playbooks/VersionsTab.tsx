@@ -1,14 +1,14 @@
 /**
  * VersionsTab (plans/016 phase 4) — the playbook view. Version list on the
  * right, the selected version on the left with its own toolbar:
- *   vN · created date · Canvas | Code | Manifest | Tests | Runs · badge/Promote
+ *   vN · created date · Canvas | Code | Manifest | Connections | Runs · badge/Promote
  * Opens on the live version. Selection is the highlighted row — nothing is
  * ever labelled "selected"; the only row badges are `Published · Live` and
  * `Candidate`.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  Eye, FileCode, FileText, FlaskConical, Play, Rocket, Loader2, X, History,
+  Eye, FileCode, FileText, Plug, Play, Rocket, Loader2, X, History,
   PanelRightClose,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
@@ -19,7 +19,7 @@ import { findStepById } from './explain/dataflow'
 import { VersionCanvas, CodeView, sourceFor } from './VersionCanvas'
 import { StepDetailPanel, execRowsForStep } from './StepDetailPanel'
 import { ManifestTab } from './ManifestTab'
-import { TestsTab } from './TestsTab'
+import { ConnectionsTab } from './ConnectionsTab'
 import { RunsTab } from './RunsTab'
 import { timeAgo } from './editorBits'
 import type { PlaybookDef, PlaybookRunDetail, StepDef, VersionDetail } from './types'
@@ -33,17 +33,15 @@ export type VersionEntry = {
   promoted_from: number | null
   live: boolean
   candidate: boolean
-  /** plans/016 phase 5: that version's spec cache. */
-  specs: { total: number; failed: number; green: number }
 }
 
-export type VersionView = 'canvas' | 'code' | 'manifest' | 'tests' | 'runs'
+export type VersionView = 'canvas' | 'code' | 'manifest' | 'connections' | 'runs'
 
 const VIEWS: { view: VersionView; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { view: 'canvas', label: 'Canvas', icon: Eye },
   { view: 'code', label: 'Code', icon: FileCode },
   { view: 'manifest', label: 'Manifest', icon: FileText },
-  { view: 'tests', label: 'Tests', icon: FlaskConical },
+  { view: 'connections', label: 'Connections', icon: Plug },
   { view: 'runs', label: 'Runs', icon: Play },
 ]
 
@@ -239,8 +237,8 @@ export function VersionsTab({
   const [selectedStep, setSelectedStep] = useState<StepDef | null>(null)
   const [promoting, setPromoting] = useState(false)
   const [promoteError, setPromoteError] = useState<string | null>(null)
-  // 021: the Promote click opens a confirm showing the ✓/✗ state (tests,
-  // test runs) — the owner is never blocked; their click is the consent.
+  // 021: the Promote click opens a confirm showing the ✓/✗ state (test
+  // runs) — the owner is never blocked; their click is the consent.
   const [confirmOpen, setConfirmOpen] = useState(false)
   // The version list folds away to a slim rail when the owner wants the room.
   const [listOpen, setListOpen] = useState(true)
@@ -260,7 +258,6 @@ export function VersionsTab({
           runs: r.runs,
           promoted_from: r.promoted_from,
           live: !!(r.live ?? r.current),
-          specs: r.specs ?? { total: 0, failed: 0, green: 0 },
           candidate: !!r.candidate,
         }))
         setVersions(list)
@@ -393,13 +390,6 @@ export function VersionsTab({
   const selectedEntry = versions?.find((v) => v.version === selected) ?? null
   const checks: { ok: boolean; text: string }[] = selectedEntry
     ? [
-        selectedEntry.specs.total === 0
-          ? { ok: false, text: 'No tests defined' }
-          : selectedEntry.specs.failed > 0
-            ? { ok: false, text: `${selectedEntry.specs.failed} of ${selectedEntry.specs.total} tests red` }
-            : selectedEntry.specs.green === selectedEntry.specs.total
-              ? { ok: true, text: `Tests: ${selectedEntry.specs.green}/${selectedEntry.specs.total} green` }
-              : { ok: false, text: `${selectedEntry.specs.total - selectedEntry.specs.green} of ${selectedEntry.specs.total} tests not run` },
         selectedEntry.runs > 0
           ? { ok: true, text: `Has run ${selectedEntry.runs} ${selectedEntry.runs === 1 ? 'time' : 'times'}` }
           : { ok: false, text: 'Never run — no test run of this version' },
@@ -556,8 +546,8 @@ export function VersionsTab({
                   </div>
                 </div>
               )
-            ) : view === 'tests' ? (
-              <TestsTab name={name} version={detail.version} />
+            ) : view === 'connections' ? (
+              <ConnectionsTab name={name} />
             ) : (
               <RunsTab
                 name={name}
@@ -665,22 +655,6 @@ export function VersionsTab({
                       <span>·</span>
                       <span>{v.runs} {v.runs === 1 ? 'run' : 'runs'}</span>
                     </div>
-                    {v.specs.total > 0 && (
-                      <div
-                        className={cn(
-                          'text-[11px] mt-1',
-                          v.specs.failed > 0 ? 'text-rose-400' : v.specs.green === v.specs.total ? 'text-emerald-400' : 'text-ink-500',
-                        )}
-                        data-testid={`version-specs-${v.version}`}
-                      >
-                        {v.specs.total} {v.specs.total === 1 ? 'test' : 'tests'} ·{' '}
-                        {v.specs.failed > 0
-                          ? `${v.specs.failed} red`
-                          : v.specs.green === v.specs.total
-                            ? `${v.specs.green} green`
-                            : `${v.specs.green} green, ${v.specs.total - v.specs.green} not run`}
-                      </div>
-                    )}
                     {v.promoted_from != null && (
                       <p className="text-[10px] text-ink-600 mt-1">← promoted from v{v.promoted_from}</p>
                     )}

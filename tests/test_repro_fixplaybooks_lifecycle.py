@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import uuid
 
-import pytest
 from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import select

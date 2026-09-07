@@ -112,7 +112,7 @@ Tests: is defined, is none, is string, is number, is mapping, is iterable,
 
 THE LOOP: playbook_propose/playbook_edit (read → ticket → write) →
 playbook_validate → playbook_dry_run (stubs effects; proves paths/branches) →
-playbook_publish (specs + a green test run gate it) → playbook_run →
+playbook_publish (a green test run gates it) → playbook_run →
 playbook_status(run_id).
 A save creates a CANDIDATE; live changes only on publish.
 """

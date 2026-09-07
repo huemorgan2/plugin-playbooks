@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import ast
 import copy
-import keyword
 import re
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ..definition import PlaybookDef

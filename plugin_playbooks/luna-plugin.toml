@@ -1,11 +1,11 @@
 name = "plugin-playbooks"
-version = "0.46.0"
+version = "0.47.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_specs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations", "playbook_watches"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations", "playbook_watches"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -33,8 +33,8 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 30
-tables = 11
+tools = 25
+tables = 10
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
 # agent_tools.build_tools + delegation.build_delegation_tools and pinned by
@@ -103,13 +103,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_versions"
-description = "List every stored version of a playbook with content/spec/run summary."
+description = "List every stored version of a playbook with content/run summary."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_version_read"
-description = "Full read of any stored version: code, manifest, specs, recent runs."
+description = "Full read of any stored version: code, manifest, recent runs."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -139,7 +139,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_dry_run"
-description = "Simulate a playbook run with tool/LLM steps stubbed — no side effects."
+description = "Simulate a playbook run with tool/LLM steps stubbed (scriptable via stubs) — no side effects."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -172,36 +172,6 @@ name = "playbook_run_candidate"
 description = "Test-run the candidate version for real (owner approval)."
 policy = "prompt_always"
 risk_level = "medium"
-
-[[tools]]
-name = "playbook_spec_add"
-description = "Add a spec (test) to a playbook version."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_spec_list"
-description = "List a playbook version's specs and their last results."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_spec_delete"
-description = "Delete one spec from a version's test set (owner approval; lead with why)."
-policy = "prompt_always"
-risk_level = "medium"
-
-[[tools]]
-name = "playbook_spec_run"
-description = "Run a version's specs (dry-run) and report pass/fail."
-policy = "auto_approve"
-risk_level = "low"
-
-[[tools]]
-name = "playbook_spec_from_run"
-description = "Draft a spec from a recorded run's actual step data."
-policy = "auto_approve"
-risk_level = "low"
 
 [[tools]]
 name = "playbook_preflight"

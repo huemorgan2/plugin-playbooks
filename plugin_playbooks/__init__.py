@@ -29,11 +29,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "publish_autonomy", "VARCHAR(16) NOT NULL DEFAULT 'ask'"),
     ("playbook_runs", "report_to", "UUID"),
     ("playbook_runs", "is_test", "BOOLEAN NOT NULL DEFAULT FALSE"),
-    # 0.28.0 (plans/016 phase 6): switchable publish gates
-    ("playbooks", "publish_require_specs", "BOOLEAN NOT NULL DEFAULT TRUE"),
+    # 0.28.0 (plans/016 phase 6): switchable publish gate
     ("playbooks", "publish_require_run", "BOOLEAN NOT NULL DEFAULT TRUE"),
-    # 0.28.0 (plans/016 phase 5): specs belong to a version
-    ("playbook_specs", "playbook_version", "INTEGER NOT NULL DEFAULT 0"),
     # 0.44.0 (plans/028): wake-on-completion promise flag
     ("playbook_runs", "wake_on_complete", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
@@ -42,7 +39,6 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
 # index (a different name) can be created next to them without conflicts.
 _LEGACY_INDEXES: list[tuple[str, str]] = [
     # (table, index name)
-    ("playbook_specs", "ix_playbook_specs_playbook_name"),   # 0.28.0: now (pb, version, name)
 ]
 
 
@@ -84,44 +80,48 @@ async def _drop_legacy_indexes(engine) -> None:
             logger.info("playbooks: dropped legacy index %s on %s", name, table)
 
 
-async def backfill_spec_versions(session_factory) -> int:
-    """0.28.0 (plans/016 phase 5): pin pre-versioned specs (playbook_version
-    0) to the playbook's live version, and give the candidate — if one
-    exists — its own copy. Idempotent. Returns the number of rows touched."""
-    from sqlalchemy import select
+async def _drop_spec_remnants(engine) -> None:
+    """0.47.0: the stored-tests feature was removed — drop its table and
+    the `playbooks.publish_require_specs` column from installs that still
+    carry them. Idempotent: a fresh install (or a second load) finds nothing
+    and does nothing. Row counts are logged before the drop so the upgrade
+    leaves a record of what it discarded."""
+    from sqlalchemy import inspect, text
 
-    from .models import Playbook, PlaybookSpec
-    from .versioning import copy_specs, live_version_of
+    def _present(sync_conn):
+        insp = inspect(sync_conn)
+        has_table = insp.has_table("playbook_specs")
+        has_col = insp.has_table("playbooks") and any(
+            c["name"] == "publish_require_specs"
+            for c in insp.get_columns("playbooks")
+        )
+        return has_table, has_col
 
-    touched = 0
-    async with session_factory() as session:
-        rows = (await session.execute(
-            select(PlaybookSpec).where(PlaybookSpec.playbook_version == 0)
-        )).scalars().all()
-        if not rows:
-            return 0
-        pids = {r.playbook_id for r in rows}
-        playbooks = {
-            p.id: p for p in (await session.execute(
-                select(Playbook).where(Playbook.id.in_(pids))
-            )).scalars().all()
-        }
-        for r in rows:
-            p = playbooks.get(r.playbook_id)
-            if p is None:
-                continue
-            r.playbook_version = live_version_of(p)
-            touched += 1
-        await session.flush()
-        for p in playbooks.values():
-            if p.candidate_version:
-                touched += await copy_specs(
-                    session, p.id, live_version_of(p), p.candidate_version,
-                )
-        await session.commit()
-    if touched:
-        logger.info("playbooks: versioned %d spec row(s)", touched)
-    return touched
+    async with engine.begin() as conn:
+        has_table, has_col = await conn.run_sync(_present)
+        if not has_table and not has_col:
+            return
+        spec_rows = 0
+        if has_table:
+            spec_rows = (await conn.execute(
+                text("SELECT COUNT(*) FROM playbook_specs")
+            )).scalar() or 0
+        relaxed = 0
+        if has_col:
+            relaxed = (await conn.execute(
+                text("SELECT COUNT(*) FROM playbooks WHERE NOT publish_require_specs")
+            )).scalar() or 0
+        logger.info(
+            "playbooks: dropping playbook_specs (%d rows) and "
+            "playbooks.publish_require_specs (%d rows false) — feature "
+            "removed in 0.47.0", spec_rows, relaxed,
+        )
+        if has_table:
+            await conn.execute(text("DROP TABLE IF EXISTS playbook_specs"))
+        if has_col:
+            await conn.execute(
+                text("ALTER TABLE playbooks DROP COLUMN publish_require_specs")
+            )
 
 
 async def backfill_code(session_factory) -> int:
@@ -217,7 +217,7 @@ two-step ticket flow — see MANIFEST + THE EDIT FLOW below.
 (line numbers, undefined refs, unknown tools, bad loops, cycles).
 3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with tool/LLM
 steps STUBBED: proves loops iterate, branches branch, templates resolve — no
-side effects. Tests the CANDIDATE by default. Outputs are SIMULATED: NEVER
+side effects. Exercises the CANDIDATE by default. Outputs are SIMULATED: NEVER
 report a dry-run value as a real result. Copy your `steps.<id>.<field>`
 paths from its `references`. The trace's per-step `output` key is JUST a
 label — `steps.<id>.output.<field>` does not exist.
@@ -371,33 +371,25 @@ Saving an edit creates a CANDIDATE — the LIVE playbook keeps running
 unchanged until you publish. Loop: edit → `candidate_saved` (one candidate
 max; history keeps every version) → `playbook_dry_run` (candidate by
 default) → REAL supervised proof `playbook_run_candidate` (asks the owner)
-→ `playbook_publish(name)` — gates: static validation, SPECS, a green test
-run since the last edit; a refusal names the failing gate — fix the
+→ `playbook_publish(name)` — gates: static validation, a green test run
+since the last edit, tool probes; a refusal names the failing gate — fix the
 candidate, never bypass. `playbook_rollback(name)` restores the previous
 live version. NEVER report an edit as done after `candidate_saved` — the
 old version runs until publish succeeds.
 
-### SPECS (playbook tests)
-A spec is a stored test: fixture `inputs`, scripted `stubs` (step-id or
-tool-name → pretended output), and `expect` assertions over the dry-run
-trace. Specs run automatically on every candidate save and are a PUBLISH
-GATE — a failing spec blocks `playbook_publish` until the code is fixed or
-the spec updated.
+### DRY-RUN STUBS (script what stubbed steps return)
+`playbook_dry_run(name, inputs, stubs)` — `stubs` is a JSON object mapping a
+step id or tool name (step id wins) to the raw result that step returns in
+the simulation, so downstream templates see fixture-shaped data.
 - Write stubs from recorded reality, not memory: after ANY real run — even
-a FAILED one — start from `playbook_spec_from_run(name)`; trim, then save.
-- BATCH all new specs into ONE `playbook_spec_add(name, specs=...)` call
-(JSON object name → body).
-- `playbook_spec_run` runs all specs; `playbook_spec_list` shows last
-results. No specs = no safety net — after meaningful changes, propose
-pinning one from a good run.
-- Keep specs SMALL — assert only what matters; over-tight specs fail on
-harmless changes.
+a FAILED one — copy the step outputs `playbook_status(run_id)` shows.
+- Keep stubs SMALL — only the fields the playbook actually reads.
 
 ### PREFLIGHT (are the tools alive?)
-Specs stub the outside world; `playbook_preflight(name)` probes every tool
+Dry runs stub the outside world; `playbook_preflight(name)` probes every tool
 the playbook touches: `ok`, `unprobeable` (no probe declared — common, NOT
 an error), `failed` (missing tool, dead credential, gone resource — blocks
-publish). Run it when a playbook misbehaves despite passing specs, or before
+publish). Run it when a playbook misbehaves despite a clean dry run, or before
 publishing external-service playbooks.
 
 ### CHANGING AN EXISTING WORKFLOW (a new requirement = an insertion)
@@ -406,7 +398,7 @@ always an INSERTION mid-graph, NOT a step bolted on the end, NEVER a second
 monolith. Recipe: read stage → find the SEAM ('for each role' means inside
 the per-role loop() body) → splice the new steps there, decomposed →
 RE-POINT downstream refs to the NEW step's output (this rewiring is the real
-work) → validate → dry_run → fix any failed specs → publish. Never create a
+work) → validate → dry_run → fix what the trace shows → publish. Never create a
 '-v2' copy — edit IN PLACE by name.
 
 ### Posting to the chat from a playbook:
@@ -453,8 +445,8 @@ async def failure_digest(session) -> list[dict]:
     Scope: runs of the CURRENT live version only (an edit+publish resets the
     count — "since the last change"), status 'failed', gated on the
     version-scoped ack. Candidate runs are excluded by construction (their
-    playbook_version is the candidate number); dry runs and spec evaluations
-    never write playbook_runs rows. One grouped query over the
+    playbook_version is the candidate number); dry runs never write
+    playbook_runs rows. One grouped query over the
     (playbook_id, started_at) index; the per-playbook detail queries run only
     for playbooks that are actually failing.
     """
@@ -564,14 +556,14 @@ _DELEGATION_SKILL_BODY = '''\
 # Delegating playbook work
 
 `playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
-authoring job (create, fix, edit, add specs) to a focused background agent.
-It runs the full loop — read, edit, validate, dry-run, specs, publish —
+authoring job (create, fix, edit) to a focused background agent.
+It runs the full loop — read, edit, validate, dry-run, test run, publish —
 in its own context; your chat keeps one call and one short result.
 
 ## When to delegate vs. do it yourself
 
 Delegate the moment a job needs the authoring loop: creating a playbook,
-fixing a failing one, changing steps, adding or repairing specs. Load
+fixing a failing one, changing or adding steps. Load
 `playbook-authoring` and work inline only when the owner explicitly wants
 to build it together step by step, or the change is trivial and you already
 have the skill loaded this conversation.
@@ -594,7 +586,7 @@ Write the task like a work order: goal + constraints + acceptance. Name the
 playbook for edit/fix jobs. Include what the owner told you (desired
 behavior, examples, the failing run's symptom). Good:
 "Fix the phone format in candidate-intake: numbers must normalize to
-E.164; all specs must pass; publish when green."
+E.164; publish when the test run is green."
 Spell collection jobs as loops — "for each unread email ..." — so the
 delegate builds a loop.
 
@@ -621,7 +613,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.46.0",
+        version="0.47.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -661,11 +653,6 @@ class PlaybooksPlugin(LunaPlugin):
                     "playbook_dry_run",
                     "playbook_set_autonomy",
                     "playbook_list_available_triggers",
-                    "playbook_spec_add",
-                    "playbook_spec_list",
-                    "playbook_spec_delete",
-                    "playbook_spec_run",
-                    "playbook_spec_from_run",
                     "playbook_preflight",
                     "playbook_language_reference",
                 ],
@@ -729,6 +716,11 @@ class PlaybooksPlugin(LunaPlugin):
             await _drop_legacy_indexes(ctx.engine)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: legacy index drop failed: %s", e)
+        # 0.47.0: the stored-tests feature is gone — drop its table and column.
+        try:
+            await _drop_spec_remnants(ctx.engine)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: spec remnant drop failed: %s", e)
 
         # plans/001: `table.create(checkfirst=True)` skips the whole table when
         # it already exists, indexes included — so installs that predate an
@@ -773,12 +765,6 @@ class PlaybooksPlugin(LunaPlugin):
             await backfill_live_version(ctx.db_session_factory)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: live_version backfill failed: %s", e)
-
-        # 0.28.0 (plans/016 phase 5): specs belong to a version.
-        try:
-            await backfill_spec_versions(ctx.db_session_factory)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("playbooks: spec version backfill failed: %s", e)
 
         # 0.38.0: drop redundant duplicate (playbook, version) rows left by
         # the pre-0.32 edit path (they 500ed version reads and doubled the
@@ -889,12 +875,6 @@ class PlaybooksPlugin(LunaPlugin):
         "playbook_dry_run",
         "playbook_set_autonomy",
         "playbook_list_available_triggers",
-        # 0.11.0: specs — every SkillDef tool must be here too (phase-3 rule).
-        "playbook_spec_add",
-        "playbook_spec_list",
-        "playbook_spec_delete",
-        "playbook_spec_run",
-        "playbook_spec_from_run",
         # 0.12.0: preflight probes
         "playbook_preflight",
         # 0.15.0 (plans/003): on-demand language recall
@@ -912,7 +892,7 @@ class PlaybooksPlugin(LunaPlugin):
 
     def _register_tool(self, ctx: PluginContext, tool_def, handler) -> None:
         # plans/027 (luna 102/phase9.1): a core that cannot gate must fail
-        # LOUD at load time — the old fallback silently registered all 18
+        # LOUD at load time — the old fallback silently registered all 13
         # authoring/delegation tools ungated on such cores, defeating the
         # skill gate with no operator-visible signal.
         if (

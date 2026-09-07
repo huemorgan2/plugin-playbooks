@@ -84,7 +84,7 @@ async def test_right_token_returns_running_shape_with_cors(env):
 async def test_live_feed_beats_stale_db_row(env):
     c, sf, row = env
     feed = _EventFeed(sf, row.id)
-    feed._append("tool", "playbook_spec_run", phase="Prove")
+    feed._append("tool", "playbook_dry_run", phase="Prove")
     feed._append("tool", "playbook_publish", phase="Ship")
     feed.steps_used = 3
     _LIVE_FEEDS[row.id] = feed  # newer than the flushed row
@@ -92,7 +92,7 @@ async def test_live_feed_beats_stale_db_row(env):
     body = (await c.get(_url(row.id, TOKEN))).json()
     assert body["steps_used"] == 3
     assert [e["label"] for e in body["events"]] == [
-        "playbook_spec_run", "playbook_publish",
+        "playbook_dry_run", "playbook_publish",
     ]
 
 

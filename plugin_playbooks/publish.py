@@ -149,13 +149,13 @@ async def test_run_gate(
             )
         else:
             note = f"version {version} has no test run since its last edit"
-            # plans/016 phase 3: green specs routinely precede this refusal
-            # and read as "all tests pass" — say why they are not enough.
+            # plans/016 phase 3: a green dry run routinely precedes this
+            # refusal — say why it is not enough.
             error = (
                 "Publish refused — gate 'test_run' failed: version "
                 f"{version} has not had a REAL run since its last edit. "
-                "Passing specs are not run evidence — specs are dry-run "
-                "simulations with tools stubbed."
+                "Dry runs are not run evidence — they are simulations with "
+                "tools stubbed."
             )
             hint = (
                 "Run the candidate for real once — playbook_run_candidate "
@@ -306,61 +306,3 @@ async def announce_publish(
     except Exception:  # noqa: BLE001
         log.exception("publish announce failed name=%s", name)
 
-
-async def specs_gate(
-    session: AsyncSession,
-    runner: Any,
-    playbook_id: Any,
-    target: Any,
-    version_n: int,
-    *,
-    require: bool = True,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """plans/016 phase 5: the specs gate, evaluated on the specs OF the
-    version going live (`playbook_specs.playbook_version == version_n`)
-    against that version's content — candidates AND restores/rollbacks
-    (supersedes plans/015 deviation #4). Returns (gate_entry, refusal_dict);
-    the refusal is None when every spec passed or the version has none.
-    Spec result caches are updated on the rows — the caller commits.
-
-    plans/016 phase 6: `require=False` (Settings → Publish) keeps the run and
-    the report but never refuses — the gate entry carries `enforced: False`."""
-    from .specs import run_all_specs
-
-    summary = await run_all_specs(session, runner, playbook_id, target, version_n)
-    gate = {
-        "gate": "specs",
-        "ok": summary["failed"] == 0,
-        "note": (
-            "no specs defined" if summary["total"] == 0
-            else f"{summary['passed']}/{summary['total']} passed"
-        ),
-        # plans/022 P1: machine-readable counts for the publish payload's
-        # evidence block.
-        "total": summary["total"],
-        "passed": summary["passed"],
-    }
-    if not summary["failed"]:
-        return gate, None
-    failing = [r for r in summary["results"] if not r["passed"]]
-    if not require:
-        gate["enforced"] = False
-        gate["note"] += " — not enforced (Settings → Publish)"
-        return gate, None
-    return gate, {
-        "error": (
-            f"Publish refused — gate 'specs' failed ({len(failing)} of "
-            f"{summary['total']} red on version {version_n}). Owner can relax this in Settings → Publish."
-        ),
-        "message": (
-            f"Promote refused — gate 'specs' failed ({len(failing)} of "
-            f"{summary['total']} red on v{version_n}). Owner can relax this in Settings → Publish."
-        ),
-        "gate": "specs",
-        "failing_specs": failing,
-        "hint": (
-            "Fix the candidate via playbook_edit, or update the spec if the "
-            "expectation itself changed (playbook_spec_add upserts by name). "
-            "Owner can relax this in Settings → Publish."
-        ),
-    }

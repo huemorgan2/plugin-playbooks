@@ -195,7 +195,7 @@ async def test_mint_version_mints_above_stored_rows(client):
         pb.version = 1  # counter fell behind the stored rows (max row = 2)
         row = await mint_version(
             s, pb, definition=_defn(3), code=None, manifest="M3",
-            author="agent", message="edit", source_version=2,
+            author="agent", message="edit",
         )
         await s.commit()
     assert row.version == 3  # above max(rows), not counter+1 == 2
