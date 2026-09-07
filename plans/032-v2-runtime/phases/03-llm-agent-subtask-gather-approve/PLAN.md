@@ -1,6 +1,6 @@
 # 032 — Phase 03: Effects: ctx.llm, ctx.agent, ctx.subtask, ctx.gather, ctx.approve (in-process form)
 Status: pending
-Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §2 Language, §2 Execution model, §2 Effect execution semantics, §2 Sub-agents, §2 Lifecycle (`result` column, `failed_handled` hoisting), §3 P1; master phase M1
+Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §2 Language (effect contracts, `Rejected`/`ApprovalExpired`, `failed_handled` + its hoisting exclusion), §2 Execution model, §2 Effect execution semantics, §2 Sub-agents, §2 Lifecycle (`result` column), §3 P1; master phase M1
 Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
 Depends on: plugin/01 (checker admits `ctx.llm/agent/subtask/gather/approve`, rejects `ctx.wait_event` and `ctx.sleep`), plugin/02 (host segment loop in `v2/loop.py`, in-memory `JournalStore` in `v2/journal.py`, shim exit/replay in `v2/shim.py`, `ctx.tool`, the `ctx.EffectError` family)
 Unblocks: plugin/04, plugin/05 (dry stubs for these kinds), plugin/07 (park form of `ctx.approve`), plugin/08 (persisted subtask `result`, `failed_handled` hoisting exclusion)
@@ -22,8 +22,15 @@ A caught effect failure is journaled `failed_handled` and the run completes.
 ## Scope — changes
 
 All effect execution lives host-side in `plugin_playbooks/v2/loop.py`
-(phase 02's module; if phase 02's summary split effect dispatch into its
-own module, the handlers go there). The shim side is `v2/shim.py`.
+(phase 02's `SegmentLoop`; if phase 02's summary split effect dispatch into
+its own module, the handlers go there). The shim side is `v2/shim.py`.
+Phase 02's `SegmentLoop(session_factory, tools, events, ctx, journal, …)`
+carries no agent facade and no way to start a run, so this phase adds two
+constructor arguments: `agent=` (the facade `PlaybookRunner` already holds
+as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
+`start_run=` (the bound `PlaybookRunner.start_run`, runner.py:257-277, for
+`ctx.subtask`); `PlaybookRunner.__init__` passes both. Below, `self._agent`
+/ `self._ctx` mean the loop's copies of the runner's `_agent` / `_ctx`.
 
 - `ctx.llm(prompt, output=None, purpose=None, model=None, system=None)`.
   Host calls `self._agent.run_llm(prompt, purpose=purpose or
@@ -40,9 +47,12 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
   v1 rule at runner.py:1018); no `output=` → `str` (a dict answer is
   `json.dumps`-ed). Cost: the entry gets `cost_cents` under the
   `_record_step_cost` rule (runner.py:1382-1397: only when `usage` has a
-  truthy `cost_cents` attribute). Billing scope: the call runs inside
+  truthy `cost_cents` attribute, :1389). Billing scope: the call runs inside
   `_playbook_origin_scope(playbook)` (runner.py:173-189), as v1's
-  `_drive_run` does at runner.py:489-490.
+  `_drive_run` does at runner.py:489-490; phase 02's v2 branch sits before
+  that `with` block (:484-488), so the loop imports the name into
+  `v2/loop.py` (`from ..runner import _playbook_origin_scope`) and calls it
+  through its own module global — which is what exit test 3 monkeypatches.
 - `ctx.agent(prompt, output=None, tools=None)`. Host calls
   `self._agent.run_turn(prompt, output_schema=output, tools=tools,
   memory_write=False, conversation_id=run.report_to,
@@ -68,20 +78,30 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
 - `ctx.subtask(playbook, inputs, returns=None)`. Host resolves the
   `Playbook` by name (the select at runner.py:1093-1095); not found →
   `EffectError("Subtask playbook '<name>' not found")` (v1 text,
-  runner.py:1098). The child row is created by phase 02's run-creation
-  path (the copy of runner.py:387-429) with `trigger=f"subtask:{parent
-  run id}"`, `parent_run_id=parent.id`, `is_test=parent.is_test` (v1
-  at runner.py:1113-1119) — so the v1 `report_to` rule (runner.py:398-406:
-  `subtask:` triggers count as chat-invoked) applies unchanged. The child
-  runs through the same segment loop inside the parent's task (awaited,
-  like v1's blocking `start_run`, runner.py:257-277, pinned by
+  runner.py:1098). Phase 02 defines no run-creation helper (its
+  `SegmentLoop.drive(run, …)` receives an existing row), so the child goes
+  through the injected `start_run` — v1's own subtask path
+  (runner.py:1113-1119): `await start_run(target, inputs=inputs,
+  trigger=f"subtask:{parent.id}", parent_run_id=parent.id,
+  is_test=parent.is_test)`. `start_run` (:257-277, blocking, pinned by
   `tests/test_async_run.py::test_blocking_start_run_unchanged_for_subtasks`
-  :167-176) with `_active_run_id` set to the child id for the child's
-  effects and restored to the parent id afterwards. The effect result is
-  the child's `run()` return value held in memory; the entry records
-  `child_run_id`. Child failure → `EffectError` carrying the child's
-  error text and run id. Cycle guard: the loop carries the ancestor
-  playbook-name chain (parent chain + own name); a target already in the
+  :167-176) creates the row via `_create_run` (:373-437) — so the v1
+  `report_to` rule (:398-406: `subtask:` triggers count as chat-invoked)
+  applies unchanged — and `_drive_run` dispatches a python-format child to
+  the same segment loop (phase 02's `sniff_format` branch), awaited inside
+  the parent's task. `_drive_run` already sets `_active_run_id` to the
+  child id (:478) and resets it to the parent's on exit (:535), so the
+  child's effects see the child id and the parent's next effect the parent
+  id with no extra code in the loop. The effect result is
+  the child's `run()` return value held in memory: `start_run` returns the
+  `PlaybookRun` row, not the value, so `SegmentLoop.drive` parks each
+  finished run's `LoopResult.value` in a per-instance dict keyed by run id
+  and the parent pops it after `start_run` returns (one `SegmentLoop` per
+  `PlaybookRunner`, so parent and child share the dict); the entry records
+  `child_run_id`. Child failure (row `failed`, no value) → `EffectError`
+  carrying the child's `run.error` text and run id. Cycle guard: the loop
+  carries the ancestor playbook-name chain per run id (parent chain + own
+  name, handed to the child before `start_run`); a target already in the
   chain fails the effect with `EffectError` whose text reuses the
   `_nested_run_refusal` wording ("would recurse") and names the chain,
   before any child row is written. The static `detect_subtask_cycles`
@@ -90,7 +110,10 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
   un-awaited effect handle; `gather` assigns `seq` to the handles in
   argument order, replays every seq present in the journal, and exits
   with the list of the missing ones as pending effects in one
-  `outputs/effect.json` (phase 02's exit payload, list form). Host: runs
+  `outputs/result.json` of `kind: "gather"` (phase 02 Risks 1: one
+  `result.json` with `kind: effect | gather | return | error`; the
+  `gather` kind carries `effects: [{seq, id, effect_kind, args}, …]`
+  in argument order). Host: runs
   the pending list concurrently (`asyncio.gather(...,
   return_exceptions=True)`, one task per effect so `_active_run_id` is
   per task), journals each entry as it settles, then re-runs the segment.
@@ -127,13 +150,17 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
   `failed` → `failed_handled`. An uncaught failure propagates out of
   `run()`, the segment exits with an error and the run fails as phase 02
   defines; the entry stays `failed`.
-- `send_chat_message` rule for `ctx.tool` (scope item; verify phase 02
-  already has it, else add): copy runner.py:856-867 — no
-  `conversation_id` in args → inject `str(run.report_to)` when set; else
-  when not `is_test` fail with the v1 text "this run has no chat to report
-  to — scheduled/background runs no longer deliver to the ops chat…";
-  test runs fall back to the ops conversation as `start_run` computes
-  `report_to` (runner.py:398-402).
+- `send_chat_message` rule for `ctx.tool` (assigned to this phase; phase
+  02's plan does not carry it — its tool path is vault resolution →
+  `rt.handler(**args)` only): copy runner.py:856-867 into the `tool`
+  handler — no `conversation_id` in args → inject `str(run.report_to)`
+  when set (v1 reads `ctx.conversation_id`, which is `run.report_to`,
+  :474) and journal the injected args as the entry's `args`; else when
+  not `run.is_test` fail the effect (`failed`, `ToolError`) with the v1
+  text "this run has no chat to report to — scheduled/background runs no
+  longer deliver to the ops chat…" (:861-867); test runs need no fallback
+  here because `_create_run` already stamps `report_to` = origin chat or
+  the ops conversation for `is_test` rows (runner.py:401-402).
 - Journal entry fields added (in-memory; phase 06 persists them):
   `cost_cents`, `transcript`, `child_run_id`, and the `handled` re-stamp.
 - `docs/v2.md`: one subsection per effect (signature, return rule,
@@ -162,8 +189,8 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
 ## Steps
 
 1. Read phase 02's `execution_summary.md` and the final names it settled
-   (`JournalStore` entry fields, exit payload shape, effect dispatch
-   table, exception family, run-creation helper). Rewrite the symbol
+   (`JournalStore` entry fields, the `result.json` kinds, effect dispatch
+   table, exception family, `SegmentLoop` constructor). Rewrite the symbol
    names below to match before coding. Done when: every symbol this plan
    names exists at HEAD or is listed under "Deviations" in the summary.
 2. Shim (`v2/shim.py`): effect handles for `llm`, `agent`, `subtask`,
@@ -171,10 +198,11 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
    JSON-serialisable; `output=` is v1's schema dict); `ctx.gather`;
    replay raising `ctx.Rejected` / `ctx.ApprovalExpired` from error types;
    `handled` list in the exit payload. Done when: the shim harness phase
-   02 tests with (its `tests/test_v2_shim.py` style) shows a gather of
-   two un-journaled handles exits with two pending effects with `seq`
-   1 and 2 in argument order, and a journal holding both returns
-   `[r1, r2]`.
+   02 tests with (`tests/_jail.py::real_code_run`, the `[real_jail]`
+   tests of `tests/test_v2_loop.py`; phase 02 has no separate shim test
+   file) shows a gather of two un-journaled handles exits with one
+   `kind: "gather"` payload holding two pending effects with `seq` 1 and
+   2 in argument order, and a journal holding both returns `[r1, r2]`.
 3. `delegation.py`: extract `_TranscriptFeed` (pure mapping) and make
    `_EventFeed(_TranscriptFeed)` keep the DB flush. Done when:
    `pytest tests/test_delegation.py` is green unchanged (no flush test
@@ -190,18 +218,21 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
 5. Gather batch executor: multi-element pending exits run through
    `asyncio.gather(return_exceptions=True)`, one task each, each entry
    journaled on settlement. Done when: exit tests 6-7 pass.
-6. Subtask: run-row creation via phase 02's helper, child loop awaited
-   in-process, `_active_run_id` child/parent swap (ContextVar token
-   reset), ancestor chain + cycle guard, child failure → `EffectError`.
-   Done when: exit tests 8-11 pass and `active_run_id()` inside the
-   parent's next effect equals the parent id.
+6. Subtask: `start_run=` injected into `SegmentLoop`, child run through
+   `start_run` → `_create_run` → `_drive_run`'s v2 branch (awaited
+   in-process), the per-run value dict, ancestor chain + cycle guard,
+   child failure → `EffectError`. Done when: exit tests 8-11 pass and
+   `active_run_id()` inside the parent's next effect equals the parent
+   id (proves `_drive_run`'s set/reset at runner.py:478/:535 covers the
+   nested call).
 7. Approve: request construction, blocking await, decision mapping,
    expiry detection (`get` first, reason/decided_by fallback). Done when:
    exit tests 12-14 pass.
 8. `failed_handled` re-stamp from the `handled` list. Done when: exit
    tests 7, 10, 13 and 15 show the status.
-9. `send_chat_message` rule (add only if phase 02 lacks it). Done when:
-   exit test 16 passes.
+9. `send_chat_message` rule in the `tool` handler (phase 02's plan does
+   not carry it; if its summary shows it was added anyway, step 9 only
+   pins it). Done when: exit test 16 passes.
 10. `docs/v2.md` effect subsections. Done when: each of the five effects
     lists its exceptions and journal fields, and the doc states that a
     caught effect failure is journaled `failed_handled`.
@@ -209,9 +240,11 @@ own module, the handlers go there). The shim side is `v2/shim.py`.
     pyproject.toml:13-14). Done when: the 403 pre-existing tests are
     green, `tests/test_v2_effects.py` is green, and the red repro pins
     are exactly those listed under Exit tests.
-12. Commit on `v2-runtime` locally (no push). Fill in the Execution
-    summary below, including "no version bump — batched into the next
-    manifest/UI bump" (Risks 8).
+12. Commit on `v2-runtime` locally (no push). Write
+    `execution_summary.md` in this folder per the template below,
+    including "no version bump — batched into the next manifest/UI bump"
+    (Risks 8); revise plugin/05-08 with the final approve request shape
+    and entry fields.
 
 ## Exit tests
 
@@ -220,20 +253,26 @@ File: `tests/test_v2_effects.py`. Harness: per-test
 as in `tests/test_repro_fixplaybooks_runtime.py:57-62`; `_Bus`, `_Tool`,
 `_Tools` copied from that file (:29-48) with `fast`/`slow` (gated) tools
 (:64-77); v2 playbooks saved through phase 02's helper (a `Playbook` row
-whose live version holds `async def run(ctx, inputs)` code). Fakes named
-by the master's "same fakes the v1 suite uses":
+whose live version holds `async def run(ctx, inputs)` code). The runner
+is built as in that file (:78) plus `agent=` and `context=`; note
+`_create_run` reads `self._ctx.current_conversation_id` (runner.py:387)
+whenever a context is given, so the local `_Ctx` must carry
+`current_conversation_id = None` (the lifecycle file's `_Ctx` does not).
+Fakes as the repo `PLAN.md` phase index requires ("the v1 suite's
+`run_llm`/`run_turn` fakes"):
 - `_Agent` from `tests/test_manifest_flow.py:37-49` (`run_llm(prompt,
   **kw)` records `(prompt, kw)`, raises `exc`, returns `(result,
   {"total_tokens": 1})`) — the `run_llm` fake.
-- `FakeAgent` from `tests/test_delegation.py:84-110` (`run_turn(prompt,
+- `FakeAgent` from `tests/test_delegation.py:85-110` (`run_turn(prompt,
   **kwargs)` records kwargs, plays `events` through
   `kwargs["event_stream_handler"]`, waits on `gate`, raises `raise_exc`,
   returns `(result, {"total_tokens": 1234})`) with the event fakes at
-  :37-80 (`FunctionToolCallEvent`, `FunctionToolResultEvent`,
+  :37-82 (`FunctionToolCallEvent`, `FunctionToolResultEvent`,
   `_FunctionToolResultEventV2`, `PartStartEvent`) — the `run_turn` fake.
-  Import them from the test module (tests/ is importable: the lifecycle
-  file imports `evidence` and `readstage`); copy verbatim only if the
-  import proves fragile, and say so in the summary.
+  Import them from the test module (`tests/` has no `__init__.py`, so
+  pytest's rootdir conftest puts `tests/` on `sys.path`; the lifecycle
+  file already imports `evidence` and `readstage` that way); copy
+  verbatim only if the import proves fragile, and say so in the summary.
 - `_Decision` and `_Approvals` from
   `tests/test_repro_fixplaybooks_lifecycle.py:47-73`, extended locally as
   `_GatedApprovals`: `request(**kw)` appends `kw`, awaits an
@@ -320,10 +359,14 @@ Tests and assertions:
     tool raises; code catches `ctx.ToolError` and continues to
     `ctx.tool("fast")`; entry 1 `failed_handled`, entry 2 `done`, run
     `done`.
-16. `test_send_chat_message_conversation_rules_match_v1`: run with
-    `report_to` set → the handler receives `conversation_id ==
-    str(report_to)`; run with `report_to=None`, `is_test=False` → effect
-    `failed`, error contains "this run has no chat to report to".
+16. `test_send_chat_message_conversation_rules_match_v1`: a
+    `send_chat_message` fake tool; run with `report_to` set (write
+    `report_to` on the row before driving, or use `trigger="agent"` with a
+    `_Ctx.current_conversation_id`, runner.py:398-404) → the handler
+    receives `conversation_id == str(report_to)` and the journal entry's
+    `args` carry it; run with `report_to=None`, `is_test=False` → effect
+    `failed`, error contains "this run has no chat to report to", run
+    `failed`.
 
 Existing suite: `pytest -q` from the repo root — the 403 pre-existing
 tests stay green; `tests/test_manifest_drift.py` green with the three
@@ -337,18 +380,21 @@ on the v2 side only — test 12 above carries its identical assertions
 original stays red as a v1 pin (it drives a v1 `wait_for_approval` step,
 runner.py:1060-1069) until the v1 runner is retired, per the repo plan's
 Risks 4 flip rule; plugin/07 completes the item with the park form. The
-other six pins (`interrupted_run_survives_restart`,
-`wait_for_event_actually_waits`, `tool_step_timeout_is_enforced` →
-plugin/02, and the three lifecycle pins) are unchanged by this phase: 7
-red before, 7 red after.
+other six pins (`interrupted_run_survives_restart` → plugin/06,
+`wait_for_event_actually_waits` → plugin/07,
+`tool_step_timeout_is_enforced` → plugin/02 (v2 twin only, original
+stays red), and the three lifecycle pins → P0 plans) are unchanged by
+this phase: 7 red before, 7 red after (410 collected = 403 green + 7 red
+at HEAD, `pytest --collect-only -q`).
 
 ## Cross-repo checks
 
 - plugin/07 (park form): must reuse this phase's `kind="playbook_effect"`
   and payload `{run_id, seq, playbook, version}` unchanged, replacing
   only the `request` call with `request_nowait` plus the
-  `approval.decided` subscription (luna `approval/db_impl.py:877-883`
-  emits `{id, decision, reason, decided_by}`; `in_memory_impl.py:227/:233`).
+  `approval.decided` subscription (luna `approval/db_impl.py:882-889`
+  emits `{id, decision, reason, decided_by}`, logged at :876-881;
+  `in_memory_impl.py:232-238`, logged at :226-231).
   The in-process form needs no luna change: `request()` is the existing
   protocol (contract.py:95-118), and because a waiter exists the orphan
   continuation path is not involved (db_impl.py `_sweep_once` sets
@@ -413,19 +459,28 @@ red before, 7 red after.
    settled and the code proceeded past them). Un-awaited handles are
    never executed (as un-awaited coroutines); a checker warning is a
    later phase.
-10. Phase 02 names (`JournalStore` fields, exit payload list form,
-    dispatch table, `tests/test_v2_shim.py` harness, run-creation helper)
-    are taken from the repo plan's layout and may differ; step 1 reconciles
-    them. The `send_chat_message` rule may already exist in phase 02 —
-    then step 9 only pins it.
+10. Phase 02 names used here (`SegmentLoop`, `MemoryJournalStore` entry
+    fields, the `kind: "gather"` payload in `result.json`, the dispatch
+    table, `tests/_jail.py::real_code_run`) are taken from phase 02's
+    plan, not its summary, and may differ once it has run; step 1
+    reconciles them. Phase 02 defines no run-creation helper — this plan
+    uses `PlaybookRunner.start_run` — and no `send_chat_message` rule;
+    if its summary shows either was added anyway, step 6 / step 9 only
+    pin them.
 11. Cost lands on the journal entry, not on a `PlaybookStepRun` row (v2
     writes none); `_record_step_cost`'s extraction rule is copied, its
     UPDATE target is not. Cost totals surfaced in results are plugin/08+.
 
 ## Execution summary
 
-Ran:
-Results:
-Deviations from this plan:
-Learned:
-Revised:
+Written to `execution_summary.md` in this folder after the phase runs
+(never created empty up front), using this template:
+- Ran: (commands, dates, HEAD before/after; the `pytest -q` totals)
+- Results: (every exit test 1-16 with its outcome; the 7 red repro pins
+  confirmed unchanged; anything red and why)
+- Deviations from this plan: (what changed and why — phase 02 name
+  reconciliation from step 1, the Risks 2-7 assumptions confirmed or
+  corrected, "no version bump — batched into the next manifest/UI bump")
+- Learned: (facts that change later phases — the approve request shape
+  plugin/07 must keep, the entry fields plugin/06 must persist)
+- Revised: (which later phase files were edited because of this, and how)

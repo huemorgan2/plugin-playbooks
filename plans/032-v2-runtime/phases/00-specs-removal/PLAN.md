@@ -1,7 +1,7 @@
 # 032 — Phase 00: Specs (Tests tab) removal
 Status: pending
 Master: §2 Specs removal (owner decision 2026-09-07), §3 P1 Step 0, §4 Rollout (branch rules), §6 Test summary (the 7 red repro tests); checklist `luna-fixer plans/2026-09-06-fix-playbooks/specs-removal.md` (authoritative hook list; its "Order of operations" 1-6 and "DB migration"); master phase M0 (`luna-fixer plans/2026-09-06-fix-playbooks/phases/M0-specs-removal/PLAN.md`)
-Repo / branch: plugin-playbooks v2-runtime (HEAD 8c31a60 at writing; origin/main 749f126, version 0.46.0)
+Repo / branch: plugin-playbooks v2-runtime (code HEAD 8c31a60 at writing, plus the plan-only commit 5306f7f on top; origin/main 749f126, version 0.46.0)
 Depends on: — (P0 plans are master prerequisites, not phase inputs; no phase in any repo precedes this one)
 Unblocks: plugin/01 and through it plugin/02-12; luna/00 (runs luna 007.009 against this phase's commit) → luna/01; dojop/00 runs in parallel and shares the M0 gate
 
@@ -69,6 +69,9 @@ Package (`plugin_playbooks/`):
 - `card.py` :183 `WAIT_WORDS.playbook_spec_delete`; `probes.py` :3-4; `reference.py` :115
   "(specs + a green test run gate it)" → "(a green test run gates it)" (:3, :110, :121 are not
   hooks — language "spec", Jinja "Tests:"; `validation.py:63` "specially" is not one either).
+  Two verb-form hits of the guard's `\bTests\b` token, `__init__.py:220` and
+  `agent_tools.py:1645` "Tests the CANDIDATE" (skill body, `playbook_dry_run` description) →
+  "Exercises the CANDIDATE", so the token check needs no allowlist beyond `reference.py:110`.
 - `__init__.py`: `_COLUMN_MIGRATIONS` :33 and :35-36, `_LEGACY_INDEXES` :45;
   `backfill_spec_versions` :87-124 + call :777-781; new `_drop_spec_remnants` after
   `_drop_legacy_indexes` :70-84, called after :728-731; skill body :374 "SPECS,", :380-394
@@ -138,12 +141,13 @@ fact by the P1 go/no-go and the P4 keyhole gate, both measured without specs." (
   `_lifecycle.py` ×3) is expected to flip; they stay red.
 
 ## Steps
-0. Preconditions. `git status --short` at HEAD 8c31a60 shows only ` M uv.lock` and
-   `?? plans/032-v2-runtime/`. Reconcile `uv.lock` first (032 Risk 5): its diff is the lock
-   catching up with `pyproject.toml` (root 0.29.0 → 0.46.0, `pyyaml` gone) — commit it on its
-   own before this phase's commit, or discard it; record which. Baseline `pytest -q` from the
-   repo root with `.venv/bin/python` (no install): record passed/failed counts; only the 7 repro
-   tests fail. Proof: the counts in the summary; a clean tree apart from `plans/`.
+0. Preconditions. `git status --short` at HEAD 5306f7f (the plan-only commit on top of code HEAD
+   8c31a60; `plans/032-v2-runtime/` is already committed) shows only ` M uv.lock`. Reconcile
+   `uv.lock` first (032 Risk 5): its diff is the lock catching up with `pyproject.toml` (root
+   0.29.0 → 0.46.0, `pyyaml` gone; 1 insertion, 58 deletions) — commit it on its own before this
+   phase's commit, or discard it; record which. Baseline `pytest -q` from the repo root with
+   `.venv/bin/python` (no install): record passed/failed counts; only the 7 repro tests fail.
+   Proof: the counts in the summary; `git status --short` empty.
 1. Tests first (checklist order 1). Rewrite the three dry-run tests in
    `tests/test_plan026_navigable_dry_stubs.py` on `_bare_runner({"t": object(),
    "send_chat_message": object()})` with `_pb(steps)` (the step dicts, including
@@ -153,9 +157,13 @@ fact by the P1 go/no-go and the P4 keyhole gate, both measured without specs." (
    delete `tests/test_specs.py` and `tests/test_versioned_specs.py`; make every other test edit
    listed under Scope. Proof: `grep -rln "test_versioned_specs\|from test_specs" tests/` is
    empty; `pytest tests/test_plan026_navigable_dry_stubs.py tests/test_publish_settings.py
-   tests/test_tool_timeouts.py tests/test_version_routes.py -q` green before any package change
-   (only `test_candidate_flow`'s gate order and `test_manifest_drift` may stay red until steps 3
-   and 5).
+   tests/test_tool_timeouts.py -q` green before any package change (at HEAD the PATCH `{}` →
+   400 guard :889 and `set_autonomy(require_run=False)` already behave as the trimmed
+   assertions expect). The edits that assert on removed code stay red until step 3 (or 5 for
+   the manifest): `test_version_routes.py:198` (`mint_version` requires `source_version`,
+   versioning.py:131, until step 3 — make that one edit in step 3 instead), `test_build_operate`,
+   `test_delegation`, `test_delegate_prompt`, `test_card_route`, `test_zero_yaml:85`,
+   `test_candidate_flow`'s gate order, `test_manifest_drift`. Record the red set at this step.
 2. Rename `_spec_target` → `_resolve_target`, move it above `_dry_run`, make `_dry_run` and
    `_preflight` call it. Proof: `grep -n "_spec_target" plugin_playbooks/` empty; `pytest
    tests/test_candidate_flow.py tests/test_probes.py -q` green (the `"no candidate"` pins hold).
@@ -195,10 +203,13 @@ fact by the P1 go/no-go and the P4 keyhole gate, both measured without specs." (
    tests` clean; `pytest -q` full; then ONE commit on `v2-runtime` (suggested subject: `0.47.0:
    remove the specs (Tests tab) feature — master §2 Specs removal, owner 2026-09-07`), not
    pushed. Proof: every Exit test below; `git log --oneline -1` shows the single phase commit on
-   top of the reconciled tree; `git status` clean apart from `plans/032-v2-runtime/` until the
-   plan folder is committed with it.
+   top of the reconciled tree (5306f7f or the `uv.lock` commit); `git status --short` empty
+   (the plan folder is already committed at 5306f7f; `execution_summary.md` is a later,
+   separate plan-only commit).
 7. Hand-off. Run the two cross-repo checks (below) against this commit, record their verdicts
-   and the owner's PG rehearsal outcome (or "deferred to before the first M1 side-load"), write
+   with the luna and dojoP shas checked (at writing luna `fix-playbooks` 5a92c05 and dojoP
+   `main` 316f007, both plan-only commits on top of f05bdf2 / f51915d) and the owner's PG
+   rehearsal outcome (or "deferred to before the first M1 side-load"), write
    `execution_summary.md`, and revise plugin/01-05 if anything moved (names, counts, hooks).
 
 ## Exit tests
@@ -251,15 +262,20 @@ fact by the P1 go/no-go and the P4 keyhole gate, both measured without specs." (
   `vision/vision.md`, `plugin_playbooks/ui/assets/*.js` for `playbook_spec`, `PlaybookSpec`,
   `playbook_specs`, `specs_gate`, `spec_from_run`, `carried_from`, `require_specs`,
   `run_all_specs`, `copy_specs`, `spec_source_version`, `specsLabel`, `specsHeadline`,
-  `SpecEntry`, `getSpecs`, `runSpecs`, `\bTests\b`, `all specs` → zero hits; plus one bare
+  `SpecEntry`, `getSpecs`, `runSpecs`, `\bTests\b`, `all specs` → zero hits (the `\bTests\b`
+  allowlist is exactly `reference.py`'s Jinja "Tests:" line once the two "Tests the CANDIDATE"
+  rewordings in Scope land); plus one bare
   `\bspecs?\b` check with the documented allowlist (`reference.py` language-"spec" lines and its
   Jinja "Tests:" line, `agent_tools.py` "spec" = specification lines, `testing.py` `spec`
   parameter; `plans/` not grepped); (4) as above; (5) `handlers["playbook_dry_run"](name=…,
   stubs=json.dumps({...}))` and the dict form both script a result by step id and by tool name,
   and `"stubs"` is in the ToolDef `parameters["properties"]`; (6) keys of `_PHASE_BY_TOOL`,
   `_GATED_TOOLS`, `_GATED_TOOL_OWNER_WORDS`, `card.WAIT_WORDS` ⊆ registered tool names;
-  `_GATED_TOOLS == {names of ToolDefs with policy prompt_always}` (re-homes
-  `test_specs.py:546-549`); `set(manifest.skills[0].tools) <= set(AUTHORING_TOOLS)` (re-homes :561).
+  `{n for n, (td, _) in tools.items() if td.policy == "prompt_always"} ==
+  {"playbook_set_autonomy", "playbook_run_candidate"}` and that set `<= _GATED_TOOLS`
+  (re-homes `test_specs.py:546-549`; equality with `_GATED_TOOLS` is wrong — it also holds the
+  approval-card tools `playbook_publish`/`playbook_rollback`, delegation.py:94-100, which are
+  not `prompt_always`); `set(manifest.skills[0].tools) <= set(AUTHORING_TOOLS)` (re-homes :561).
 - UI: `cd ui-src && npm ci && npm test` green — `ConnectionsTab.test.tsx` (probes only),
   `VersionsTab.test.tsx` (view ids include `connections`, not `tests`; "never run → ✗" seeds
   `runs: 0`; the refusal test uses gate `probes`), `trust.test.ts` (no `specsLabel`/
@@ -299,7 +315,10 @@ fact by the P1 go/no-go and the P4 keyhole gate, both measured without specs." (
    `_resolve_target`'s wording and the JSON error shape is unchanged.
 3. Assumption: the guard's bare-word allowlist (item 3) is keyed by file + regex context, not by
    the checklist's line numbers, which shift after the deletions (`reference.py:3/:121`,
-   `agent_tools.py:113/:1517`, `reference.py:110`, `testing.py:44-47` at HEAD).
+   `agent_tools.py:113/:1517`, `reference.py:110`, `testing.py:44-47` at HEAD). The two
+   "Tests the CANDIDATE" rewordings (`__init__.py:220`, `agent_tools.py:1645`) are this plan's
+   addition — the checklist lists neither; without them the `\bTests\b` token check has two
+   non-spec hits and needs a second allowlist entry.
 4. Assumption: the row count is logged inside the helper (INFO) and the file export is the
    owner's step on the vaselin agent — no in-repo export code, nothing written under any repo.
    The suite cannot exercise PG; SQLite ≥ 3.35 is required for DROP COLUMN (`.venv`: 3.50.4) —
