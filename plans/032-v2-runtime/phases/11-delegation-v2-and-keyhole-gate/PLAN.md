@@ -32,10 +32,10 @@ Writer identity (`plugin_playbooks/delegation.py`):
 
 Author stamping (no DDL — `PlaybookVersion.author` exists: `String(64)`, default `"owner"`,
 models.py:98; `delegation:<uuid>` is 47 chars):
-- `_edit_impl` write part 2 mints with `author="agent"` (agent_tools.py:1871-1877) →
+- `_edit_impl` write part 2 mints with `author="agent"` (agent_tools.py:1871-1877 at 8c31a60; :2333 at phase 04's `17bbd47`) →
   `author=writer_identity()`.
-- `_propose`'s v1 row mint (added by plugin/04 with `author="agent"`) → `writer_identity()`.
-- `_manifest_set` (:2005-2011, `author="agent"`) → `writer_identity()`.
+- `_propose`'s v1 row mint (added by plugin/04 with `author="agent", message="candidate"`, agent_tools.py:539 at `17bbd47`; used for both the new-row and the re-create path) → `writer_identity()`.
+- `_manifest_set` (:2005-2011 at 8c31a60; `_manifest_set` :2456, `author="agent"` :2473 at `17bbd47`) → `writer_identity()`.
 - `mint_version` (versioning.py:122-169, `author=author` :153) unchanged. `Playbook.created_by`
   (`String(32)`, models.py:73; set at agent_tools.py:311/:325) stays `"agent"` — too short for a
   delegation id and not a version row.
@@ -51,7 +51,7 @@ Candidate-conflict guard (`plugin_playbooks/versioning.py`, new
   `{"candidate_version": N, "author": <row.author>, "saved_at": <row.created_at isoformat>}`.
 - Author labels in messages: `agent` → "the agent", `owner` → "the owner",
   `delegation:<id>` → "delegation <first 8 hex chars> (delegation:<id>)".
-- `_edit_impl` READ header (:1717-1738) gains `"candidate_author"` and, when the guard fires,
+- `_edit_impl` READ header (:1717-1738 at 8c31a60; `_edit_impl` :2027 at `17bbd47`, rejected-write payloads :2153/:2233, `_EDIT_PAYLOAD_PROPS` :2400, `playbook_edit` ToolDef :2419) gains `"candidate_author"` and, when the guard fires,
   `"conflict": {...}` plus a first instruction line "Another author's candidate exists — do not
   write; ask the owner".
 - `_edit_impl` WRITE part 2 under the lock (:1847-1861) calls the guard after the version-race
@@ -64,8 +64,8 @@ Candidate-conflict guard (`plugin_playbooks/versioning.py`, new
 - Same-author re-save keeps today's pointer move (tests/test_candidate_flow.py:191-207 stays green).
 - `_propose` re-create over an archived name with a candidate (:293-312): same refusal shape minus
   the ticket keys.
-- `_manifest_set` (:1991-2019): the guard applies once the P0 plan
-  `2026-09-06-manifest-set-live-bypass` makes it a candidate writer; at HEAD it writes live (:2012)
+- `_manifest_set` (:1991-2019 at 8c31a60; :2456 at `17bbd47`): the guard applies once the P0 plan
+  `2026-09-06-manifest-set-live-bypass` makes it a candidate writer; at HEAD it writes live (:2012 at 8c31a60; :2476 at `17bbd47`)
   and only the author stamp changes here.
 - Explicit replace (assumption, Risks 5): `playbook_edit` gains an optional `replace_candidate: bool`
   (default false; `_EDIT_PAYLOAD_PROPS` :1942-1954; description "OWNER-authorised only — pass true
@@ -123,7 +123,7 @@ Tests and stamps:
   `tests/test_delegate_prompt.py` (explicit `format="pblang"` on the `pb=None` calls so its pins keep
   pinning the pblang variant) and `ui-src/src/playbooks/__tests__/VersionsTab.test.tsx`.
 - Minor bump in the three stamps (`pyproject.toml:3`, `plugin_playbooks/luna-plugin.toml:2`,
-  `plugin_playbooks/__init__.py:624`; 0.49.0 after phase 05 — the exact number is whatever phases
+  `plugin_playbooks/__init__.py:647` at phase 04's `17bbd47`; 0.48.0 after phase 04, 0.49.0 planned after phase 05 — the exact number is whatever phases
   06-10 left plus one minor): the UI bundle and a ToolDef payload change. The `playbook_agent`
   `[[tools]]` entry in `luna-plugin.toml` is re-written by hand to match the new description
   (`tests/test_manifest_drift.py:50-60` only compares names, policy, risk_level and count, so a stale
@@ -171,10 +171,10 @@ Tests and stamps:
    "delegation 1234abcd" with the full id in `title`). Rebuild and commit the bundle.
    Proof: `npm test` green; `git status` shows the new hashed pair and `ui/index.html`; the old pair
    deleted.
-8. End-to-end script, `tests/test_v2_end_to_end.py`. Harness: aiosqlite engine; `tools = build_tools(sf, _Bus(), runner, _Ctx(_Approvals()))` with `_Ctx` / `_Approvals` from tests/test_repro_fixplaybooks_lifecycle.py:54-87 (a bare `ctx=None` skips the card — agent_tools.py:2088-2093 — so the ctx must carry `.approval`; `_Approvals` records both `request` and `request_nowait`, the two the publish gate may use, :2190); `runner = PlaybookRunner(session_factory=sf, tool_registry=<registry with a recording file_write fake AND the scripted code_run fake>, events=_Bus())` with the scripted `code_run` fake of tests/test_v2_loop.py so the candidate run executes the python for real (no jail) — `code_run` must be in the registry because phase 04's `collect_tools` adds it to the probe list and a missing tool is a `failed` probe, which blocks publish. The script's playbook is NOT the master §2 example (`PY_CODE` calls `ctx.approve`, which would raise a second card and break the one-card assertion, and its tools are `fetch_list`/`send_message`): `E2E_CODE` is a two-line `async def run(ctx, inputs)` that awaits `ctx.tool("file_write", path=inputs["path"], content=inputs["note"])` and returns `{"written": inputs["path"]}` — no `ctx.approve`, no `ctx.llm`. A `ScriptedAgent` runs the "turn" as an ordered list of handler calls under `_delegation_id.set(uuid)`, recording `(name, result)`:
-   - `playbook_propose(name="pb-e2e", format="python", code=E2E_CODE, inputs_schema=...)` → `status == "candidate_saved"`, `validated is True` (phase 04's propose result; its `next`, if any, does not name `playbook_validate`).
+8. End-to-end script, `tests/test_v2_end_to_end.py`. Harness: aiosqlite engine; `tools = build_tools(sf, _Bus(), runner, _Ctx(_Approvals()))` with `_Ctx` / `_Approvals` from tests/test_repro_fixplaybooks_lifecycle.py:54-87 (phase 04's `tests/v2harness.py::env(*, script=None, decision="approved", **fake_tools)` builds exactly this — a real `PlaybookRunner` with the scripted `code_run` plus named fake tools, `_ensure_columns` applied — and may be reused) (a bare `ctx=None` skips the card — agent_tools.py:2088-2093 — so the ctx must carry `.approval`; `_Approvals` records both `request` and `request_nowait`, the two the publish gate may use, :2190); `runner = PlaybookRunner(session_factory=sf, tool_registry=<registry with a recording file_write fake AND the scripted code_run fake>, events=_Bus())` with the scripted `code_run` fake of tests/test_v2_loop.py so the candidate run executes the python for real (no jail) — `code_run` must be in the registry because phase 04's `collect_tools` adds it to the probe list and a missing tool is a `failed` probe, which blocks publish. The script's playbook is NOT the master §2 example (`PY_CODE` calls `ctx.approve`, which would raise a second card and break the one-card assertion, and its tools are `fetch_list`/`send_message`): `E2E_CODE` is a two-line `async def run(ctx, inputs)` that awaits `ctx.tool("file_write", path=inputs["path"], content=inputs["note"])` and returns `{"written": inputs["path"]}` — no `ctx.approve`, no `ctx.llm`. A `ScriptedAgent` runs the "turn" as an ordered list of handler calls under `_delegation_id.set(uuid)`, recording `(name, result)`:
+   - `playbook_propose(name="pb-e2e", format="python", code=E2E_CODE, inputs_schema=...)` → `status == "candidate_saved"`, `validated is True` (phase 04's propose result at `17bbd47` has no `next` key — keys `playbook_id, name, format, status, live_version, candidate_version, runnable_via, triggers_active, publish_required, validated, warnings`; plugin/09 adds `next`, and if it exists by then it must not name `playbook_validate`).
    - `playbook_dry_run` → `status == "simulated"`, zero `playbook_runs` rows.
-   - `playbook_run_candidate(name, inputs=..., wait_seconds=30)` (the handler waits via `runner.wait_for_run`, :2698-2701; default `_RUN_WAIT_DEFAULT` 55 s, :456) → `status == "done"`, one run row `is_test=True`, `trigger="agent-candidate"` (:2699), the fake `file_write` was called with the real args.
+   - `playbook_run_candidate(name, inputs=..., wait_seconds=30)` (the handler waits via `runner.wait_for_run`, :2698-2701 at 8c31a60; `_run_candidate` :3101 at `17bbd47`; default `_RUN_WAIT_DEFAULT` 55 s, :456 at 8c31a60) → `status == "done"`, one run row `is_test=True`, `trigger="agent-candidate"` (:2699), the fake `file_write` was called with the real args.
    - `playbook_publish(name, explanation=EXPLANATION)` → `status == "published"`, `live_version == 1`, `candidate_version is None`, exactly one entry in `approvals.requests`, the live row's `author == "delegation:<uuid>"` — publish moves the pointer onto the candidate row (`_apply_version_to_live` :2454-2456, no new row minted), so the live row is the delegated row.
    - Across the script: the recorded call list has no `playbook_validate` (none after the green write, none at all); no result's `next` asks for validation. Rejected twin: `_Approvals(decision="rejected")` → nothing published, `live_version` None, still exactly one card.
    Proof: the file is green.
@@ -238,10 +238,10 @@ Tests and stamps:
   against run rows (its step 1; the judge sees `str(result)[:300]`, `lib/judge.py:124`), returns
   the verdict copied here (its step 7). dojoP commits to `main` and pushes to origin
   novalystrix-org/dojoP per its plan; this repo does not push.
-- plugin/04: `_propose` returns `candidate_saved` with `validated: true` and the `next` sentence;
-  the edit-error shape with `ticket_still_valid` — the guard's refusal reuses it; the delegate
-  toolset includes `playbook_propose` (`__init__.py:880-884`), so propose = candidate is what closes
-  the delegation side door (master §2 Lifecycle).
+- plugin/04 (landed `17bbd47`): `_propose` returns `candidate_saved` with `validated: true` (no `next` key — see Step 8);
+  the edit-error shape `{stage: "write", saved: false, format, errors, warnings, ticket, ticket_still_valid: true, expires_in_seconds, retry}` (+ `language_reference` and a compat `error` key on pblang compile errors; the format-change refusal is the shorter `{stage, saved, format, error, ticket, ticket_still_valid}`) — the guard's refusal reuses the shorter shape; the delegate
+  toolset includes `playbook_propose` (`__init__.py:880-884` at 8c31a60; `AUTHORING_TOOLS` :897 at `17bbd47`), so propose = candidate is what closes
+  the delegation side door (master §2 Lifecycle). `_referenced_tools` :141, `delegate_toolset` :165, `_PROMPT_TAIL` :195, `_delegate_prompt` :203, `_drive_delegation` :583, `_playbook_agent` :713 at `17bbd47` (delegation.py untouched by phase 04).
 - plugin/05: `V2_SKILL_BODY` / `V2_SKILL_MAX_BYTES` (`plugin_playbooks/v2/skill.py`) are imported by
   the v2 prompt; the owner-intent-to-publish sentence in `playbook_publish`'s description stays the
   delegate's rule too.
@@ -282,7 +282,7 @@ Tests and stamps:
    (:2012) and the guard would never fire. `Playbook.created_by` (`String(32)`) keeps `"agent"`.
 7. Line drift: phase 00 deletes the SPECS step (:278-282) and renumbers 6/7/8 → 5/6/7, drops
    checklist item 2 (:370-379) and the "3 failed spec" assert (`test_delegate_prompt.py:80`);
-   phase 04 rewrites the propose sentence (:266); phase 09 adds a tool. All delegation.py /
+   phase 04 did NOT rewrite the propose sentence (delegation.py:261 at `17bbd47`, "Create with playbook_propose (pass manifest=)" — it never claimed a live create; phase 04 summary Deviations 8), so this phase's python §4 replaces it; phase 09 adds a tool. All delegation.py /
    agent_tools.py citations above are at 8c31a60 — symbols are the anchor.
 8. The end-to-end script calls handlers directly, so the core's `prompt_always` gate on
    `playbook_run_candidate` (tests/test_candidate_flow.py:419-420) is not exercised there; the

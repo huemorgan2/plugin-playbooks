@@ -1,5 +1,5 @@
 # 032 — Phase 04: format column and tool wiring, propose = candidate, loud intake, edit-error payload, error surfacing, interim UI
-Status: pending
+Status: done
 Master: §2 Lifecycle ("propose = candidate, always"; `Playbook.format`; definition = checker summary), §2 Prompt surface (format precedence, riders, edit-error payload, `validated: true`), §2 Error contract (run columns surfaced, `failure_signature` keying), §2 Language (inputs typed at intake, loud failure), §2 Canvas (interim "code + journal list"), §3 P1; master phase M1
 Repo / branch: plugin-playbooks v2-runtime (HEAD 8c31a60 at writing — 5306f7f on top of it is plans-only, code identical; phases 00-03 land first — every agent_tools.py line below is at 8c31a60 and shifts after phase 00's 54 deletions; cite the symbol when in doubt)
 Depends on: plugin/01 (`resolve_format`, `sniff_format`, `check` → `CheckResult.summary` in `plugin_playbooks/v2/checker.py`), plugin/02 (`SegmentLoop`; run columns `error`, `error_type`, `traceback`, `failed_at`; the `run.error` one-liner), plugin/03 (effects complete, so a python playbook runs end to end in the exit tests); plugin/00 through them
