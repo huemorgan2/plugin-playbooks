@@ -104,7 +104,11 @@ async def _env(ctx):
 
 
 async def _green_candidate(sf, tools) -> None:
+    # plans/032 phase 04: propose saves a candidate; publish v1 through
+    # the gate so the shape below is live v1 + candidate v2 (setup only).
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await green_run(sf, 1)
+    await tools["playbook_publish"](name="greeter", explanation=EXPLANATION)
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     await tools["playbook_edit"](name="greeter", ticket=read["ticket"], code=NEW_CODE)
     await green_run(sf, 2)
@@ -149,7 +153,17 @@ async def test_approved_then_regated_same_payload_trips_loop_guard():
     approvals = _Approvals(decision="pending")
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
-        await _green_candidate(sf, tools)
+        # plans/032 phase 04 (repo plan Risk 4): the stub answers
+        # "pending", so a gated v1 publish cannot land — seed v1 live.
+        await tools["playbook_propose"](name="greeter", code=CODE)
+        async with sf() as s:
+            pb = (await s.execute(select(Playbook))).scalar_one()
+            pb.live_version, pb.candidate_version = 1, None
+            await s.commit()
+        approvals.requests.clear()
+        read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
+        await tools["playbook_edit"](name="greeter", ticket=read["ticket"], code=NEW_CODE)
+        await green_run(sf, 2)
 
         first = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
@@ -188,7 +202,12 @@ async def test_manifest_set_does_not_flip_live():
     try:
         # v1 live, v2 is a pending candidate (exactly the 09-05 shape:
         # a candidate awaiting approval when manifest_set fires).
+        # plans/032 phase 04: propose saves a candidate — v1 goes live
+        # through the (approving) gate first; setup only.
         await tools["playbook_propose"](name="greeter", code=CODE)
+        await green_run(sf, 1)
+        await tools["playbook_publish"](name="greeter", explanation=EXPLANATION)
+        approvals.requests.clear()
         read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
         await tools["playbook_edit"](
             name="greeter", ticket=read["ticket"], code=NEW_CODE,

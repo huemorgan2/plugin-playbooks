@@ -17,6 +17,7 @@ import { playbooksApi } from './api'
 import { applyPlaybookPatch, type PlaybookPatchEvt } from './livePatch'
 import { findStepById } from './explain/dataflow'
 import { VersionCanvas, CodeView, sourceFor } from './VersionCanvas'
+import { V2View } from './V2View'
 import { StepDetailPanel, execRowsForStep } from './StepDetailPanel'
 import { ManifestTab } from './ManifestTab'
 import { ConnectionsTab } from './ConnectionsTab'
@@ -212,6 +213,7 @@ export function VersionsTab({
   agentName,
   liveVersion,
   candidateVersion,
+  format,
   refreshKey = 0,
   patch = null,
   onPromoted,
@@ -221,6 +223,8 @@ export function VersionsTab({
   agentName: string
   liveVersion: number
   candidateVersion: number | null
+  /** plans/032 phase 04: python → the interim V2View replaces the canvas. */
+  format?: 'pblang' | 'python'
   /** Bumped by the editor after a reload (agent save, promote) → re-list + re-fetch. */
   refreshKey?: number
   /** The latest live agent patch, forwarded by the editor's staggered queue. */
@@ -513,6 +517,15 @@ export function VersionsTab({
               <div className="h-full flex items-center justify-center text-ink-400">
                 <Loader2 className="w-5 h-5 animate-spin" />
               </div>
+            ) : view === 'canvas' && format === 'python' ? (
+              // plans/032 phase 04: a python definition is the checker
+              // summary — no steps to lay out, so no VersionCanvas/buildGraph.
+              <V2View
+                code={detail.code}
+                runDetail={runDetail}
+                agentName={agentName}
+                onClearRun={() => setRunDetail(null)}
+              />
             ) : view === 'canvas' ? (
               <VersionCanvas
                 def={def}

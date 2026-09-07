@@ -98,7 +98,8 @@ async def test_propose_over_archived_name_takes_over_the_row(env):
         await s.commit()
 
     out = json.loads(await tools["playbook_propose"](name="greeter", code=NEW_CODE))
-    assert out.get("status") == "created", out
+    # plans/032 phase 04: propose saves a candidate on the taken-over row
+    assert out.get("status") == "candidate_saved", out
 
     pb = await _get(sf)
     assert pb.id == old_id                        # same row — history survives
@@ -106,8 +107,10 @@ async def test_propose_over_archived_name_takes_over_the_row(env):
     assert pb.code == NEW_CODE
     assert pb.definition["steps"][0]["args"]["message"] == "{{ inputs.name }}"
     assert pb.version == old_version + 1          # old runs keep their versions
-    assert pb.live_version == pb.version
-    assert pb.candidate_version is None
+    # plans/032 phase 04: the old row was never published, so the
+    # re-created playbook is candidate-only — nothing is live.
+    assert pb.live_version == 0
+    assert pb.candidate_version == pb.version
     async with sf() as s:
         runs = (await s.execute(select(PlaybookRun))).scalars().all()
     assert len(runs) == 1 and runs[0].playbook_id == old_id

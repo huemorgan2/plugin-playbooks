@@ -14,7 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .models import Playbook, PlaybookVersion
 
 
-def live_version_of(p: Playbook) -> int:
+def live_version_of(p: Playbook) -> int | None:
+    """The version triggers and `playbook_run` execute, or None when nothing
+    is live yet. `live_version == 0` reads "same as version" on legacy rows
+    (no candidate pointer — both columns arrived together in 0.10.0) and
+    "no live version" on a row that carries a candidate (plans/032 phase 04:
+    propose saves a candidate; the first publish makes it live)."""
+    if p.live_version == 0 and p.candidate_version is not None:
+        return None
     return p.live_version or p.version
 
 
@@ -51,10 +58,13 @@ async def get_version_row(
     return min(rows, key=_dup_keep_key)
 
 
-async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
+async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion | None:
     """Guarantee a version row exists for the current live content. Records
-    an EXISTING number — no new number is minted."""
+    an EXISTING number — no new number is minted. Returns None (and creates
+    nothing) when the playbook has no live version yet."""
     n = live_version_of(p)
+    if n is None:
+        return None
     row = await get_version_row(session, p, n)
     if row is None:
         row = PlaybookVersion(

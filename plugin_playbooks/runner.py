@@ -236,6 +236,18 @@ def _playbook_origin_scope(playbook: Any):
     )
 
 
+class InputTypeError(ValueError):
+    """plans/032 phase 04 (docs/v2.md §2 Language): a run input that cannot
+    be coerced to its declared schema type fails AT INTAKE, naming the
+    input and the type — never a silent pass-through into the run."""
+
+    def __init__(self, input: str, expected: str, got: Any) -> None:
+        self.input = input
+        self.expected = expected
+        self.got = got
+        super().__init__(f"input {input!r} expects {expected}, got {got!r}")
+
+
 def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     """plans/022 P5b: coerce run inputs through the playbook's declared
     input schema BEFORE the run starts — stored inputs and runtime inputs
@@ -245,10 +257,12 @@ def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     delivered Monday's numeric itemId as an int while the schema declared
     string; conditions then compared str != int and misbranched — while the
     stored run inputs showed the string, making the run unreproducible from
-    its own record. Best-effort per property: scalar type mismatches are
-    coerced (int/float/bool → str; numeric str → int/float; bool-ish str →
-    bool); anything un-coercible passes through unchanged (the run, not the
-    intake, owns that failure)."""
+    its own record. Per property: scalar type mismatches are coerced
+    (int/float/bool → str; numeric str → int/float; bool-ish str → bool).
+    plans/032 phase 04: a string that cannot become the declared integer /
+    number / boolean raises `InputTypeError` — the intake, not the run,
+    owns that failure (loud, named, typed). Values of other shapes (lists,
+    dicts, None) pass through as before."""
     schema = getattr(playbook, "inputs_schema", None) or {}
     props = schema.get("properties") if isinstance(schema, dict) else None
     if not props or not inputs:
@@ -262,7 +276,9 @@ def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
         try:
             if declared == "string" and isinstance(val, (int, float, bool)):
                 out[key] = str(val)
-            elif declared == "integer" and isinstance(val, str) and val.strip().lstrip("+-").isdigit():
+            elif declared == "integer" and isinstance(val, str):
+                if not val.strip().lstrip("+-").isdigit():
+                    raise InputTypeError(key, "integer", val)
                 out[key] = int(val.strip())
             elif declared == "number" and isinstance(val, str):
                 out[key] = float(val.strip())
@@ -272,9 +288,25 @@ def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
                     out[key] = True
                 elif low in ("false", "0", "no"):
                     out[key] = False
+                else:
+                    raise InputTypeError(key, "boolean", val)
+        except InputTypeError:
+            raise
         except (ValueError, TypeError):
-            pass  # un-coercible — leave as delivered
+            raise InputTypeError(key, str(declared), val) from None
     return out
+
+
+def _is_python_playbook(playbook: Any) -> bool:
+    """plans/032 phase 04: the `format` column decides; a row/shim without
+    the column set (legacy default 'pblang' on a python source, phase 02 test
+    rows) is sniffed from its code."""
+    fmt = getattr(playbook, "format", None)
+    if fmt == "python":
+        return True
+    if fmt == "pblang" and (playbook.definition or {}).get("steps"):
+        return False
+    return sniff_format(getattr(playbook, "code", None) or "") == "python"
 
 
 class PlaybookRunner:
@@ -522,7 +554,12 @@ class PlaybookRunner:
             "meta": activity_meta,
         })
 
-        definition = PlaybookDef.model_validate(playbook.definition)
+        # plans/032 phase 04: dispatch on the `format` column (a python
+        # definition is a checker summary, never a PlaybookDef — so the v2
+        # branch precedes model_validate). Rows without the column (phase
+        # 02's test rows, transient shims) fall back to sniffing the code.
+        is_python = _is_python_playbook(playbook)
+        definition = None if is_python else PlaybookDef.model_validate(playbook.definition)
         # 0.26.0 (plans/015, 089 §1): the stamped report_to is authoritative
         # for chat delivery. plans/016 phase 2: no origin fallback — a
         # background live run stamps None and must NOT deliver to a leaked
@@ -541,7 +578,7 @@ class PlaybookRunner:
             self._activity_heartbeat(activity_id, activity_label, activity_meta)
         )
         try:
-            if sniff_format(playbook.code) == "python":
+            if is_python:
                 # plans/032 phase 02: a v2 playbook runs on the segment loop
                 # under the SAME billing scope as v1's step machinery.
                 with _playbook_origin_scope(playbook):

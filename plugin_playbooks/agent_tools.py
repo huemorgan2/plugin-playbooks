@@ -41,9 +41,12 @@ from .publish import (
     test_run_gate,
 )
 from .reference import LANGUAGE_CHEATSHEET, LANGUAGE_MINIREF
+from .runner import InputTypeError
 from .runner import active_run_id as _active_playbook_run
+from .v2.checker import check as v2_check
+from .v2.checker import resolve_format, sniff_format
 from .validation import validate_definition
-from .versioning import ensure_live_row, mint_version
+from .versioning import ensure_live_row, live_version_of, mint_version
 from .versioning import get_version_row as _tolerant_get_version_row_fn
 
 _log = logging.getLogger("luna.plugin.playbooks.agent_tools")
@@ -109,10 +112,116 @@ def _compile_code(code: str, *, name: str) -> tuple[PlaybookDef | None, str | No
 
 
 def _derive_code(playbook: Playbook) -> str:
-    """The playbook's pblang source — stored, or derived via codegen."""
+    """The playbook's source — stored, or (pblang only) derived via codegen.
+    plans/032 phase 04: a python playbook's code IS its definition; it is
+    never NULL and never derived."""
     if playbook.code:
         return playbook.code
+    if getattr(playbook, "format", "pblang") == "python":
+        return playbook.code or ""
     return generate_code(PlaybookDef.model_validate(playbook.definition))
+
+
+# plans/032 phase 04 — the python authoring path (docs/v2.md §7-§9).
+_PY_REFERENCE_LINE = "python playbook — the playbook-authoring skill is the reference"
+_FORMAT_PARAM = {
+    "type": "string",
+    "enum": ["pblang", "python"],
+    "description": (
+        "Playbook language. python: one `async def run(ctx, inputs)`; "
+        "pblang: the `playbook(...)` DSL. Omitted: sniffed from the code."
+    ),
+}
+_INPUTS_SCHEMA_PARAM = {
+    "type": "string",
+    "description": (
+        "python only: JSON-schema object for the run inputs, e.g. "
+        '{"type": "object", "properties": {"url": {"type": "string"}}}. '
+        "Values are coerced to the declared types at intake."
+    ),
+}
+_TRIGGERS_PARAM = {
+    "type": "string",
+    "description": (
+        "python only: JSON list of triggers, e.g. "
+        '[{"event": "email.received", "map": {"url": "{{ event.payload.url }}"}}]. '
+        "Triggers activate when the playbook is published."
+    ),
+}
+
+
+def _registry_tool_names(registry: Any) -> set[str] | None:
+    """Every tool name the registry knows, or None when it cannot be listed
+    (then the checker skips its unknown-tool rule)."""
+    if registry is None:
+        return None
+    try:
+        names: set[str] = set()
+        for rt in registry.all():
+            name = getattr(getattr(rt, "definition", None), "name", None) or getattr(rt, "name", None)
+            if name:
+                names.add(str(name))
+        return names
+    except Exception:  # noqa: BLE001 — a stub registry without .all()
+        return None
+
+
+def _parse_json_param(raw: Any, *, label: str, kind: type) -> tuple[Any, str | None]:
+    """A JSON object/list tool parameter → (value, error)."""
+    if raw is None or raw == "":
+        return None, None
+    value = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return None, f"{label} is not valid JSON: {e.msg}"
+    if not isinstance(value, kind):
+        want = "object" if kind is dict else "list"
+        return None, f"{label} must be a JSON {want}"
+    return value, None
+
+
+def _python_check(
+    code: str, *, name: str, version: int, inputs_schema: dict | None, registry: Any,
+) -> tuple[Any, list[dict], list[dict]]:
+    """Run the v2 checker; (result, error dicts, warning dicts)."""
+    result = v2_check(
+        code, name=name, version=version, inputs_schema=inputs_schema,
+        tool_names=_registry_tool_names(registry),
+    )
+    errors = [i.to_dict() for i in result.issues if i.severity == "error"]
+    warnings = [i.to_dict() for i in result.issues if i.severity != "error"]
+    return result, errors, warnings
+
+
+def _python_definition(
+    *, name: str, summary: dict, triggers: list | None, inputs_schema: dict | None,
+) -> dict:
+    """The stored `definition` of a python playbook — identity + triggers +
+    inputs schema + the checker summary (never a PlaybookDef)."""
+    defn = {
+        "name": name,
+        "format": "python",
+        "triggers": list(triggers or []),
+        "inputs": inputs_schema,
+        **summary,
+    }
+    defn["name"] = name  # the summary never carries identity; pin it
+    defn["format"] = "python"
+    return defn
+
+
+def _validate_triggers(triggers: list | None) -> str | None:
+    """Every trigger must be a TriggerDef (definition.py)."""
+    from .definition import TriggerDef
+
+    for t in triggers or []:
+        try:
+            TriggerDef.model_validate(t)
+        except Exception as e:  # noqa: BLE001
+            return f"invalid trigger {t!r}: {e}"
+    return None
 
 
 def _codegen_or_none(pb_def: PlaybookDef) -> str | None:
@@ -210,6 +319,25 @@ async def _check_ticket(
     return None
 
 
+async def _ticket_seconds_left(session: AsyncSession, ticket: str) -> int:
+    """plans/032 phase 04: seconds until a (valid) ticket expires — the
+    rejected-write payload tells the agent how long it may keep retrying
+    with the same ticket."""
+    from datetime import datetime, timedelta, timezone
+
+    row = (await session.execute(
+        select(PlaybookEditTicket).where(PlaybookEditTicket.id == uuid.UUID(ticket))
+    )).scalar_one_or_none()
+    if row is None:
+        return 0
+    expiry = _aware(row.created_at) + timedelta(seconds=_TICKET_TTL_SECONDS)
+    left = (expiry - datetime.now(timezone.utc)).total_seconds()
+    return max(1, min(_TICKET_TTL_SECONDS, int(left)))
+
+
+_EDIT_RETRY_TEXT = "fix and call playbook_edit again with this ticket — do NOT re-read"
+
+
 def build_tools(
     session_factory: async_sessionmaker[AsyncSession],
     events: EventBus,
@@ -240,24 +368,62 @@ def build_tools(
         definition_yaml: str = "",
         manifest: str = "",
         agent_autonomy: str = "agent_must_confirm",
+        format: str | None = None,
+        inputs_schema: str | dict | None = None,
+        triggers: str | list | None = None,
     ) -> str:
         # 0.14.0 (plans/002 phase 7): code is the ONLY authoring format.
         # definition_yaml is still a declared-nowhere kwarg so stale callers
         # get a steering hint instead of a TypeError.
         if definition_yaml:
+            # the steering hint comes first: a stale definition_yaml caller
+            # gets it whether or not it also passed code.
+            if code and resolve_format(format or None, code, default="python")[0] == "python":
+                return json.dumps({
+                    "error": "definition_yaml is pblang only — a python "
+                             "playbook is its code; pass inputs_schema= and "
+                             "triggers= instead.",
+                    "format": "python",
+                })
             return json.dumps({
                 "error": "YAML authoring was removed — write the playbook as "
                          "`code` (see the playbook-authoring skill).",
+                "format": "pblang",
             })
         if not code:
             return json.dumps({"error": "Provide 'code' — the full playbook source."})
-        pb_def, err = _compile_code(code, name=name)
-        if err:
-            return err
+        # plans/032 phase 04 (docs/v2.md §9): explicit > sniff > default python.
+        fmt, fmt_issue = resolve_format(format or None, code, default="python")
+        if fmt_issue is not None:
+            return json.dumps({
+                "error": "Playbook format could not be resolved.",
+                "format": fmt,
+                "errors": [fmt_issue.to_dict()],
+                "warnings": [],
+            })
         stored_code: str | None = code
 
-        defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
-        defn["name"] = name
+        pb_def = None
+        py_schema: dict | None = None
+        py_triggers: list | None = None
+        if fmt == "python":
+            py_schema, perr = _parse_json_param(inputs_schema, label="inputs_schema", kind=dict)
+            if perr:
+                return json.dumps({"error": perr, "format": fmt})
+            py_triggers, perr = _parse_json_param(triggers, label="triggers", kind=list)
+            if perr:
+                return json.dumps({"error": perr, "format": fmt})
+            perr = _validate_triggers(py_triggers)
+            if perr:
+                return json.dumps({"error": perr, "format": fmt})
+        else:
+            pb_def, err = _compile_code(code, name=name)
+            if err:
+                payload = json.loads(err)
+                payload["format"] = fmt
+                return json.dumps(payload)
+            defn = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
+            defn["name"] = name
 
         async with session_factory() as session:
             existing = (await session.execute(
@@ -265,62 +431,118 @@ def build_tools(
             )).scalar_one_or_none()
             if existing and existing.status != "archived":
                 return json.dumps({"error": f"Playbook '{name}' already exists"})
-            all_pb = await _load_all_playbook_steps(session, exclude=name)
 
-            # The compiler already rejects unknown kwargs, and the dump
-            # carries cross-kind defaults (fan_in/concurrency/...) the key
-            # checker would falsely flag — so skip the unknown-key check.
-            issues = validate_definition(
-                defn,
-                tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
-                check_unknown_keys=False,
-            )
-            errors = [i.to_dict() for i in issues if i.severity == "error"]
-            if errors:
-                return json.dumps({
-                    "error": "Playbook is invalid — fix these before it can be created.",
-                    "issues": errors,
-                })
-            warnings = [i.to_dict() for i in issues if i.severity == "warning"]
+            if fmt == "python":
+                # the version the checker names is the one about to be minted
+                next_version = (existing.version if existing else 0) + 1
+                check_result, errors, warnings = _python_check(
+                    code, name=name, version=next_version, inputs_schema=py_schema,
+                    registry=getattr(runner, "_tools", None),
+                )
+                if errors:
+                    return json.dumps({
+                        "error": "Playbook is invalid — fix these before it can be created.",
+                        "format": fmt,
+                        "errors": errors,
+                        "warnings": warnings,
+                        "issues": errors,
+                    })
+                defn = _python_definition(
+                    name=name, summary=check_result.summary,
+                    triggers=py_triggers, inputs_schema=py_schema,
+                )
+                new_display = display_name or name
+                new_description = description
+                new_when = when_to_use
+                new_inputs = py_schema
+            else:
+                all_pb = await _load_all_playbook_steps(session, exclude=name)
 
+                # The compiler already rejects unknown kwargs, and the dump
+                # carries cross-kind defaults (fan_in/concurrency/...) the key
+                # checker would falsely flag — so skip the unknown-key check.
+                issues = validate_definition(
+                    defn,
+                    tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
+                    check_unknown_keys=False,
+                )
+                errors = [i.to_dict() for i in issues if i.severity == "error"]
+                if errors:
+                    return json.dumps({
+                        "error": "Playbook is invalid — fix these before it can be created.",
+                        "format": fmt,
+                        "issues": errors,
+                        "errors": errors,
+                        "warnings": [],
+                    })
+                warnings = [i.to_dict() for i in issues if i.severity == "warning"]
+                new_display = display_name or pb_def.display_name or name
+                new_description = description or pb_def.description
+                new_when = when_to_use or pb_def.when_to_use
+                new_inputs = pb_def.inputs
+
+            # plans/032 phase 04: propose = candidate, always. The new content
+            # is minted as a version row named by candidate_version; nothing
+            # goes live until playbook_publish (gate + card).
             if existing:
                 # plans/017: an archived playbook no longer squats its name —
                 # the proposal takes over its row (id kept so run history
-                # survives; the version counter keeps climbing so old runs
-                # stay attributed to their versions).
+                # survives; mint_version climbs above every stored row so
+                # old runs stay attributed to their versions).
                 playbook = existing
-                playbook.version = (existing.version or 1) + 1
-                playbook.live_version = playbook.version
-                playbook.candidate_version = None
                 playbook.failures_acked_version = None
-                playbook.display_name = display_name or pb_def.display_name or name
-                playbook.description = description or pb_def.description
-                playbook.when_to_use = when_to_use or pb_def.when_to_use
-                playbook.inputs_schema = pb_def.inputs
-                playbook.definition = defn
-                playbook.code = stored_code
-                playbook.manifest = manifest
+                playbook.display_name = new_display
+                playbook.description = new_description
+                playbook.when_to_use = new_when
                 playbook.agent_autonomy = agent_autonomy
                 playbook.created_by = "agent"
                 playbook.status = "enabled"
+                if _live_version_of(playbook) is None:
+                    # never published: the row content is the candidate's
+                    playbook.inputs_schema = new_inputs
+                    playbook.definition = defn
+                    playbook.code = stored_code
+                    playbook.format = fmt
+                    playbook.manifest = manifest
+                elif playbook.format != fmt:
+                    return json.dumps({
+                        "error": (
+                            f"Playbook '{name}' exists (archived) as "
+                            f"{playbook.format}; changing a playbook's format "
+                            "is not supported yet — pick a new name."
+                        ),
+                        "format": playbook.format,
+                    })
+                await session.flush()
             else:
                 playbook = Playbook(
                     name=name,
-                    display_name=display_name or pb_def.display_name or name,
-                    description=description or pb_def.description,
-                    when_to_use=when_to_use or pb_def.when_to_use,
-                    inputs_schema=pb_def.inputs,
+                    display_name=new_display,
+                    description=new_description,
+                    when_to_use=new_when,
+                    inputs_schema=new_inputs,
                     definition=defn,
                     code=stored_code,
+                    format=fmt,
                     manifest=manifest,
-                    live_version=1,  # a brand-new playbook goes live directly
+                    version=0,  # mint_version issues v1
                     agent_autonomy=agent_autonomy,
                     created_by="agent",
                     status="enabled",
                 )
                 session.add(playbook)
+                await session.flush()
+            await mint_version(
+                session, playbook,
+                definition=defn, code=stored_code,
+                manifest=manifest or playbook.manifest or "",
+                author="agent", message="candidate",
+            )
+            playbook.candidate_version = playbook.version
             await session.commit()
             await session.refresh(playbook)
+            candidate_version = playbook.version
+            live_version = _live_version_of(playbook)
 
         await events.emit("playbook.created", {
             "playbook_id": str(playbook.id),
@@ -337,10 +559,19 @@ def build_tools(
             "payload": {"draft_id": name, "name": name},
             "focus": True,
         })
+        # plans/032 phase 04: the master's propose contract — a candidate,
+        # never a live version; publish activates triggers and playbook_run.
         return json.dumps({
             "playbook_id": str(playbook.id),
             "name": name,
-            "status": "created",
+            "format": fmt,
+            "status": "candidate_saved",
+            "live_version": live_version,
+            "candidate_version": candidate_version,
+            "runnable_via": "playbook_run_candidate",
+            "triggers_active": False,
+            "publish_required": True,
+            "validated": True,
             "warnings": warnings,
         })
 
@@ -350,11 +581,15 @@ def build_tools(
             artifact_ref="playbook:{name}",
             description=(
                 "Create a new playbook from its FULL source, written all at "
-                "once. Pass `code` — the playbook language "
-                "(restricted Python: playbook(...) header, then "
-                "x = tool(...)/llm(...)/loop(...)/if_(...) steps; see the "
-                "playbook-authoring skill). The code is parsed and compiled, "
-                "never executed."
+                "once — saved as a CANDIDATE (validated, not live): test it "
+                "with playbook_run_candidate, then playbook_publish makes it "
+                "live and activates its triggers. Pass `code` in one of two "
+                "languages (format=): python — one `async def run(ctx, "
+                "inputs)` using ctx.tool/ctx.llm/ctx.approve (the default; "
+                "see the playbook-authoring skill); pblang — the "
+                "`playbook(...)` DSL (playbook(...) header, then "
+                "x = tool(...)/llm(...)/loop(...)/if_(...) steps). The code "
+                "is checked, never executed."
             ),
             parameters={
                 "type": "object",
@@ -367,6 +602,9 @@ def build_tools(
                         "type": "string",
                         "description": "Full playbook code",
                     },
+                    "format": _FORMAT_PARAM,
+                    "inputs_schema": _INPUTS_SCHEMA_PARAM,
+                    "triggers": _TRIGGERS_PARAM,
                     "manifest": {
                         "type": "string",
                         "description": (
@@ -469,6 +707,20 @@ def build_tools(
         if not playbook:
             return json.dumps({"error": f"Playbook '{name}' not found"})
 
+        # plans/032 phase 04: propose = candidate — nothing runs live until
+        # playbook_publish. No run row is written for the refusal.
+        if _live_version_of(playbook) is None:
+            return json.dumps({
+                "error": (
+                    f"Playbook '{name}' has no live version — candidate "
+                    f"v{playbook.candidate_version} is not published. Run it "
+                    "with playbook_run_candidate or publish it."
+                ),
+                "candidate_version": playbook.candidate_version,
+                "runnable_via": "playbook_run_candidate",
+                "publish_required": True,
+            })
+
         if playbook.agent_autonomy in (
             AgentAutonomy.MANUAL_ONLY.value,
             AgentAutonomy.AGENT_MUST_CONFIRM.value,
@@ -488,9 +740,17 @@ def build_tools(
                 ),
             })
 
-        run = await runner.start_run_background(
-            playbook, inputs=input_data, trigger="agent",
-        )
+        try:
+            run = await runner.start_run_background(
+                playbook, inputs=input_data, trigger="agent",
+            )
+        except InputTypeError as e:
+            # plans/032 phase 04: loud intake — the rejection names the
+            # input and the declared type; no run row exists.
+            return json.dumps({
+                "status": "rejected", "error": str(e),
+                "input": e.input, "expected": e.expected,
+            })
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
 
@@ -542,10 +802,25 @@ def build_tools(
                 "results until playbook_status shows status 'done'."
             )
         elif status == "failed":
-            result["error"] = (
+            # plans/032 phase 04 (docs/v2.md §7): the run's one-liner is
+            # readable HERE — a python playbook's `error` leads with it; v1
+            # keeps its sentence and gains `error_detail`.
+            async with session_factory() as session:
+                row = await session.get(PlaybookRun, run.id)
+            run_error = getattr(row, "error", None) if row is not None else None
+            fabricate = (
                 "Playbook execution FAILED. Do NOT fabricate results. "
                 "Check the error details with playbook_status."
             )
+            if getattr(playbook, "format", "pblang") == "python" and run_error:
+                result["error"] = f"{run_error} {fabricate}"
+            else:
+                result["error"] = fabricate
+                if run_error:
+                    result["error_detail"] = run_error
+            result["error_type"] = getattr(row, "error_type", None) if row is not None else None
+            failed_at = getattr(row, "failed_at", None) if row is not None else None
+            result["failed_at"] = failed_at.isoformat() if failed_at else None
         elif status == "done":
             async with session_factory() as session:
                 steps = (await session.execute(
@@ -631,8 +906,20 @@ def build_tools(
                     "error": s.error,
                 } for s in steps],
             }
-            if step_errors:
-                payload["error"] = step_errors[-1]
+            # plans/032 phase 04 (docs/v2.md §7): the run row's own error
+            # (a python one-liner, or v1's abort text) wins over the last
+            # step error; the other columns ride along.
+            run_error = getattr(run, "error", None)
+            if run_error or step_errors:
+                payload["error"] = run_error or step_errors[-1]
+            if run.status == "failed" or run_error:
+                payload["error_type"] = getattr(run, "error_type", None)
+                failed_at = getattr(run, "failed_at", None)
+                payload["failed_at"] = failed_at.isoformat() if failed_at else None
+                tb = getattr(run, "traceback", None)
+                payload["traceback"] = (
+                    "\n".join(tb.splitlines()[-20:]) if tb else None
+                )
             if run.status == "running":
                 payload["hint"] = (
                     "Still running — poll playbook_status again in a bit. "
@@ -941,7 +1228,14 @@ def build_tools(
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
-            live = playbook.live_version or playbook.version
+            live = _live_version_of(playbook)
+            if live is None:
+                return json.dumps({
+                    "error": (
+                        f"'{name}' has no live version — nothing is live, so "
+                        "there is no failure digest to dismiss."
+                    ),
+                })
             playbook.failures_acked_version = live
             await session.commit()
         return json.dumps({
@@ -992,8 +1286,10 @@ def build_tools(
     # "snapshot before change" rows already held; only the current live
     # version may lack a row on legacy playbooks, hence _ensure_live_row.
 
-    def _live_version_of(playbook: Playbook) -> int:
-        return playbook.live_version or playbook.version
+    def _live_version_of(playbook: Playbook) -> int | None:
+        # plans/032 phase 04: one implementation (versioning.live_version_of);
+        # None = no live version yet (candidate-only row).
+        return live_version_of(playbook)
 
     async def _get_version_row(
         session: AsyncSession, playbook: Playbook, n: int,
@@ -1002,14 +1298,17 @@ def build_tools(
 
     async def _ensure_live_row(
         session: AsyncSession, playbook: Playbook,
-    ) -> PlaybookVersion:
-        """Guarantee a version row exists for the current live content."""
+    ) -> PlaybookVersion | None:
+        """Guarantee a version row exists for the current live content
+        (None when nothing is live)."""
         return await ensure_live_row(session, playbook)
 
     def _version_code(row: PlaybookVersion) -> str:
-        """pblang source of a version row (stored, or derived on read)."""
+        """Source of a version row (stored, or — pblang — derived on read)."""
         if row.code:
             return row.code
+        if (row.definition or {}).get("format") == "python":
+            return row.code or ""
         return generate_code(PlaybookDef.model_validate(row.definition))
 
     def _apply_version_to_live(
@@ -1042,6 +1341,7 @@ def build_tools(
             inputs_schema=dict(row.definition).get("inputs"),
             definition=row.definition,
             code=row.code,
+            format=playbook.format,  # plans/032 phase 04: the runner dispatches on it
             manifest=row.manifest,
             version=row.version,
             live_version=row.version,
@@ -1358,6 +1658,12 @@ def build_tools(
                     "completed_at": r.completed_at.isoformat() if r.completed_at else None,
                 }
                 if r.status == "failed":
+                    # plans/032 phase 04 (docs/v2.md §7): the run-level
+                    # error columns beside the per-step failures.
+                    failed_at = getattr(r, "failed_at", None)
+                    entry["error"] = getattr(r, "error", None)
+                    entry["error_type"] = getattr(r, "error_type", None)
+                    entry["failed_at"] = failed_at.isoformat() if failed_at else None
                     # plans/022 P4: reading a failing run must be as good as
                     # reading a CI log — FULL error text, never truncated.
                     failed_steps = (await session.execute(
@@ -1415,12 +1721,68 @@ def build_tools(
     ))
 
     # --- playbook_validate (the compiler) ---
-    async def _validate(*, name: str = "", definition_yaml: str = "", code: str = "") -> str:
-        # plans/023: YAML input removed — steering hint for stale callers.
+    async def _validate(
+        *, name: str = "", definition_yaml: str = "", code: str = "",
+        format: str | None = None,
+    ) -> str:
         if definition_yaml:
+            # plans/023: YAML input removed — steering hint for stale callers.
+            if (format or "") == "python" or (
+                not format and code and sniff_format(code) == "python"
+            ):
+                return json.dumps({
+                    "error": "definition_yaml is pblang only — a python "
+                             "playbook is its code; pass code= instead.",
+                    "format": "python",
+                })
             return json.dumps({
                 "error": "YAML validation was removed — pass code= (full "
                          "playbook source) or name= (a saved playbook) instead.",
+                "format": "pblang",
+            })
+        if not code and not name:
+            return json.dumps({"error": "Provide 'name' or 'code'."})
+        # plans/032 phase 04: explicit > sniff > stored (name given) > python.
+        pb: Playbook | None = None
+        if name:
+            async with session_factory() as session:
+                pb = (await session.execute(
+                    select(Playbook).where(Playbook.name == name)
+                )).scalar_one_or_none()
+            if not pb:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+        stored_fmt = getattr(pb, "format", None) if pb is not None else None
+        if code or format:
+            fmt, fmt_issue = resolve_format(
+                format or None, code or None, stored=stored_fmt, default="python",
+            )
+        else:
+            fmt, fmt_issue = (stored_fmt or "pblang"), None
+        if fmt_issue is not None:
+            return json.dumps({
+                "ok": False, "format": fmt,
+                "errors": [fmt_issue.to_dict()], "warnings": [],
+                "saved": False,
+                "note": "Format could not be resolved — nothing was checked further.",
+            })
+        saved_note = (
+            "Validation only — NOTHING was saved. To persist a change, "
+            "call playbook_edit (existing playbook) or playbook_propose "
+            "(new playbook)."
+        )
+        if fmt == "python":
+            src = code or (pb.code if pb is not None else "") or ""
+            schema = pb.inputs_schema if (pb is not None and not code) else None
+            _, errors, warnings = _python_check(
+                src, name=name or "unnamed",
+                version=(pb.version + 1) if pb is not None else 1,
+                inputs_schema=schema, registry=getattr(runner, "_tools", None),
+            )
+            # no rider on python paths: the authoring skill is the reference
+            return json.dumps({
+                "ok": not errors, "format": fmt,
+                "errors": errors, "warnings": warnings,
+                "saved": False, "note": saved_note,
             })
         check_keys = False
         if code:
@@ -1429,6 +1791,7 @@ def build_tools(
                 payload = json.loads(err)
                 return json.dumps({
                     "ok": False,
+                    "format": fmt,
                     "errors": payload["issues"],
                     "warnings": [],
                     "saved": False,
@@ -1439,16 +1802,8 @@ def build_tools(
             # compiler already rejects unknown kwargs; the dump carries
             # cross-kind defaults the key checker would falsely flag.
             check_keys = False
-        elif name:
-            async with session_factory() as session:
-                pb = (await session.execute(
-                    select(Playbook).where(Playbook.name == name)
-                )).scalar_one_or_none()
-            if not pb:
-                return json.dumps({"error": f"Playbook '{name}' not found"})
-            defn = pb.definition
         else:
-            return json.dumps({"error": "Provide 'name' or 'code'."})
+            defn = pb.definition
 
         async with session_factory() as session:
             all_pb = await _load_all_playbook_steps(session, exclude=name or None)
@@ -1463,13 +1818,9 @@ def build_tools(
         # save — validate and edit have near-identical schemas, and edit used
         # to be invisible headless. Say explicitly that nothing was persisted.
         result: dict[str, Any] = {
-            "ok": not errors, "errors": errors, "warnings": warnings,
+            "ok": not errors, "format": fmt, "errors": errors, "warnings": warnings,
             "saved": False,
-            "note": (
-                "Validation only — NOTHING was saved. To persist a change, "
-                "call playbook_edit (existing playbook) or playbook_propose "
-                "(new playbook)."
-            ),
+            "note": saved_note,
         }
         # plans/003 phase 4: attach the spec on FAILED validation only — a
         # green result needs no recall, and the sheet is ~2KB per call.
@@ -1482,18 +1833,23 @@ def build_tools(
             name="playbook_validate",
             modes=["planning", "building"],
             description=(
-                "Statically check a playbook WITHOUT running it (the compiler). "
-                "Returns ALL issues at once: compile errors, schema errors, unknown "
-                "keys, undefined {{inputs}}/{{steps}} references, use-before-define, "
+                "Statically check a playbook WITHOUT running it. python "
+                "(format='python', one `async def run(ctx, inputs)`): the "
+                "checker — entry point, ctx usage, unknown tools, inputs "
+                "not in the schema. pblang (the `playbook(...)` DSL): the "
+                "compiler — compile errors, schema errors, unknown keys, "
+                "undefined {{inputs}}/{{steps}} references, use-before-define, "
                 "bad loops, unknown tools, subtask cycles, and context-economy "
                 "warnings. Pass a saved playbook 'name' or playbook 'code' "
-                "(preferred). Run this before saving or running."
+                "(preferred). Not needed after playbook_edit/playbook_propose "
+                "— a green write is already validated."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Saved playbook name"},
                     "code": {"type": "string", "description": "Full playbook code to check"},
+                    "format": _FORMAT_PARAM,
                 },
             },
             policy="auto_approve",
@@ -1536,7 +1892,13 @@ def build_tools(
         if v == "auto":
             v = "candidate" if playbook.candidate_version else "live"
         if v == "live":
-            return playbook, _live_version_of(playbook)
+            live_n = _live_version_of(playbook)
+            if live_n is None:
+                # plans/032 phase 04: candidate-only row — nothing is live
+                # yet, so the candidate is the only content to act on.
+                v = "candidate"
+            else:
+                return playbook, live_n
         if v == "candidate":
             if not playbook.candidate_version:
                 return (
@@ -1594,6 +1956,16 @@ def build_tools(
             if isinstance(resolved, str):
                 return json.dumps({"error": resolved})
             target, tested = resolved
+            if getattr(target, "format", "pblang") == "python":
+                # plans/032 phase 04: the dry-run harness walks a PlaybookDef
+                # graph; python gets its own in plugin/05.
+                return json.dumps({
+                    "ok": False,
+                    "error": "dry run for python playbooks is not available "
+                             "yet — use playbook_run_candidate",
+                    "format": "python",
+                    "tested_version": tested,
+                })
 
         trace = await runner.dry_run(target, inputs=input_data, stubs=stub_data)
         if isinstance(trace, dict):
@@ -1660,19 +2032,16 @@ def build_tools(
         old: str = "",
         new: str = "",
         definition_yaml: str = "",
+        format: str | None = None,
+        inputs_schema: str | dict | None = None,
+        triggers: str | list | None = None,
     ) -> str:
-        # 0.14.0 (plans/002 phase 7): YAML input removed — steering hint for
-        # stale callers instead of a TypeError.
-        if definition_yaml:
-            return json.dumps({
-                "error": "YAML editing was removed — pass code= (full source) "
-                         "or old=/new= (targeted snippet) instead.",
-            })
         snippet_mode = bool(old) or bool(new)
         modes = sum([bool(code), snippet_mode])
 
         # READ stage: no payload at all → manifest + code + fresh ticket.
-        if modes == 0:
+        # (definition_yaml alone is a stale caller — handled below.)
+        if modes == 0 and not definition_yaml:
             async with session_factory() as session:
                 playbook = (await session.execute(
                     select(Playbook).where(Playbook.name == name)
@@ -1694,9 +2063,11 @@ def build_tools(
                 except Exception:  # noqa: BLE001 — legacy defs must stay editable
                     current = ""
                 t = await _issue_ticket(session, playbook)
+                pb_format = getattr(playbook, "format", "pblang") or "pblang"
                 header = {
                     "stage": "read",
                     "editing": "candidate" if cand_row else "live",
+                    "format": pb_format,
                     "version": playbook.version,
                     "live_version": _live_version_of(playbook),
                     "candidate_version": playbook.candidate_version,
@@ -1711,7 +2082,10 @@ def build_tools(
                         "targeted edit. Then call playbook_edit again with "
                         "this ticket and exactly one of: code= (full source) "
                         "or old=/new= (targeted snippet). The ticket is "
-                        "single-use and expires. Saving creates a CANDIDATE — "
+                        "consumed by a successful write; a rejected write "
+                        "keeps it valid (retry with the same ticket, do not "
+                        "re-read). The ticket expires after 15 minutes. "
+                        "Saving creates a CANDIDATE — "
                         "the live playbook keeps running unchanged until "
                         "playbook_publish."
                     ),
@@ -1740,11 +2114,22 @@ def build_tools(
                 # 012 phase 3: the mini-reference rides on every edit; the
                 # full sheet stays one call away (playbook_language_reference)
                 # and still attaches to failed validate/compile results.
+                # plans/032 phase 04: pblang only — python's reference is
+                # the authoring skill, so the frame carries one line.
                 + "\n--- language reference ---\n"
-                + LANGUAGE_MINIREF
+                + (_PY_REFERENCE_LINE if header["format"] == "python" else LANGUAGE_MINIREF)
                 + "\n--- end ---"
             )
 
+        # 0.14.0 (plans/002 phase 7): YAML input removed — steering hint for
+        # stale callers instead of a TypeError.
+        if definition_yaml:
+            return json.dumps({
+                "error": "YAML editing was removed — pass code= (full source) "
+                         "or old=/new= (targeted snippet) instead. "
+                         "(definition_yaml is pblang only; a python playbook "
+                         "is its code.)",
+            })
         if modes != 1:
             return json.dumps({
                 "error": "Provide exactly one of: 'code' or 'old'+'new'.",
@@ -1752,7 +2137,33 @@ def build_tools(
         if snippet_mode and not (old and new is not None):
             return json.dumps({"error": "Snippet edits need both 'old' and 'new'."})
 
-        # WRITE stage, part 1: ticket check + compile + validate.
+        def _rejected(
+            fmt: str, errors: list[dict], warnings: list[dict], seconds_left: int,
+            *, extra: dict | None = None,
+        ) -> str:
+            # plans/032 phase 04 (docs/v2.md §9): a rejected write keeps
+            # the ticket — the agent fixes and retries without re-reading.
+            payload: dict[str, Any] = {
+                "stage": "write",
+                "saved": False,
+                "format": fmt,
+                "errors": errors,
+                "warnings": warnings,
+                "ticket": ticket,
+                "ticket_still_valid": True,
+                "expires_in_seconds": seconds_left,
+                "retry": _EDIT_RETRY_TEXT,
+            }
+            if extra:
+                payload.update(extra)
+            if fmt != "python":
+                payload["language_reference"] = LANGUAGE_CHEATSHEET
+            return json.dumps(payload)
+
+        # WRITE stage, part 1: ticket check + compile/check + validate.
+        pb_def = None
+        py_defn: dict | None = None
+        py_schema: dict | None = None
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name)
@@ -1764,6 +2175,8 @@ def build_tools(
             refusal = await _check_ticket(session, playbook, ticket, consume=False)
             if refusal:
                 return json.dumps({"error": refusal})
+            seconds_left = await _ticket_seconds_left(session, ticket)
+            stored_fmt = getattr(playbook, "format", "pblang") or "pblang"
             base_version = playbook.version
             # Edits build on the candidate when one exists (that's what the
             # read stage handed out), else on live.
@@ -1800,28 +2213,91 @@ def build_tools(
                     })
                 code = old_code.replace(old, new)
 
-            pb_def, err = _compile_code(code, name=name)
-            if err:
-                return err
-            stored_code = code
-            check_target: Any = pb_def.model_dump(
-                mode="json", exclude_none=True, by_alias=True,
+            # plans/032 phase 04 (docs/v2.md §9): explicit > sniff > stored.
+            # A format change is refused (per-version format is plugin/08).
+            fmt, fmt_issue = resolve_format(
+                format or None, code, stored=stored_fmt, default=stored_fmt,
             )
-
-            all_pb = await _load_all_playbook_steps(session, exclude=name)
-            issues = validate_definition(
-                check_target,
-                tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
-                # compiled dumps carry cross-kind defaults the key checker
-                # would falsely flag; the compiler already rejects typos.
-                check_unknown_keys=False,
-            )
-            errors = [i.to_dict() for i in issues if i.severity == "error"]
-            if errors:
+            if fmt_issue is not None:
+                return _rejected(fmt or stored_fmt, [fmt_issue.to_dict()], [], seconds_left)
+            if fmt != stored_fmt:
                 return json.dumps({
-                    "error": "Edit rejected — the new definition is invalid.",
-                    "issues": errors,
+                    "stage": "write",
+                    "saved": False,
+                    "format": stored_fmt,
+                    "error": (
+                        f"This playbook is {stored_fmt}; changing a playbook's "
+                        "format is not supported yet — create a new playbook."
+                    ),
+                    "ticket": ticket,
+                    "ticket_still_valid": True,
                 })
+            stored_code = code
+            if fmt == "python":
+                py_schema, perr = _parse_json_param(
+                    inputs_schema, label="inputs_schema", kind=dict,
+                )
+                if perr:
+                    return json.dumps({"error": perr, "format": fmt})
+                py_triggers, perr = _parse_json_param(triggers, label="triggers", kind=list)
+                if perr:
+                    return json.dumps({"error": perr, "format": fmt})
+                perr = _validate_triggers(py_triggers)
+                if perr:
+                    return json.dumps({"error": perr, "format": fmt})
+                base_defn = dict((cand_row.definition if cand_row else playbook.definition) or {})
+                if py_schema is None:
+                    py_schema = base_defn.get("inputs")
+                if py_triggers is None:
+                    py_triggers = list(base_defn.get("triggers") or [])
+                check_result, errors, warnings = _python_check(
+                    code, name=name, version=playbook.version + 1,
+                    inputs_schema=py_schema, registry=getattr(runner, "_tools", None),
+                )
+                if errors:
+                    return _rejected(fmt, errors, warnings, seconds_left)
+                py_defn = _python_definition(
+                    name=name, summary=check_result.summary,
+                    triggers=py_triggers, inputs_schema=py_schema,
+                )
+                issues = []
+            else:
+                if inputs_schema not in (None, "") or triggers not in (None, ""):
+                    return json.dumps({
+                        "error": "inputs_schema= and triggers= are python only "
+                                 "— a pblang playbook declares them in its "
+                                 "playbook(...) header.",
+                        "format": fmt,
+                    })
+                pb_def, err = _compile_code(code, name=name)
+                if err:
+                    compile_payload = json.loads(err)
+                    # `error` keeps the pre-032 "does not compile" sentence
+                    # that existing callers/tests key on; the ticket fields
+                    # are the phase 04 additions.
+                    return _rejected(
+                        fmt, compile_payload["issues"], [], seconds_left,
+                        extra={"error": compile_payload["error"]},
+                    )
+                check_target: Any = pb_def.model_dump(
+                    mode="json", exclude_none=True, by_alias=True,
+                )
+
+                all_pb = await _load_all_playbook_steps(session, exclude=name)
+                issues = validate_definition(
+                    check_target,
+                    tool_registry=getattr(runner, "_tools", None), all_playbooks=all_pb,
+                    # compiled dumps carry cross-kind defaults the key checker
+                    # would falsely flag; the compiler already rejects typos.
+                    check_unknown_keys=False,
+                )
+                errors = [i.to_dict() for i in issues if i.severity == "error"]
+                warnings = [i.to_dict() for i in issues if i.severity == "warning"]
+                if errors:
+                    return _rejected(
+                        fmt, errors, warnings, seconds_left,
+                        extra={"error": "Edit rejected — the new definition is invalid."},
+                    )
 
         # WRITE stage, part 2: consume the ticket and save, under lock.
         async with session_factory() as session:
@@ -1843,9 +2319,14 @@ def build_tools(
             # 0.10.0: a save creates a CANDIDATE version row — live content
             # on the playbook row is not touched. One candidate max: the
             # pointer moves, the previous candidate row stays in history.
-            await _ensure_live_row(session, playbook)
-            data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
-            data["name"] = name  # never rename via edit
+            # plans/032 phase 04: `_ensure_live_row` returns None on a
+            # candidate-only row (nothing live to record).
+            had_live = await _ensure_live_row(session, playbook) is not None
+            if py_defn is not None:
+                data = py_defn
+            else:
+                data = pb_def.model_dump(mode="json", exclude_none=True, by_alias=True)
+                data["name"] = name  # never rename via edit
             await mint_version(
                 session, playbook,
                 definition=data, code=stored_code, manifest=playbook.manifest,
@@ -1853,6 +2334,12 @@ def build_tools(
                 message="candidate",
             )
             playbook.candidate_version = playbook.version
+            if not had_live:
+                # never published: the row content mirrors the candidate so
+                # reads (_derive_code, GET /playbooks/{name}) show it.
+                playbook.definition = data
+                playbook.code = stored_code
+                playbook.inputs_schema = data.get("inputs")
             await session.commit()
             new_version = playbook.version
             live_version = _live_version_of(playbook)
@@ -1860,21 +2347,35 @@ def build_tools(
         await events.emit("playbook.candidate.saved", {
             "name": name, "candidate_version": new_version,
         })
-        warnings = [i.to_dict() for i in issues if i.severity == "warning"]
+        if py_defn is None:
+            warnings = [i.to_dict() for i in issues if i.severity == "warning"]
+        if live_version is None:
+            next_text = (
+                "Do not call playbook_validate — this write was validated. "
+                "No live version yet — triggers and playbook_run stay off "
+                "until playbook_publish(name). Test the candidate with "
+                "playbook_run_candidate, then publish to make it live."
+            )
+        else:
+            next_text = (
+                "Do not call playbook_validate — this write was validated. "
+                "The LIVE playbook is unchanged — triggers and playbook_run "
+                f"still execute version {live_version}. Test the candidate "
+                + ("with playbook_run_candidate" if fmt == "python" else
+                   "with playbook_dry_run (it targets the candidate by default)")
+                + ", then call playbook_publish(name) to make it live. "
+                "playbook_rollback restores the previous live version after "
+                "a publish."
+            )
         result: dict[str, Any] = {
             "playbook": name,
+            "format": fmt,
             "status": "candidate_saved",
             "candidate_version": new_version,
             "live_version": live_version,
+            "validated": True,
             "warnings": warnings,
-            "next": (
-                "The LIVE playbook is unchanged — triggers and playbook_run "
-                "still execute version "
-                f"{live_version}. Test the candidate with playbook_dry_run "
-                "(it targets the candidate by default), then call "
-                "playbook_publish(name) to make it live. playbook_rollback "
-                "restores the previous live version after a publish."
-            ),
+            "next": next_text,
         }
         return json.dumps(result)
 
@@ -1886,10 +2387,14 @@ def build_tools(
         old: str = "",
         new: str = "",
         definition_yaml: str = "",
+        format: str | None = None,
+        inputs_schema: str | dict | None = None,
+        triggers: str | list | None = None,
     ) -> str:
         return await _edit_impl(
             name=name, ticket=ticket, code=code, old=old, new=new,
-            definition_yaml=definition_yaml,
+            definition_yaml=definition_yaml, format=format,
+            inputs_schema=inputs_schema, triggers=triggers,
         )
 
     _EDIT_PAYLOAD_PROPS = {
@@ -1904,6 +2409,9 @@ def build_tools(
             "description": "Exact snippet of the current code to replace (must be unique)",
         },
         "new": {"type": "string", "description": "Replacement text for 'old'"},
+        "format": _FORMAT_PARAM,
+        "inputs_schema": _INPUTS_SCHEMA_PARAM,
+        "triggers": _TRIGGERS_PARAM,
     }
 
     tools.append((
@@ -1918,18 +2426,22 @@ def build_tools(
             # approval gate as chat since luna 0.40.003, and the edit
             # validates + snapshots a version before replacing.
             description=(
-                "Change an existing playbook — a two-step flow. STEP 1 (read): "
-                "call with ONLY the name; you get the playbook's manifest (the "
-                "bigger picture — read it before changing things; update it "
-                "via playbook_manifest_set when it's outdated), the current "
-                "code as plain readable text "
-                "(copy old= snippets from it verbatim), and a single-use edit "
-                "ticket. STEP 2 (write): call again with that ticket plus "
+                "Change an existing playbook (python or pblang — the stored "
+                "format; format= must match it) — a two-step flow. STEP 1 "
+                "(read): call with ONLY the name; you get the playbook's "
+                "manifest (the bigger picture — read it before changing "
+                "things; update it via playbook_manifest_set when it's "
+                "outdated), the current code as plain readable text "
+                "(copy old= snippets from it verbatim), and an edit ticket. "
+                "STEP 2 (write): call again with that ticket plus "
                 "exactly one of code= (full new source) or old=/new= (targeted "
                 "snippet; 'old' must match exactly one place). "
-                "The write compiles, validates, snapshots a version, "
-                "then saves a CANDIDATE — live keeps running until "
-                "playbook_publish."
+                "The write checks the code (python: the checker; pblang: "
+                "compile + validate), snapshots a version, then saves a "
+                "CANDIDATE — live keeps running until playbook_publish. "
+                "The ticket is consumed by a successful write; a rejected "
+                "write keeps it valid — fix and retry with the same ticket. "
+                "python only: inputs_schema= / triggers= replace the stored ones."
             ),
             parameters={
                 "type": "object",
@@ -2236,14 +2748,22 @@ def build_tools(
 
             gates: list[dict[str, Any]] = []
             # gate 1: static validation of the definition going live.
-            all_pb = await _load_all_playbook_steps(session, exclude=name)
-            issues = validate_definition(
-                row.definition,
-                tool_registry=getattr(runner, "_tools", None),
-                all_playbooks=all_pb,
-                check_unknown_keys=False,
-            )
-            errors = [i.to_dict() for i in issues if i.severity == "error"]
+            # plans/032 phase 04: python rows go through the checker.
+            if (row.definition or {}).get("format") == "python":
+                _, errors, _ = _python_check(
+                    row.code or "", name=name, version=row.version,
+                    inputs_schema=(row.definition or {}).get("inputs"),
+                    registry=getattr(runner, "_tools", None),
+                )
+            else:
+                all_pb = await _load_all_playbook_steps(session, exclude=name)
+                issues = validate_definition(
+                    row.definition,
+                    tool_registry=getattr(runner, "_tools", None),
+                    all_playbooks=all_pb,
+                    check_unknown_keys=False,
+                )
+                errors = [i.to_dict() for i in issues if i.severity == "error"]
             gates.append({"gate": "static_validation", "ok": not errors})
             if errors:
                 return json.dumps({
@@ -2423,6 +2943,11 @@ def build_tools(
                 f"Version {old_live} stays in history — publish a new "
                 "candidate to move forward."
                 if rolled_back else
+                # plans/032 phase 04: the first publish has nothing to
+                # roll back to.
+                f"Version {new_live} is the FIRST live version — triggers "
+                "and playbook_run execute it from now on."
+                if old_live is None else
                 f"Version {new_live} is now LIVE — triggers and "
                 f"playbook_run execute it. playbook_rollback(name) "
                 f"restores version {old_live} if it misbehaves."
@@ -2505,6 +3030,12 @@ def build_tools(
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
             live_n = _live_version_of(playbook)
+            if live_n is None:
+                # plans/032 phase 04: candidate-only — nothing to restore.
+                return json.dumps({
+                    "error": f"'{name}' has no live version to roll back "
+                             "from — publish the candidate first.",
+                })
             live_row = await _get_version_row(session, playbook, live_n)
             target_n = live_row.promoted_from if live_row else None
             if not target_n:
@@ -2604,9 +3135,17 @@ def build_tools(
 
         # 0.26.0 (plans/015, 089): candidate runs ARE the test evidence the
         # publish gate looks for — stamped is_test at creation.
-        run = await runner.start_run_background(
-            shim, inputs=input_data, trigger="agent-candidate", is_test=True,
-        )
+        try:
+            run = await runner.start_run_background(
+                shim, inputs=input_data, trigger="agent-candidate", is_test=True,
+            )
+        except InputTypeError as e:
+            # plans/032 phase 04: loud intake — same shape as playbook_run.
+            return json.dumps({
+                "status": "rejected", "error": str(e),
+                "input": e.input, "expected": e.expected,
+                "candidate_version": candidate_version,
+            })
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
 
@@ -2628,11 +3167,25 @@ def build_tools(
                 "re-run, do NOT report results yet."
             )
         elif status == "failed":
-            result["error"] = (
+            fabricate = (
                 "Candidate test run FAILED. Do NOT fabricate results — "
                 "playbook_publish will refuse until a green test run "
                 "exists. Check playbook_status for the error details."
             )
+            # plans/032 phase 04 (docs/v2.md §7): the one-liner is readable
+            # here, same as playbook_run.
+            async with session_factory() as session:
+                row_run = await session.get(PlaybookRun, run.id)
+            run_error = getattr(row_run, "error", None) if row_run is not None else None
+            if getattr(shim, "format", "pblang") == "python" and run_error:
+                result["error"] = f"{run_error} {fabricate}"
+            else:
+                result["error"] = fabricate
+                if run_error:
+                    result["error_detail"] = run_error
+            result["error_type"] = getattr(row_run, "error_type", None) if row_run is not None else None
+            failed_at = getattr(row_run, "failed_at", None) if row_run is not None else None
+            result["failed_at"] = failed_at.isoformat() if failed_at else None
         elif status == "done":
             async with session_factory() as session:
                 steps = (await session.execute(

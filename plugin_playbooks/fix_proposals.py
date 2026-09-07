@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,8 +26,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import Playbook, PlaybookFixProposal, PlaybookRun, PlaybookStepRun
 from .publish import ops_conversation_id
+from .versioning import live_version_of
 
 log = logging.getLogger("luna.playbooks.fix_proposals")
+
+
+_V2_LINE_RE = re.compile(r"^line (\d+):")
+_V2_TAIL_RE = re.compile(r" (after effect \S+|before any effect)\s*$")
+
+
+def _v2_signature_parts(one_liner: str) -> tuple[str, str]:
+    """`line 7: rows['items'] → KeyError: 'items' after effect fetch#1` →
+    ("line 7", "KeyError: 'items'"). Falls back to ("", whole text)."""
+    m = _V2_LINE_RE.match(one_liner or "")
+    step = f"line {m.group(1)}" if m else ""
+    head = one_liner or ""
+    if " → " in head:
+        head = head.split(" → ", 1)[1]
+    head = _V2_TAIL_RE.sub("", head).strip()
+    return step, head
 
 
 def failure_signature(playbook_name: str, step_id: str, error: str) -> str:
@@ -106,8 +124,10 @@ class FixProposalService:
             # proposals are for PRODUCTION failures: the version that failed
             # must still be the live one (a failure of an since-replaced
             # version is stale news, and the digest covers history anyway).
-            live = playbook.live_version or playbook.version
-            if run.playbook_version != live:
+            # plans/032 phase 04: None = candidate-only row; nothing is
+            # live, so a failure there is never a production failure.
+            live = live_version_of(playbook)
+            if live is None or run.playbook_version != live:
                 return
             failed_step = (await session.execute(
                 select(PlaybookStepRun).where(
@@ -118,9 +138,16 @@ class FixProposalService:
             step_id = failed_step.step_id if failed_step else ""
             error = (
                 (failed_step.error if failed_step else None)
-                or payload.get("error") or ""
+                or run.error or payload.get("error") or ""
             )
-            sig = failure_signature(playbook.name, step_id, error)
+            sig_step, sig_error = step_id, error
+            if getattr(run, "error_type", None) and not failed_step:
+                # plans/032 phase 04 (docs/v2.md §7): a python failure keys
+                # its signature on the line and the `<type>: <message>`
+                # head of the one-liner — same line, same error → one row.
+                sig_step, sig_error = _v2_signature_parts(run.error or "")
+                step_id = sig_step or step_id
+            sig = failure_signature(playbook.name, sig_step, sig_error)
             existing = (await session.execute(
                 select(PlaybookFixProposal).where(
                     PlaybookFixProposal.playbook_id == playbook.id,

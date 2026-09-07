@@ -42,6 +42,11 @@ class Playbook(Base):
     # that changes `definition` without code MUST null this out (stale code is
     # worse than no code).
     code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # plans/032 phase 04: the playbook's language — "pblang" (the v1 DSL,
+    # `definition` is a compiled PlaybookDef) or "python" (a v2
+    # `async def run(ctx, inputs)` playbook, `definition` is the checker
+    # summary). Existing rows read pblang from the DDL default.
+    format: Mapped[str] = mapped_column(String(16), default="pblang", nullable=False)
     # 0.9.0 (plans/002 phase 2): free-text intent manifest (markdown). Empty
     # string = no manifest yet; the drift gate only engages when non-empty.
     manifest: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -49,7 +54,9 @@ class Playbook(Base):
     # 0.10.0 (plans/002 phase 3): `version` is the monotonic counter (highest
     # version number ever created). `live_version` is what triggers/runs
     # execute — playbook.definition/code/manifest always hold ITS content.
-    # 0 means "same as version" (pre-0.10 rows; backfilled on load).
+    # 0 means "same as version" (pre-0.10 rows; backfilled on load) — unless
+    # the row carries `candidate_version`, where 0 means "no live version"
+    # (plans/032 phase 04: propose saves a candidate; publish makes it live).
     live_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # the one un-promoted candidate (its content lives in playbook_versions);
     # NULL = no candidate. A new save overwrites the pointer, not the history.

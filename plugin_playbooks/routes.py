@@ -32,7 +32,7 @@ from .models import (
 )
 from .probes import run_preflight
 from .publish import announce_publish, test_run_gate
-from .versioning import ensure_live_row, mint_version
+from .versioning import ensure_live_row, live_version_of, mint_version
 from .versioning import get_version_row as _tolerant_get_version_row
 from .validation import validate_definition
 
@@ -420,8 +420,10 @@ def _aware(dt: datetime | None) -> datetime | None:
 # at version `live_version` (0 = "same as version" on pre-0.10 rows); the one
 # un-promoted candidate is a playbook_versions row named by `candidate_version`.
 
-def _live_version_of(p: Playbook) -> int:
-    return p.live_version or p.version
+def _live_version_of(p: Playbook) -> int | None:
+    # plans/032 phase 04: one implementation (versioning.live_version_of);
+    # None = candidate-only row, nothing live yet.
+    return live_version_of(p)
 
 
 async def _get_version_row(
@@ -430,8 +432,9 @@ async def _get_version_row(
     return await _tolerant_get_version_row(session, p, n)
 
 
-async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion:
-    """Guarantee a version row exists for the current live content."""
+async def _ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion | None:
+    """Guarantee a version row exists for the current live content (None
+    when nothing is live)."""
     return await ensure_live_row(session, p)
 
 
@@ -611,6 +614,7 @@ async def list_playbooks(status: str = "active"):
             "when_to_use": p.when_to_use,
             "status": p.status,
             "agent_autonomy": p.agent_autonomy,
+            "format": p.format,  # plans/032 phase 04
             "version": p.version,
             "live_version": _live_version_of(p),
             "candidate_version": p.candidate_version,
@@ -645,6 +649,7 @@ async def get_playbook(name: str):
             "when_to_use": p.when_to_use,
             "definition": p.definition,
             "code": p.code,
+            "format": p.format,  # plans/032 phase 04: the UI picks its view by it
             "manifest": p.manifest,
             "inputs_schema": p.inputs_schema,
             "status": p.status,
@@ -1002,7 +1007,9 @@ async def list_versions(name: str):
         # synthesized entry covers that gap only (no duplicates).
         live_n = _live_version_of(p)
         result = []
-        if not any(v.version == live_n for v in versions):
+        # plans/032 phase 04: a candidate-only row has nothing live to
+        # synthesize.
+        if live_n is not None and not any(v.version == live_n for v in versions):
             result.append({
                 "version": live_n,
                 "title": "",
@@ -1047,7 +1054,7 @@ async def get_version(name: str, n: int):
             raise HTTPException(404, f"Playbook '{name}' not found")
         live_n = _live_version_of(p)
         row = await _get_version_row(session, p, n)
-        if row is None and n != live_n:
+        if row is None and (live_n is None or n != live_n):
             raise HTTPException(404, f"Version {n} of '{name}' not found")
         runs = (await session.execute(
             select(sa_func.count()).select_from(PlaybookRun).where(

@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.47.0"
+version = "0.48.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -43,7 +43,7 @@ tables = 10
 
 [[tools]]
 name = "playbook_propose"
-description = "Create a new playbook draft from pblang source."
+description = "Save a new playbook as a validated candidate from python or pblang source — nothing runs live until playbook_publish."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -55,13 +55,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_run"
-description = "Execute a playbook for real (runs tools and agent steps)."
+description = "Execute the LIVE version of a playbook for real; inputs are typed at intake and a compute failure is reported as one readable line."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_status"
-description = "Get the full step trace of a playbook run."
+description = "Get the full step/effect trace of a playbook run, with error, error_type, traceback and failed_at."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -97,7 +97,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_get_definition"
-description = "Get the pblang source of a playbook version."
+description = "Get the source (python or pblang) or JSON definition of a playbook version."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -121,13 +121,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_runs"
-description = "List a playbook's runs with full failure output; filter by version/status."
+description = "List a playbook's runs with full failure output (error, error_type, failed_at); filter by version/status."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_validate"
-description = "Statically check a playbook without running it."
+description = "Statically check python or pblang playbook source without saving or running it."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -139,13 +139,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_dry_run"
-description = "Simulate a playbook run with tool/LLM steps stubbed (scriptable via stubs) — no side effects."
+description = "Simulate a pblang playbook run with tool/LLM steps stubbed (scriptable via stubs) — no side effects; python dry run arrives later."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_edit"
-description = "Edit a playbook's candidate version (read-stage ticket flow)."
+description = "Edit a playbook's candidate version in its stored format (read-stage ticket flow; a rejected write keeps the ticket)."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -169,7 +169,7 @@ risk_level = "medium"
 
 [[tools]]
 name = "playbook_run_candidate"
-description = "Test-run the candidate version for real (owner approval)."
+description = "Test-run the candidate version for real (owner approval); inputs typed at intake, failures reported as one readable line."
 policy = "prompt_always"
 risk_level = "medium"
 

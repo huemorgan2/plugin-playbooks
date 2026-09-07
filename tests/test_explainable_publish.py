@@ -97,7 +97,14 @@ async def _env(ctx):
 
 
 async def _green_candidate(sf, tools) -> None:
+    # plans/032 phase 04: propose saves a candidate — v1 goes live through
+    # the (approving) gate before the v2 candidate is saved.
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await green_run(sf, 1)
+    out = json.loads(await tools["playbook_publish"](
+        name="greeter", explanation=EXPLANATION,
+    ))
+    assert out.get("status") == "published", out
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     await tools["playbook_edit"](
         name="greeter", ticket=read["ticket"], code=NEW_CODE,
@@ -116,6 +123,7 @@ async def test_publish_files_one_rich_approval_then_flips():
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
         await _green_candidate(sf, tools)
+        approvals.requests.clear()  # the v1 card from setup
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
         ))
@@ -156,6 +164,7 @@ async def test_publish_without_explanation_still_files_the_card():
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
         await _green_candidate(sf, tools)
+        approvals.requests.clear()  # the v1 card from setup
         out = json.loads(await tools["playbook_publish"](name="greeter"))
         assert out["status"] == "published"
         assert len(approvals.requests) == 1
@@ -167,10 +176,12 @@ async def test_publish_without_explanation_still_files_the_card():
 
 @pytest.mark.asyncio
 async def test_rejected_publish_leaves_live_untouched():
-    approvals = _Approvals(decision="rejected", reason="not this week")
+    approvals = _Approvals()
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
-        await _green_candidate(sf, tools)
+        await _green_candidate(sf, tools)  # v1 approved and live
+        # the owner rejects the v2 publish under test
+        approvals._decision, approvals._reason = "rejected", "not this week"
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
         ))

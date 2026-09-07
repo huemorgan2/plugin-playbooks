@@ -49,6 +49,8 @@ export function PlaybookEditor(props: Props) {
     status: string
     version: number
     candidateVersion: number | null
+    // plans/032 phase 04: python playbooks get the interim V2View.
+    format?: 'pblang' | 'python'
     isDraft: boolean
     draftId?: string
   } | null>(null)
@@ -113,6 +115,7 @@ export function PlaybookEditor(props: Props) {
             status: pb.status as string,
             version: pb.live_version ?? pb.version,
             candidateVersion: pb.candidate_version ?? null,
+            format: pb.format,
             isDraft: false,
           })
           setRefreshKey((k) => k + 1)
@@ -353,6 +356,7 @@ export function PlaybookEditor(props: Props) {
               agentName={agentName}
               liveVersion={meta?.version ?? 0}
               candidateVersion={meta?.candidateVersion ?? null}
+              format={meta?.format}
               refreshKey={refreshKey}
               patch={patch}
               onPromoted={() => loadData()}

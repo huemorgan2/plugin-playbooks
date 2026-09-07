@@ -19,6 +19,8 @@ from luna_sdk import EventBus
 
 from .definition import TriggerDef
 from .models import Playbook
+from .runner import InputTypeError
+from .versioning import live_version_of
 
 log = logging.getLogger("luna.playbooks.triggers")
 
@@ -54,6 +56,10 @@ class PlaybookTriggerService:
 
         event_map: dict[str, list[tuple[Playbook, TriggerDef]]] = {}
         for pb in playbooks:
+            if live_version_of(pb) is None:
+                # plans/032 phase 04: a candidate-only playbook has no
+                # live version — its triggers activate at publish.
+                continue
             definition = pb.definition or {}
             for trigger_data in definition.get("triggers", []):
                 try:
@@ -105,6 +111,26 @@ class PlaybookTriggerService:
                                 # run already finished (or untracked) —
                                 # nothing left to guard.
                                 self._in_flight.discard(flight_key)
+                        except InputTypeError as e:
+                            # plans/032 phase 04: loud intake on the trigger
+                            # path — a failed run row names the input so the
+                            # failure digest / runs list show it; no run ever
+                            # started.
+                            self._in_flight.discard(flight_key)
+                            log.warning(
+                                "trigger.input_rejected playbook=%s input=%s expected=%s",
+                                pb.name, e.input, e.expected,
+                            )
+                            try:
+                                run = await self._runner._create_run(
+                                    pb, inputs=mapped, trigger=trigger.event,
+                                )
+                                await self._runner._complete_run(
+                                    run.id, "failed", error=str(e),
+                                    error_type="InputTypeError",
+                                )
+                            except Exception:  # noqa: BLE001
+                                log.exception("trigger.input_rejected_record_failed playbook=%s", pb.name)
                         except Exception:
                             self._in_flight.discard(flight_key)
                             log.exception("trigger.run_failed playbook=%s", pb.name)

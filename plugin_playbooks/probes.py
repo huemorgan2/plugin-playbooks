@@ -31,7 +31,11 @@ def collect_tools(definition: dict[str, Any]) -> list[str]:
     agent-step allowlists, recursing into condition branches, loop bodies,
     and parallel branches. Sorted, deduped. Subtask targets are collected
     separately (see collect_subtasks) — their tools belong to their own
-    definitions."""
+    definitions. plans/032 phase 04: a python definition is the checker
+    summary — its literal `tools` plus `code_run` (the jail every python
+    playbook runs in)."""
+    if (definition or {}).get("format") == "python":
+        return sorted(set(definition.get("tools") or []) | {"code_run"})
     found: set[str] = set()
 
     def walk(steps: list[dict[str, Any]]) -> None:
@@ -55,7 +59,10 @@ def collect_tools(definition: dict[str, Any]) -> list[str]:
 
 
 def collect_subtasks(definition: dict[str, Any]) -> list[str]:
-    """Names of playbooks referenced by subtask steps, anywhere in the IR."""
+    """Names of playbooks referenced by subtask steps, anywhere in the IR.
+    plans/032 phase 04: a python definition lists them in its summary."""
+    if (definition or {}).get("format") == "python":
+        return sorted(definition.get("subtasks") or [])
     found: set[str] = set()
 
     def walk(steps: list[dict[str, Any]]) -> None:

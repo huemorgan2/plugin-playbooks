@@ -38,6 +38,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_runs", "error_type", "VARCHAR(64)"),
     ("playbook_runs", "traceback", "TEXT"),
     ("playbook_runs", "failed_at", "TIMESTAMP"),
+    # plans/032 phase 04: the playbook's language (pblang | python)
+    ("playbooks", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
 ]
 
 # Indexes whose definition changed — dropped on load so the model's current
@@ -145,7 +147,12 @@ async def backfill_code(session_factory) -> int:
     filled = 0
     async with session_factory() as session:
         rows = (await session.execute(
-            select(Playbook).where(Playbook.code.is_(None))
+            select(Playbook).where(
+                Playbook.code.is_(None),
+                # plans/032 phase 04: python rows carry code by construction
+                # and their definition is a checker summary, not a PlaybookDef
+                Playbook.format != "python",
+            )
         )).scalars().all()
         for pb in rows:
             try:
@@ -176,6 +183,10 @@ async def backfill_live_version(session_factory) -> int:
 
     0 means "same as version"; make that explicit so every reader can trust
     `live_version` directly. Idempotent. Returns the number of rows updated.
+
+    plans/032 phase 04: a row that carries `candidate_version` with
+    `live_version == 0` has NO live version (propose saved a candidate) —
+    a restart must never promote it, so those rows are left alone.
     """
     from sqlalchemy import update
 
@@ -184,7 +195,7 @@ async def backfill_live_version(session_factory) -> int:
     async with session_factory() as session:
         result = await session.execute(
             update(Playbook)
-            .where(Playbook.live_version == 0)
+            .where(Playbook.live_version == 0, Playbook.candidate_version.is_(None))
             .values(live_version=Playbook.version)
         )
         await session.commit()
@@ -216,8 +227,10 @@ Never run blind:
 quantifier (each/all/every) MUST be a `loop`; (b) no single step may carry
 the whole task; (c) each `agent()`/`llm()` is ONE judgment on ONE thing.
 Only then write code.
-1. WRITE: `playbook_propose(name, code=...)` to create; edit via the
-two-step ticket flow — see MANIFEST + THE EDIT FLOW below.
+1. WRITE: `playbook_propose(name, code=...)` to create — it saves a
+CANDIDATE (validated, not live): nothing runs via triggers or
+`playbook_run` until `playbook_publish`. Edit via the two-step ticket
+flow — see MANIFEST + THE EDIT FLOW below.
 2. COMPILE: `playbook_validate(code=... | name=...)` — ALL errors at once
 (line numbers, undefined refs, unknown tools, bad loops, cycles).
 3. TEST: `playbook_dry_run(name, inputs)` — simulates the run with tool/LLM
@@ -367,7 +380,9 @@ plus the manifest and current code as plain-text frames; copy `old=`
 snippets verbatim from the code frame.
 2. WRITE: `playbook_edit(name, ticket=..., ...)` with exactly one of `code=`
 or `old=`/`new=` (the `old` snippet must match exactly one place). The
-ticket is single-use and expires; no valid ticket, no save.
+ticket is consumed by a successful write; a rejected write keeps it valid
+(fix and retry with the same ticket — do not re-read). It expires after
+15 minutes; no valid ticket, no save.
 Pass `manifest=` to `playbook_propose` on create; if a playbook has none,
 propose one.
 
@@ -481,6 +496,12 @@ async def failure_digest(session) -> list[dict]:
             & (PlaybookRun.is_test.is_(False)),
         )
         .where(Playbook.status == "enabled")
+        # plans/032 phase 04: a candidate-only row (live_version 0 with a
+        # candidate pointer) has nothing live — never read its 0 as "same
+        # as version". Legacy 0 rows are pinned by backfill_live_version.
+        .where(
+            (Playbook.live_version != 0) | (Playbook.candidate_version.is_(None))
+        )
         .where(
             (Playbook.failures_acked_version.is_(None))
             | (Playbook.failures_acked_version != eff_live)
@@ -517,6 +538,9 @@ async def failure_digest(session) -> list[dict]:
             "finished": int(n_finished),
             "last_failed_run_id": str(last.id) if last else None,
             "last_failed_at": last.started_at if last else None,
+            # plans/032 phase 04: the run's one-liner (docs/v2.md §7) so the
+            # digest names the failure, not just the count
+            "error": (getattr(last, "error", None) or None) if last else None,
             "promoted_at": promoted_at,
         })
     return out
@@ -532,11 +556,13 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
         promoted = (
             f", promoted {_rel_age(d['promoted_at'], now)}" if d["promoted_at"] else ""
         )
+        error = d.get("error")
         lines.append(
             f"- `{d['name']}`: {d['failed']} of {d['finished']} runs FAILED "
             f"since its last change (v{d['live_version']}{promoted}). "
             f"Last failure {_rel_age(d['last_failed_at'], now)} "
             f"(run_id {d['last_failed_run_id']}, inspect with playbook_status)."
+            + (f" — {error}" if error else "")
         )
     lines += [
         "",
@@ -618,7 +644,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.47.0",
+        version="0.48.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -953,8 +979,8 @@ class PlaybooksPlugin(LunaPlugin):
                 "note": (
                     "Put the 'event' value in a trigger(...) entry of the playbook's "
                     "triggers=[...] list in the code you pass to playbook_propose / "
-                    "playbook_edit. The trigger goes live automatically when the "
-                    "playbook is saved."
+                    "playbook_edit. The trigger goes live when the playbook "
+                    "is published (playbook_publish)."
                 ),
             }
 

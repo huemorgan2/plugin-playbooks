@@ -117,6 +117,8 @@ export interface PlaybookSummary {
   version: number
   live_version?: number
   candidate_version?: number | null
+  // plans/032 phase 04: the UI picks its version view by it (python → V2View).
+  format?: 'pblang' | 'python'
   trust?: TrustSummary
   // plans/001: run history, computed server-side over the last 30 days.
   last_run_at?: string | null
@@ -161,7 +163,9 @@ export interface StateFrame {
 
 export interface StepRunDetail {
   step_id: string
-  kind: StepKind
+  // plans/032 phase 04: a python run's rows are effects (`tool`, `log`, …),
+  // not pblang step kinds — the string branch keeps StepKind's completions.
+  kind: StepKind | (string & {})
   status: RunStatus
   inputs: Record<string, any> | null
   outputs: Record<string, any> | null

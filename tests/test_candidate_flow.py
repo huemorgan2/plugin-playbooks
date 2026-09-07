@@ -1,7 +1,8 @@
 """0.10.0 (plans/002 phase 3) — candidate versions, promote, rollback.
 
 A save creates a CANDIDATE version row; live content on the playbook row is
-untouched until playbook_publish passes the gate. playbook_rollback restores
+untouched until playbook_publish passes the gate. plans/032 phase 04:
+playbook_propose saves a candidate too — tests publish v1 in setup. playbook_rollback restores
 the previous live version. dry_run targets the candidate by default;
 playbook_run_candidate is a supervised real run of the candidate.
 """
@@ -118,6 +119,17 @@ async def _green_run(sf, version: int, *, is_test: bool = True) -> None:
         await s.commit()
 
 
+async def _publish_v1(sf, tools) -> None:
+    """plans/032 phase 04: propose saves a CANDIDATE — v1 goes live only
+    through the publish gate. Setup-only helper for tests whose subject
+    assumes a live v1 plus a candidate v2."""
+    await _green_run(sf, 1)
+    out = json.loads(await tools["playbook_publish"](
+        explanation=EXPLANATION, name="greeter",
+    ))
+    assert out.get("status") == "published", out
+
+
 async def _save_candidate(tools, code: str = NEW_CODE) -> dict:
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     return json.loads(await tools["playbook_edit"](
@@ -128,19 +140,25 @@ async def _save_candidate(tools, code: str = NEW_CODE) -> dict:
 # --- creation + backfill ---
 
 @pytest.mark.asyncio
-async def test_propose_goes_live_directly(env):
+async def test_propose_saves_a_candidate_not_live(env):
+    # plans/032 phase 04: propose = candidate for both formats; nothing
+    # is live until playbook_publish.
     sf, tools, _, _ = env
-    await tools["playbook_propose"](name="greeter", code=CODE)
+    out = json.loads(await tools["playbook_propose"](name="greeter", code=CODE))
+    assert out["status"] == "candidate_saved"
+    assert out["live_version"] is None
+    assert out["candidate_version"] == 1
     pb = await _get(sf)
     assert pb.version == 1
-    assert pb.live_version == 1
-    assert pb.candidate_version is None
+    assert pb.live_version == 0
+    assert pb.candidate_version == 1
 
 
 @pytest.mark.asyncio
 async def test_backfill_pins_live_version_on_legacy_rows(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     async with sf() as s:
         await s.execute(update(Playbook).values(live_version=0, version=4))
         await s.commit()
@@ -157,6 +175,8 @@ async def test_backfill_pins_live_version_on_legacy_rows(env):
 async def test_save_creates_candidate_and_leaves_live_untouched(env):
     sf, tools, _, bus = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
+    bus.events.clear()  # the v1 publish resynced triggers; not the subject
     out = await _save_candidate(tools)
     assert out["status"] == "candidate_saved"
     assert out["candidate_version"] == 2
@@ -179,6 +199,7 @@ async def test_save_creates_candidate_and_leaves_live_untouched(env):
 async def test_read_stage_returns_candidate_when_one_exists(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     assert read["editing"] == "candidate"
@@ -191,6 +212,7 @@ async def test_read_stage_returns_candidate_when_one_exists(env):
 async def test_second_save_iterates_on_candidate(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     # snippet edit applies to the CANDIDATE code, not live
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
@@ -213,6 +235,7 @@ async def test_second_save_iterates_on_candidate(env):
 async def test_dry_run_defaults_to_candidate(env):
     sf, tools, runner, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     out = json.loads(await tools["playbook_dry_run"](name="greeter"))
     assert out["tested_version"] == 2
@@ -231,6 +254,7 @@ async def test_dry_run_defaults_to_candidate(env):
 async def test_dry_run_without_candidate_uses_live(env):
     sf, tools, runner, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     out = json.loads(await tools["playbook_dry_run"](name="greeter"))
     assert out["tested_version"] == 1
     assert out["is_candidate"] is False
@@ -244,6 +268,7 @@ async def test_dry_run_without_candidate_uses_live(env):
 async def test_promote_swaps_live_and_records_lineage(env):
     sf, tools, _, bus = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     await _green_run(sf, 2)
     bus.events.clear()
@@ -269,6 +294,7 @@ async def test_promote_swaps_live_and_records_lineage(env):
 async def test_promote_without_candidate_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert "no candidate" in out["error"]
 
@@ -277,6 +303,7 @@ async def test_promote_without_candidate_is_refused(env):
 async def test_promote_gate_names_static_validation_failure(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     # corrupt the candidate row so validation fails (undefined step reference)
     async with sf() as s:
@@ -319,6 +346,7 @@ async def test_promote_keeps_live_manifest(env):
 async def test_rollback_restores_previous_live(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     await _green_run(sf, 2)
     await tools["playbook_publish"](explanation=EXPLANATION, name="greeter")
@@ -340,6 +368,7 @@ async def test_rollback_restores_previous_live(env):
 async def test_rollback_without_history_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     out = json.loads(await tools["playbook_rollback"](explanation=EXPLANATION, name="greeter"))
     assert "no previous version" in out["error"]
 
@@ -350,6 +379,7 @@ async def test_rollback_without_history_is_refused(env):
 async def test_run_candidate_executes_the_candidate_shim(env):
     sf, tools, runner, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     out = json.loads(await tools["playbook_run_candidate"](name="greeter"))
     assert out["candidate_version"] == 2
@@ -366,6 +396,7 @@ async def test_run_candidate_executes_the_candidate_shim(env):
 async def test_run_candidate_without_candidate_is_refused(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     out = json.loads(await tools["playbook_run_candidate"](name="greeter"))
     assert "no candidate" in out["error"]
 
@@ -376,6 +407,7 @@ async def test_live_run_notes_pending_candidate(env):
     await tools["playbook_propose"](
         name="greeter", code=CODE, agent_autonomy="agent_may_trigger",
     )
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)
     out = json.loads(await tools["playbook_run"](name="greeter"))
     assert "LIVE version (1)" in out["note"]
@@ -390,6 +422,7 @@ async def test_live_run_notes_pending_candidate(env):
 async def test_manifest_set_with_pending_candidate_keeps_versions_unique(env):
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     await _save_candidate(tools)                # candidate = v2
     out = json.loads(await tools["playbook_manifest_set"](
         name="greeter", manifest="## Purpose\nGreets.\n",

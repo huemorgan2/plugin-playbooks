@@ -111,8 +111,15 @@ async def env():
     await engine.dispose()
 
 
-async def _make_candidate(tools) -> None:
+async def _make_candidate(sf, tools) -> None:
+    # plans/032 phase 04: propose saves a candidate — publish v1 through
+    # the gate first so the tests below start from live v1 + candidate v2.
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await green_run(sf, 1)
+    out = json.loads(await tools["playbook_publish"](
+        explanation=EXPLANATION, name="greeter",
+    ))
+    assert out.get("status") == "published", out
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     await tools["playbook_edit"](
         name="greeter", ticket=read["ticket"], code=NEW_CODE,
@@ -124,7 +131,7 @@ async def _make_candidate(tools) -> None:
 @pytest.mark.asyncio
 async def test_publish_refused_without_test_run(env):
     sf, tools, _, _ = env
-    await _make_candidate(tools)
+    await _make_candidate(sf, tools)
     out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["gate"] == "test_run"
     assert "simulations" in out["error"]
@@ -138,7 +145,7 @@ async def test_publish_refused_without_test_run(env):
 @pytest.mark.asyncio
 async def test_publish_refused_on_failed_test_run(env):
     sf, tools, _, _ = env
-    await _make_candidate(tools)
+    await _make_candidate(sf, tools)
     later = datetime.now(timezone.utc) + timedelta(seconds=5)
     async with sf() as s:
         pb = (await s.execute(select(Playbook))).scalar_one()
@@ -157,7 +164,8 @@ async def test_publish_refused_on_failed_test_run(env):
 @pytest.mark.asyncio
 async def test_publish_passes_with_green_test_run_and_announces(env):
     sf, tools, _, bus = env
-    await _make_candidate(tools)
+    await _make_candidate(sf, tools)
+    bus.events.clear()  # drop the v1 publish announce from setup
     await green_run(sf, 2)
     out = json.loads(await tools["playbook_publish"](explanation=EXPLANATION, name="greeter"))
     assert out["status"] == "published"
@@ -175,7 +183,7 @@ async def test_stale_evidence_does_not_satisfy_a_new_edit(env):
     """A green run of v2 is no evidence for v3 — every edit needs a fresh
     test (version rows are immutable, so version identity carries it)."""
     sf, tools, _, _ = env
-    await _make_candidate(tools)
+    await _make_candidate(sf, tools)
     await green_run(sf, 2)
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     await tools["playbook_edit"](

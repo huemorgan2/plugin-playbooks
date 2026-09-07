@@ -402,6 +402,11 @@ async def test_promote_refused_on_failed_probe_then_passes(env):
 async def test_preflight_tool_reports_and_steers(env):
     sf, runner, handlers, tools = env
     await handlers["playbook_propose"](name="greeter", code=CODE)
+    # plans/032 phase 04: propose saves a candidate — publish v1 so the
+    # default target is the live version, as this test is about.
+    await green_run(sf, 1)
+    pub = json.loads(await handlers["playbook_publish"](explanation=EXPLANATION, name="greeter"))
+    assert pub["status"] == "published", pub
 
     out = json.loads(await handlers["playbook_preflight"](name="greeter"))
     assert out["playbook"] == "greeter"

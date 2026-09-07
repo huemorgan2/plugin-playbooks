@@ -116,8 +116,9 @@ class _GatedApprovalsNoGet(_GatedApprovals):
 
 def _pb(name: str, source: str) -> Playbook:
     return Playbook(
-        name=name, display_name=name, code=source,
-        definition={"name": name, "steps": []}, status="enabled",
+        name=name, display_name=name, code=source, format="python",
+        definition={"name": name, "format": "python", "steps": []},
+        status="enabled",
     )
 
 

@@ -123,8 +123,22 @@ async def _env(ctx):
     return engine, sf, tools, bus
 
 
-async def _candidate(sf, tools) -> None:
+async def _candidate(sf, tools, *, seed_live: bool = False) -> None:
+    # plans/032 phase 04: propose saves a candidate. v1 goes live through
+    # the gate; where the approval stub under test cannot approve
+    # (broken/exploding engine), the row is seeded live directly.
     await tools["playbook_propose"](name="greeter", code=CODE)
+    if seed_live:
+        async with sf() as s:
+            pb = (await s.execute(select(Playbook))).scalar_one()
+            pb.live_version, pb.candidate_version = 1, None
+            await s.commit()
+    else:
+        await green_run(sf, 1)
+        out = json.loads(await tools["playbook_publish"](
+            name="greeter", explanation=EXPLANATION,
+        ))
+        assert out.get("status") == "published", out
     read = parse_read_stage(await tools["playbook_edit"](name="greeter"))
     await tools["playbook_edit"](
         name="greeter", ticket=read["ticket"], code=NEW_CODE,
@@ -190,6 +204,9 @@ async def test_publish_result_and_announce_state_failed_evidence_honestly():
     engine, sf, tools, bus = await _env(ctx)
     try:
         await _candidate(sf, tools)
+        approvals.requests.clear()  # the v1 card from setup
+        ctx.sent.clear()            # and its announce
+        bus.events.clear()          # and its bus event
         async with sf() as s:
             pb = (await s.execute(select(Playbook))).scalar_one()
             pb.publish_require_run = False  # Settings → Publish, gate off
@@ -228,6 +245,7 @@ async def test_green_publish_reports_passed_evidence():
     engine, sf, tools, bus = await _env(ctx)
     try:
         await _candidate(sf, tools)
+        bus.events.clear()  # the v1 publish event from setup
         await green_run(sf, 2)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
@@ -247,7 +265,7 @@ async def test_green_publish_reports_passed_evidence():
 async def test_broken_approval_engine_aborts_publish():
     engine, sf, tools, _ = await _env(_NoApprovalCtx())
     try:
-        await _candidate(sf, tools)
+        await _candidate(sf, tools, seed_live=True)
         await green_run(sf, 2)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
@@ -263,7 +281,7 @@ async def test_broken_approval_engine_aborts_publish():
 async def test_approval_wait_exception_aborts_publish():
     engine, sf, tools, _ = await _env(_Ctx(_ExplodingApprovals()))
     try:
-        await _candidate(sf, tools)
+        await _candidate(sf, tools, seed_live=True)
         await green_run(sf, 2)
         out = json.loads(await tools["playbook_publish"](
             name="greeter", explanation=EXPLANATION,
@@ -399,13 +417,21 @@ def test_coerce_inputs_casts_scalars_to_declared_types():
     assert out["extra"] == [1, 2]
 
 
-def test_coerce_inputs_leaves_uncoercible_values_alone():
+def test_coerce_inputs_rejects_uncoercible_values():
+    # plans/032 phase 04: an un-coercible declared input fails loud at
+    # intake, naming the input and the expected type — never a silent
+    # pass-through into the run.
     from types import SimpleNamespace
+
+    from plugin_playbooks.runner import InputTypeError
     pb = SimpleNamespace(inputs_schema={"type": "object", "properties": {
         "count": {"type": "integer"},
     }})
-    out = _coerce_inputs(pb, {"count": "not-a-number"})
-    assert out["count"] == "not-a-number"
+    with pytest.raises(InputTypeError) as ei:
+        _coerce_inputs(pb, {"count": "not-a-number"})
+    assert ei.value.input == "count"
+    assert ei.value.expected == "integer"
+    assert str(ei.value) == "input 'count' expects integer, got 'not-a-number'"
 
 
 # --- P6: history integrity --------------------------------------------------

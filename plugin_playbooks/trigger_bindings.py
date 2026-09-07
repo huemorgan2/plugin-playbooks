@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from luna_sdk import TriggerSourceRegistry
 
 from .models import Playbook
+from .versioning import live_version_of
 
 log = logging.getLogger("luna.playbooks.bindings")
 
@@ -89,6 +90,9 @@ class TriggerBindingService:
             )).scalars().all()
         events: set[str] = set()
         for pb in playbooks:
+            if live_version_of(pb) is None:
+                # plans/032 phase 04: candidate-only — no live triggers.
+                continue
             for trigger in (pb.definition or {}).get("triggers", []):
                 event = trigger.get("event")
                 if event:

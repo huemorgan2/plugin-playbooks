@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -58,6 +59,16 @@ async def _get(sf, name: str) -> Playbook:
         )).scalar_one()
 
 
+async def _publish_v1(sf, tools, name: str = "greeter") -> None:
+    """plans/032 phase 04: propose saves a candidate; v1 goes live only
+    through the publish gate (setup-only helper)."""
+    await green_run(sf, 1, name=name)
+    out = json.loads(await tools["playbook_publish"](
+        explanation=EXPLANATION, name=name,
+    ))
+    assert out.get("status") == "published", out
+
+
 async def _ticket(tools, name: str) -> str:
     """0.9.0: the write stage of playbook_edit needs a read-stage ticket."""
     out = parse_read_stage(await tools["playbook_edit"](name=name))
@@ -68,7 +79,7 @@ async def _ticket(tools, name: str) -> str:
 async def test_propose_with_code_stores_code_and_definition(env):
     sf, tools = env
     out = json.loads(await tools["playbook_propose"](name="greeter", code=CODE))
-    assert out["status"] == "created", out
+    assert out["status"] == "candidate_saved", out  # plans/032 phase 04
     pb = await _get(sf, "greeter")
     assert pb.code == CODE
     step = pb.definition["steps"][0]
@@ -106,7 +117,7 @@ async def test_code_cannot_rename(env):
     sf, tools = env
     code = "playbook(name='other-name')\nsay = tool('t', m='x')\n"
     out = json.loads(await tools["playbook_propose"](name="pinned", code=code))
-    assert out["status"] == "created"
+    assert out["status"] == "candidate_saved"  # plans/032 phase 04
     pb = await _get(sf, "pinned")
     assert pb.definition["name"] == "pinned"
 
@@ -145,6 +156,7 @@ async def test_edit_with_code_saves_a_candidate(env):
     # until playbook_publish.
     sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     new_code = CODE.replace("inputs.greeting", "inputs.name")
     out = json.loads(await tools["playbook_edit"](name="greeter", ticket=await _ticket(tools, "greeter"), code=new_code))
     assert out["status"] == "candidate_saved"
@@ -273,8 +285,9 @@ async def test_backfill_fills_missing_code_only(env):
 async def test_read_stage_is_framed_plain_text(env):
     """The read stage returns a JSON header line + plain-text frames with
     REAL newlines — no JSON-escaped one-liner code."""
-    _, tools = env
+    sf, tools = env
     await tools["playbook_propose"](name="greeter", code=CODE)
+    await _publish_v1(sf, tools)
     raw = await tools["playbook_edit"](name="greeter")
 
     # header is the first line, valid JSON, and carries no code
