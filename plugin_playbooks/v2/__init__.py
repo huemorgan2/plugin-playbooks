@@ -1,9 +1,12 @@
-"""v2 runtime — shared constants (plans/032 phase 01).
+"""v2 runtime — shared constants (plans/032 phase 01) and, since phase 02,
+the runtime exports (`SegmentLoop`, `JournalStore`, `MemoryJournalStore`,
+`SHIM_SOURCE`) at the bottom.
 
-Constants only, no runtime imports: `docs/v2.md` is the contract text, the
-checker (`plugin_playbooks.v2.checker`), the shim/segment loop (phase 02-03)
+The constants come first and import nothing: `docs/v2.md` is the contract
+text, the checker (`plugin_playbooks.v2.checker`), the shim/segment loop
 and the skill (phase 05) are all written from it and read these values so
-the doc and the code cannot drift.
+the doc and the code cannot drift. The runtime modules import the constants
+from this package, so they are imported LAST.
 """
 
 from __future__ import annotations
@@ -45,3 +48,15 @@ DEFAULT_TIMEOUTS = {"tool": 120, "llm": 300, "agent": 900, "subtask": None}
 # `dry`) return exactly these keys. `approval_id` is NOT one of them — that
 # name is reserved for the `parked_on` record.
 APPROVE_RESULT_KEYS = frozenset({"approved", "request_id", "reason", "decided_by"})
+
+# Runtime exports (phase 02) — after the constants, which these modules import.
+from .journal import JournalStore, MemoryJournalStore  # noqa: E402
+from .loop import SegmentLoop  # noqa: E402
+from .shim import SHIM_SOURCE  # noqa: E402
+
+__all__ = [
+    "MAX_EFFECTS", "FORMATS", "AVAILABLE_EFFECTS", "UNAVAILABLE_EFFECTS",
+    "DEFAULT_FEATURES", "CTX_EXCEPTIONS", "CTX_UNCATCHABLE", "DEFAULT_TIMEOUTS",
+    "APPROVE_RESULT_KEYS", "SegmentLoop", "JournalStore", "MemoryJournalStore",
+    "SHIM_SOURCE",
+]

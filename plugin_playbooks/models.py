@@ -174,6 +174,17 @@ class PlaybookRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # plans/032 phase 02 (docs/v2.md §7): the run-level error contract. `error`
+    # is the one-liner (`line <n>: <source> → <type>: <msg> after effect <id>`),
+    # `error_type` the exception class / host error kind, `traceback` the
+    # playbook-frame-only traceback text, `failed_at` when it landed. Written
+    # by _complete_run for v1 and v2 runs alike; read by phase 04.
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    traceback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class PlaybookStepRun(Base):

@@ -33,6 +33,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbooks", "publish_require_run", "BOOLEAN NOT NULL DEFAULT TRUE"),
     # 0.44.0 (plans/028): wake-on-completion promise flag
     ("playbook_runs", "wake_on_complete", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # plans/032 phase 02 (docs/v2.md §7): run-level error contract
+    ("playbook_runs", "error", "TEXT"),
+    ("playbook_runs", "error_type", "VARCHAR(64)"),
+    ("playbook_runs", "traceback", "TEXT"),
+    ("playbook_runs", "failed_at", "TIMESTAMP"),
 ]
 
 # Indexes whose definition changed — dropped on load so the model's current

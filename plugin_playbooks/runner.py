@@ -30,6 +30,9 @@ from luna_sdk import EventBus, PluginContext, ToolRegistry, message_source
 from .definition import OnError, PlaybookDef, StepDef, StepKind
 from .models import Playbook, PlaybookRun, PlaybookStepRun
 from .publish import ops_conversation_id as _ops_conversation_id
+from .v2 import MemoryJournalStore, SegmentLoop
+from .v2.checker import sniff_format
+from .v2.loop import V2RunError
 
 log = logging.getLogger("luna.playbooks.runner")
 
@@ -169,6 +172,51 @@ def _iter_strings(value: Any):
             yield from _iter_strings(v)
 
 
+async def resolve_vault_refs(vault: Any, args: Any, *, step_id: str) -> Any:
+    """plans/031 vault-ref resolution on a COPY of `args` (see
+    `PlaybookRunner._resolve_vault_refs`); shared with the v2 segment loop
+    (plans/032 phase 02) so both runtimes resolve refs identically."""
+    if not any(_VAULT_REF_RE.match(s) for s in _iter_strings(args)):
+        return args
+    if vault is None:
+        raise ValueError(
+            f"Step '{step_id}': arguments use a vault:<name> reference "
+            "but no vault is available to the playbook runtime."
+        )
+    cache: dict[str, str] = {}
+
+    async def resolve(value: Any) -> Any:
+        if isinstance(value, str):
+            m = _VAULT_REF_RE.match(value)
+            if not m:
+                return value
+            name = m.group(1)
+            if name not in cache:
+                try:
+                    cred = await vault.get_credential(name)
+                except KeyError:
+                    raise ValueError(
+                        f"Step '{step_id}': vault credential '{name}' not "
+                        "found. Check the name with list_credentials, or "
+                        "store it first."
+                    ) from None
+                except PermissionError as e:
+                    raise ValueError(
+                        f"Step '{step_id}': vault ref denied: {e} Grant "
+                        "plugin-playbooks read access to the credential."
+                    ) from None
+                cache[name] = cred.value
+            return cache[name]
+        if isinstance(value, Mapping):
+            return {k: await resolve(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            resolved = [await resolve(v) for v in value]
+            return tuple(resolved) if isinstance(value, tuple) else resolved
+        return value
+
+    return await resolve(args)
+
+
 def _playbook_origin_scope(playbook: Any):
     """Bind the billing origin for a playbook run and everything it derives
     (luna-service 048): root_action_type=playbook_run + a stable playbook id.
@@ -252,6 +300,11 @@ class PlaybookRunner:
         # keeps the task alive (create_task alone can be GC'd); entries pop
         # via done-callback. wait_for_run/cancel_run look tasks up here.
         self._tasks: dict[Any, asyncio.Task] = {}
+        # plans/032 phase 02: the v2 segment loop (docs/v2.md §11). The
+        # journal is in memory until phase 06 makes it durable.
+        self._v2 = SegmentLoop(
+            session_factory, tool_registry, events, context, MemoryJournalStore(),
+        )
 
     async def start_run(
         self,
@@ -343,6 +396,11 @@ class PlaybookRunner:
                     continue
                 run.status = "failed"
                 run.completed_at = now
+                # plans/032 phase 02: the row says WHY (docs/v2.md §7). A v2
+                # run is swept exactly like a v1 run until phase 06 resumes it.
+                run.error = note
+                run.error_type = "Interrupted"
+                run.failed_at = now
                 if getattr(run, "wake_on_complete", False):
                     owed_wakes.append(run.id)
                 steps = (await session.execute(
@@ -480,6 +538,14 @@ class PlaybookRunner:
             self._activity_heartbeat(activity_id, activity_label, activity_meta)
         )
         try:
+            if sniff_format(playbook.code) == "python":
+                # plans/032 phase 02: a v2 playbook runs on the segment loop
+                # under the SAME billing scope as v1's step machinery.
+                with _playbook_origin_scope(playbook):
+                    await self._v2.drive(run, playbook, inputs)
+                await self._complete_run(run.id, "done")
+                run.status = "done"
+                return
             if not definition.steps:
                 raise ValueError(
                     f"Playbook '{playbook.name}' has no steps — nothing to execute. "
@@ -489,6 +555,14 @@ class PlaybookRunner:
                 await self._execute_steps(definition.steps, context)
             await self._complete_run(run.id, "done")
             run.status = "done"
+        except V2RunError as e:
+            # docs/v2.md §7: the four run columns
+            log.info("playbook.run.v2_failed run_id=%s type=%s", run.id, e.error_type)
+            await self._complete_run(
+                run.id, "failed", error=e.error, error_type=e.error_type,
+                traceback=e.traceback, failed_at=e.failed_at,
+            )
+            run.status = "failed"
         except _PlaybookHalt as h:
             # 007.009.01: an explicit `halt` step ended the run early — success.
             log.info("playbook.run.halted run_id=%s reason=%s", run.id, h.reason)
@@ -769,46 +843,9 @@ class PlaybookRunner:
         credentials need a grant to plugin-playbooks — same rule as playbook
         code reading them any other way.
         """
-        if not any(_VAULT_REF_RE.match(s) for s in _iter_strings(args)):
-            return args
-        vault = getattr(self._ctx, "vault", None)
-        if vault is None:
-            raise ValueError(
-                f"Step '{step_id}': arguments use a vault:<name> reference "
-                "but no vault is available to the playbook runtime."
-            )
-        cache: dict[str, str] = {}
-
-        async def resolve(value: Any) -> Any:
-            if isinstance(value, str):
-                m = _VAULT_REF_RE.match(value)
-                if not m:
-                    return value
-                name = m.group(1)
-                if name not in cache:
-                    try:
-                        cred = await vault.get_credential(name)
-                    except KeyError:
-                        raise ValueError(
-                            f"Step '{step_id}': vault credential '{name}' not "
-                            "found. Check the name with list_credentials, or "
-                            "store it first."
-                        ) from None
-                    except PermissionError as e:
-                        raise ValueError(
-                            f"Step '{step_id}': vault ref denied: {e} Grant "
-                            "plugin-playbooks read access to the credential."
-                        ) from None
-                    cache[name] = cred.value
-                return cache[name]
-            if isinstance(value, Mapping):
-                return {k: await resolve(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                resolved = [await resolve(v) for v in value]
-                return tuple(resolved) if isinstance(value, tuple) else resolved
-            return value
-
-        return await resolve(args)
+        return await resolve_vault_refs(
+            getattr(self._ctx, "vault", None), args, step_id=step_id,
+        )
 
     async def _run_tool_call(self, step: StepDef, ctx: _RunContext) -> Any:
         """Execute a tool_call step — calls a registered tool by name."""
@@ -1425,12 +1462,26 @@ class PlaybookRunner:
 
     async def _complete_run(
         self, run_id: Any, status: str, error: str | None = None,
+        error_type: str | None = None, traceback: str | None = None,
+        failed_at: datetime | None = None,
     ) -> None:
         async with self._sf() as session:
             run = await session.get(PlaybookRun, run_id)
             if run:
                 run.status = status
                 run.completed_at = datetime.now(timezone.utc)
+                # plans/032 phase 02 (docs/v2.md §7): the error contract
+                # columns. v1 runs land `error` only; v2 fills all four.
+                if error is not None:
+                    run.error = error
+                if error_type is not None:
+                    run.error_type = error_type
+                if traceback is not None:
+                    run.traceback = traceback
+                if failed_at is not None:
+                    run.failed_at = failed_at
+                elif status == "failed" and run.failed_at is None:
+                    run.failed_at = run.completed_at
                 await session.commit()
 
         started_at = None

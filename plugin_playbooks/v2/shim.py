@@ -1,0 +1,449 @@
+"""In-jail shim for v2 playbooks (plans/032 phase 02; docs/v2.md §6, §7, §11).
+
+`SHIM_SOURCE` is the constant `code` argument of every `code_run` segment.
+plugin-inline-code-run wraps it as the body of `__pb_main__(inputs)`
+(managed install `json_mode.wrap`: 5-line prologue, body indented 4, epilogue
+dumps the return value to `outputs/result.json`), where `inputs` is the
+envelope the host wrote:
+
+    {playbook, version, source, hash_seed, max_effects, call_sites, journal}
+
+The shim re-execs itself under `PYTHONHASHSEED=<hash_seed>` (hash-seed pin,
+option A), silences stdout, compiles the saved source under the stable
+filename `playbook:<name>@v<N>`, replays the journal and runs `run()` until
+the first effect with no journal row, then returns ONE result:
+
+    {kind: "effect" | "return" | "error", ...}
+
+The playbook coroutine is driven directly (`coro.send`), not through an
+event loop: `asyncio` is outside the checker's import whitelist, every
+`await` inside `run()` is a ctx effect, and a plain generator step lets the
+segment stop at an effect WITHOUT unwinding the author's `try`/`finally`
+blocks (an exception-based exit would run `finally:` bodies — and any effect
+inside them — in the exiting segment).
+
+The source below is a module-level string so this file stays importable
+without executing it; `tests/test_v2_loop.py` runs it through the real jail.
+"""
+
+from __future__ import annotations
+
+SHIM_SOURCE = r'''
+import sys as _pb_sys, os as _pb_os
+# --- hash-seed pin, option A (inline-code-run-plan §3): the jail starts
+# python with -I, which ignores PYTHONHASHSEED; re-exec once without it.
+if _pb_sys.flags.isolated:
+    _pb_exe = _pb_sys.executable
+    if not _pb_exe:
+        return {"kind": "error", "error_type": "HashSeedPinFailed",
+                "message": "sys.executable is empty inside the jail: cannot re-exec "
+                           "under PYTHONHASHSEED (hash-seed option A). Option B is "
+                           "needed: plugin-inline-code-run must pass PYTHONHASHSEED "
+                           "itself (inline-code-run-plan §3).",
+                "traceback": [], "playbook_line": 0,
+                "last_completed_effect": None, "locals_preview": {}}
+    try:
+        _pb_os.execve(
+            _pb_exe,
+            [_pb_exe, "-s", "-B", "-u", "-P", _pb_os.path.abspath(_pb_sys.argv[0])],
+            dict(_pb_os.environ, PYTHONHASHSEED=str(inputs["hash_seed"])),
+        )
+    except OSError as _pb_e:
+        return {"kind": "error", "error_type": "HashSeedPinFailed",
+                "message": f"execve failed inside the jail ({_pb_e!r}): cannot re-exec "
+                           "under PYTHONHASHSEED (hash-seed option A). Option B is "
+                           "needed: plugin-inline-code-run must pass PYTHONHASHSEED "
+                           "itself (inline-code-run-plan §3).",
+                "traceback": [], "playbook_line": 0,
+                "last_completed_effect": None, "locals_preview": {}}
+    # execve never returns on success; reaching here is a failure too
+    return {"kind": "error", "error_type": "HashSeedPinFailed",
+            "message": "execve returned; the playbook was not started unseeded.",
+            "traceback": [], "playbook_line": 0,
+            "last_completed_effect": None, "locals_preview": {}}
+
+import io as _pb_io, json as _pb_json, re as _pb_re, traceback as _pb_tb
+from datetime import datetime as _pb_datetime
+
+# stdout is never an author channel (docs/v2.md §7): silence it before any
+# playbook code runs; stderr stays for shim-internal failures.
+try:
+    _pb_sys.stdout = open(_pb_os.devnull, "w")
+except OSError:
+    _pb_sys.stdout = _pb_io.StringIO()
+
+_pb_name = str(inputs["playbook"])
+_pb_version = int(inputs["version"])
+_pb_filename = f"playbook:{_pb_name}@v{_pb_version}"
+_pb_journal = list(inputs["journal"])
+_pb_max_effects = int(inputs.get("max_effects") or 200)
+_pb_call_sites = list(inputs.get("call_sites") or [])
+_pb_inputs = dict((_pb_journal[0] if _pb_journal else {}).get("inputs") or {})
+_pb_source = str(inputs["source"])
+_pb_VAULT_RE = _pb_re.compile(r"vault:[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}")
+_pb_OPTIONS = ("_id", "_timeout", "_retry")
+_pb_EFFECT_KINDS = ("tool", "llm", "agent", "subtask", "gather", "approve", "now",
+                    "random", "log")
+
+
+def _pb_progress(seq, phase):
+    try:
+        with open("outputs/progress.json", "w", encoding="utf-8") as f:
+            _pb_json.dump({"seq": seq, "phase": phase}, f)
+    except OSError:
+        pass
+
+
+_pb_progress(0, "replaying")
+
+
+# --- exception family (docs/v2.md §4) ---
+class EffectError(Exception):
+    """Base class of every catchable effect failure."""
+
+
+class ToolError(EffectError): ...
+class EffectTimeout(EffectError): ...
+class OutcomeUnknown(EffectError): ...
+class Rejected(EffectError): ...
+class ApprovalExpired(EffectError): ...
+class EventTimeout(EffectError): ...
+class SubtaskFailed(EffectError): ...
+
+
+class RunCancelled(BaseException): ...
+class JournalDivergence(BaseException): ...
+class MaxEffectsExceeded(BaseException): ...
+
+
+_pb_FAILED_CLASSES = {
+    "ToolError": ToolError, "EffectTimeout": EffectTimeout,
+    "OutcomeUnknown": OutcomeUnknown, "Rejected": Rejected,
+    "ApprovalExpired": ApprovalExpired, "EventTimeout": EventTimeout,
+    "SubtaskFailed": SubtaskFailed, "EffectError": EffectError,
+}
+
+
+class _pb_ArgsNotSerializable(Exception): ...
+
+
+class _pb_Request:
+    """What an effect awaitable yields to the driver: one pending effect."""
+
+    __slots__ = ("kind", "site", "name", "args", "options")
+
+    def __init__(self, kind, site, name, args, options):
+        self.kind, self.site, self.name, self.args, self.options = kind, site, name, args, options
+
+
+class _pb_Awaitable:
+    __slots__ = ("request",)
+
+    def __init__(self, request):
+        self.request = request
+
+    def __await__(self):
+        result = yield self.request
+        return result
+
+
+class _pb_NotWired:
+    __slots__ = ("message",)
+
+    def __init__(self, message):
+        self.message = message
+
+    def __await__(self):
+        raise EffectError(self.message)
+        yield  # noqa — makes this a generator
+
+
+_pb_sites_by_pos = {}
+_pb_sites_by_line = {}
+for _pb_s in _pb_call_sites:
+    _pb_sites_by_pos[(int(_pb_s["line"]), int(_pb_s["col"]))] = _pb_s
+    _pb_sites_by_line.setdefault(int(_pb_s["line"]), []).append(_pb_s)
+
+
+def _pb_caller_site(frame):
+    """Resolve the checker call site of the `ctx.*` call in `frame` by its
+    (line, col) — the CALL instruction's start position equals the AST
+    Call node's (lineno, col_offset) on 3.11+ (`co_positions`)."""
+    if frame.f_code.co_filename != _pb_filename:
+        raise JournalDivergence(
+            f"ctx effect called from {frame.f_code.co_filename!r}, not from the "
+            f"playbook {_pb_filename!r}: code edited under a run, or an effect "
+            "reached through a non-playbook helper"
+        )
+    line = frame.f_lineno
+    col = None
+    try:
+        positions = list(frame.f_code.co_positions())
+        pos = positions[frame.f_lasti // 2]
+        if pos and pos[0] is not None:
+            line, col = pos[0], pos[2]
+    except (AttributeError, IndexError, TypeError):
+        col = None
+    site = _pb_sites_by_pos.get((line, col)) if col is not None else None
+    if site is None:
+        same_line = _pb_sites_by_line.get(line) or []
+        if len(same_line) == 1:
+            site = same_line[0]
+    if site is None:
+        raise JournalDivergence(
+            f"no call site at line {line}, col {col} of {_pb_filename}: the source "
+            "was edited under a run (code edited under a run), or the call sites "
+            "were derived from a different version — candidate causes: set "
+            "iteration, code edited under a run, non-journaled randomness"
+        )
+    return site
+
+
+def _pb_json_norm(value):
+    return _pb_json.loads(_pb_json.dumps(value))
+
+
+class _pb_Ctx:
+    """The `ctx` object handed to `run()` (docs/v2.md §2)."""
+
+    # the exception classes are attached after the class body (a class body
+    # cannot read enclosing-function names it also assigns)
+
+    def __repr__(self):
+        return "<ctx>"
+
+    # every effect method is SYNC: it captures the caller frame at call time
+    # (so `ctx.gather(ctx.tool(...), ...)` and `await ctx.tool(...)` resolve
+    # the same site) and returns an awaitable.
+    def _effect(self, kind, frame, name, args):
+        options = {k: args.pop(k) for k in _pb_OPTIONS if k in args}
+        try:
+            args = _pb_json_norm(args)
+        except (TypeError, ValueError) as e:
+            raise _pb_ArgsNotSerializable(
+                f"ctx.{kind} arguments must be JSON-serializable: {e}"
+            ) from None
+        site = _pb_caller_site(frame)
+        return _pb_Awaitable(_pb_Request(kind, site, name, args, options))
+
+    def tool(self, name, /, **args):
+        if not isinstance(name, str):
+            raise TypeError("ctx.tool: the tool name must be a string literal")
+        return self._effect("tool", _pb_sys._getframe(1), name, args)
+
+    def now(self, **args):
+        return self._effect("now", _pb_sys._getframe(1), None, args)
+
+    def random(self, **args):
+        return self._effect("random", _pb_sys._getframe(1), None, args)
+
+    def log(self, msg, **args):
+        args["message"] = msg if isinstance(msg, str) else str(msg)
+        return self._effect("log", _pb_sys._getframe(1), None, args)
+
+    def llm(self, *a, **kw):
+        return _pb_NotWired("ctx.llm is not wired until plugin/03")
+
+    def agent(self, *a, **kw):
+        return _pb_NotWired("ctx.agent is not wired until plugin/03")
+
+    def subtask(self, *a, **kw):
+        return _pb_NotWired("ctx.subtask is not wired until plugin/03")
+
+    def gather(self, *a, **kw):
+        return _pb_NotWired("ctx.gather is not wired until plugin/03")
+
+    def approve(self, *a, **kw):
+        return _pb_NotWired("ctx.approve is not wired until plugin/03")
+
+    def wait_event(self, *a, **kw):
+        return _pb_NotWired("ctx.wait_event is not available in this version")
+
+
+for _pb_cls in (EffectError, ToolError, EffectTimeout, OutcomeUnknown, Rejected,
+                ApprovalExpired, EventTimeout, SubtaskFailed, RunCancelled,
+                JournalDivergence, MaxEffectsExceeded):
+    setattr(_pb_Ctx, _pb_cls.__name__, _pb_cls)
+_pb_ctx = _pb_Ctx()
+_pb_occurrences = {}
+_pb_last_effect = None  # {seq, id, kind} of the last journal entry consumed
+
+
+def _pb_decode_result(kind, entry):
+    result = entry.get("result")
+    if kind == "now" and isinstance(result, str):
+        return _pb_datetime.fromisoformat(result)
+    if kind == "log":
+        return None
+    return result
+
+
+_pb_source_lines = _pb_source.splitlines()
+
+
+def _pb_source_line(n):
+    if n and 1 <= n <= len(_pb_source_lines):
+        return _pb_source_lines[n - 1].strip()
+    return ""
+
+
+def _pb_mask(text):
+    return _pb_VAULT_RE.sub("vault:***", text)
+
+
+def _pb_error_payload(exc):
+    tb = exc.__traceback__
+    frames = []
+    innermost = None
+    for fs, cur in zip(_pb_tb.extract_tb(tb), _pb_iter_tb(tb)):
+        if fs.filename == _pb_filename:
+            frames.append({"line": fs.lineno, "name": fs.name,
+                           "source": _pb_source_line(fs.lineno)})
+            innermost = cur
+    playbook_line = frames[-1]["line"] if frames else 0
+    if isinstance(exc, SyntaxError) and exc.filename == _pb_filename and exc.lineno:
+        playbook_line = exc.lineno
+        frames.append({"line": exc.lineno, "name": "<module>",
+                       "source": (exc.text or "").strip()})
+    preview = {}
+    if innermost is not None:
+        for k, v in list(innermost.tb_frame.f_locals.items()):
+            if k == "ctx" or v is _pb_ctx:
+                preview[k] = "<ctx>"
+                continue
+            try:
+                r = repr(v)
+            except Exception:  # noqa: BLE001
+                r = f"<unrepr {type(v).__name__}>"
+            preview[k] = _pb_mask(r[:200])
+    message = _pb_mask(str(exc))
+    return {
+        "kind": "error",
+        "error_type": type(exc).__name__,
+        "message": message,
+        "traceback": frames,
+        "playbook_line": playbook_line,
+        "last_completed_effect": _pb_last_effect,
+        "locals_preview": preview,
+    }
+
+
+def _pb_iter_tb(tb):
+    while tb is not None:
+        yield tb
+        tb = tb.tb_next
+
+
+def _pb_serve(request, cursor):
+    """Replay `request` against journal[cursor] or exit the segment."""
+    nonlocal _pb_last_effect
+    site_id = request.site["id"]
+    occ = _pb_occurrences.get(site_id, 0) + 1
+    _pb_occurrences[site_id] = occ
+    key = f"{site_id}#{occ}"
+    seq = cursor
+    if seq < len(_pb_journal):
+        entry = _pb_journal[seq]
+        expected = (entry.get("kind"), entry.get("id"), entry.get("occurrence"),
+                    _pb_json_norm(entry.get("args")))
+        actual = (request.kind, site_id, occ, request.args)
+        if expected != actual:
+            raise JournalDivergence(
+                f"journal entry {seq} is {entry.get('kind')} "
+                f"{entry.get('id')}#{entry.get('occurrence')} args={entry.get('args')!r} "
+                f"but the code asked for {request.kind} {key} args={request.args!r} — "
+                "candidate causes: set iteration, code edited under a run, "
+                "non-journaled randomness"
+            )
+        _pb_last_effect = {"seq": seq, "id": key, "kind": request.kind}
+        status = entry.get("status")
+        if status == "done":
+            return ("value", _pb_decode_result(request.kind, entry))
+        if status == "failed":
+            err = entry.get("error") or {}
+            cls = _pb_FAILED_CLASSES.get(err.get("type"), EffectError)
+            return ("raise", cls(err.get("message") or err.get("type") or "effect failed"))
+        if status in ("in_flight", "timed_out_unknown"):
+            return ("raise", OutcomeUnknown(
+                f"the outcome of {key} is unknown (journal status {status})"))
+        return ("raise", EffectError(f"journal entry {seq} has status {status!r}"))
+    if seq > _pb_max_effects:
+        raise MaxEffectsExceeded(
+            f"effect {key} would be effect #{seq}, past the cap of "
+            f"{_pb_max_effects} effects per run (MAX_EFFECTS)"
+        )
+    _pb_progress(seq, "effect_exit")
+    return ("exit", {
+        "kind": "effect", "seq": seq, "id": key, "call_site_id": site_id,
+        "occurrence": occ, "effect_kind": request.kind, "name": request.name,
+        "args": request.args, "options": request.options,
+    })
+
+
+def _pb_main():
+    nonlocal _pb_last_effect
+    ns = {"__name__": "__playbook__", "__builtins__": __builtins__}
+    try:
+        code = compile(_pb_source, _pb_filename, "exec")
+        exec(code, ns)
+    except BaseException as e:  # noqa: BLE001 — every case is a payload
+        return _pb_error_payload(e)
+    run = ns.get("run")
+    if run is None or not callable(run):
+        return {"kind": "error", "error_type": "InvalidPlaybook",
+                "message": "the playbook defines no `async def run(ctx, inputs)`",
+                "traceback": [], "playbook_line": 0,
+                "last_completed_effect": None, "locals_preview": {}}
+    try:
+        coro = run(_pb_ctx, _pb_inputs)
+        if not hasattr(coro, "send"):
+            return {"kind": "error", "error_type": "InvalidPlaybook",
+                    "message": "`run` must be `async def run(ctx, inputs)`",
+                    "traceback": [], "playbook_line": 0,
+                    "last_completed_effect": None, "locals_preview": {}}
+        cursor = 1
+        send_value = None
+        throw_exc = None
+        replay_done = len(_pb_journal) <= 1
+        if replay_done:
+            _pb_progress(0, "compute")
+        while True:
+            try:
+                if throw_exc is not None:
+                    exc, throw_exc = throw_exc, None
+                    request = coro.throw(exc)
+                else:
+                    request = coro.send(send_value)
+            except StopIteration as stop:
+                value = stop.value
+                try:
+                    _pb_json.dumps(value)
+                except (TypeError, ValueError) as e:
+                    return {"kind": "error", "error_type": "ResultNotSerializable",
+                            "message": f"run() returned a value that is not JSON: {e}",
+                            "traceback": [], "playbook_line": 0,
+                            "last_completed_effect": _pb_last_effect,
+                            "locals_preview": {}}
+                return {"kind": "return", "value": value}
+            if not isinstance(request, _pb_Request):
+                raise JournalDivergence(
+                    f"run() awaited something that is not a ctx effect: {request!r}"
+                )
+            action, payload = _pb_serve(request, cursor)
+            cursor += 1
+            if cursor >= len(_pb_journal) and not replay_done:
+                # every journaled row is consumed: pure compute from here
+                replay_done = True
+                _pb_progress(cursor - 1, "compute")
+            if action == "value":
+                send_value = payload
+            elif action == "raise":
+                throw_exc = payload
+            else:
+                return payload
+    except BaseException as e:  # noqa: BLE001 — every case is a payload
+        return _pb_error_payload(e)
+
+
+return _pb_main()
+'''

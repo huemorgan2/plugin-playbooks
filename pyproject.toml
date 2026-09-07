@@ -13,3 +13,4 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "aiosqlite>=0.20", "greenlet>=3", "h
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["real_jail: needs the plugin-inline-code-run managed install and a usable kernel jail"]
