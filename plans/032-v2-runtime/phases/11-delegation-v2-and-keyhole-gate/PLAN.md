@@ -188,9 +188,14 @@ Tests and stamps:
     `LUNA_PLUGIN_SET_DIR`; version proof `run.json.plugin_versions["plugin-playbooks"]` == this
     stamp): delegate one edit on a throwaway python playbook;
     `GET /api/p/plugin-playbooks/playbooks/<name>/versions` shows `author: delegation:<id>` and the
-    versions tab renders "delegation <8 chars>". Proof: the row and a screenshot reference in the
-    summary. Red here (author `agent` on a delegated write) = the ContextVar did not propagate →
-    STOP, re-plan (Risks 2).
+    versions tab renders "delegation <8 chars>"; then run one existing pblang (v1) playbook end to
+    end via `playbook_run` (agent_tools.py:568 `ToolDef(name="playbook_run", ...)`) on the
+    side-loaded build and record its run id and status `done` in the summary — the master §4
+    Rollout standing regression gate ("v1 playbooks on that agent must keep working at every
+    phase"). Proof: the row, a screenshot reference and the v1 run id + status in the summary.
+    Red here (author `agent` on a delegated write) = the ContextVar did not propagate → STOP,
+    re-plan (Risks 2); a v1 run that is not `done` is also STOP (regression on the build dojop/02
+    is about to measure).
 11. Gate. Hand the build to dojop/02 (its phase file `phases/02-criteria-graders-and-keyhole-gate/PLAN.md` steps 7-9 — pre-flight, `-- --trials 2 --tags keyhole`, verdict; the repo plan "## 02" numbers the same work as steps 5-6; verdict against the per-task baseline 0056 `dryrun-is-not-a-run`; 0057 `comment-lies-in-code`, `docs-say-verified`, `docs-say-slow-queue`, `edit-not-in-run`; 0058 `note-says-broken`, `run-history-failure`, each 2/2). In the same session run `python run.py run --base <url> --ids playbooks.candidate-then-publish --trials 2` (turn 2 `must_not_call: [playbook_publish]`, turn 3 publish) as the live half of the end-to-end story (its YAML grades `must_call_any` propose/edit/publish, `must_not_call` on turn 2 and judge dims only — it does not grade a dry run or a candidate run; those steps are proven by Step 8, Risks 8). Copy dojop/02's verdict block (results folder id, trials, per-task pass^k, failing checks, `must_not_call` failures, code-graded wrong-claim count from `claim_matches_runs`) into this summary and luna-fixer M4's. STOP RULE: any miss → `VERDICT: stop`; plugin/12 does not start.
     Proof: the block exists in both summaries.
 12. Summary and revisions. Write `execution_summary.md`; revise plugin/12 (author values it will see
@@ -219,7 +224,9 @@ Tests and stamps:
   bundle rebuilt and committed.
 - `tests/test_manifest_drift.py`: 26 tools, 11 tables, three stamps agree at the new minor.
 - Integration proof (Step 10) recorded: a delegated write stamped `delegation:<id>` on the
-  `vaselin-*` build.
+  `vaselin-*` build; and one existing pblang (v1) playbook run end to end via `playbook_run` on
+  the same side-loaded build, its run id and status `done` recorded in the summary (master §4
+  Rollout standing regression gate).
 - Keyhole gate verdict (dojop/02, Step 11) recorded: 7 tasks in one run, `--trials ≥ 2`,
   pass^k ≥ 1.00, zero failed code checks, zero `must_not_call` failures, wrong-claim count
   code-graded; `candidate-then-publish` 2/2 with no publish on turn 2. Red → `VERDICT: stop`.
