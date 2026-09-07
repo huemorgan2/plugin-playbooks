@@ -27,12 +27,21 @@ class JournalStore(Protocol):
 
     async def complete(
         self, run_id: str, seq: int, result: Any, attempts: list[dict[str, Any]], ms: int,
-    ) -> None: ...
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """`extra` (phase 03) merges kind-specific fields onto the row:
+        `cost_cents` (llm/agent), `transcript` (agent), `child_run_id` (subtask)."""
+        ...
 
     async def fail(
         self, run_id: str, seq: int, error_type: str, message: str,
-        attempts: list[dict[str, Any]],
+        attempts: list[dict[str, Any]], extra: dict[str, Any] | None = None,
     ) -> None: ...
+
+    async def mark_handled(self, run_id: str, seqs: list[int]) -> None:
+        """Re-stamp `failed` rows the code caught and proceeded past as
+        `failed_handled` (phase 03; docs/v2.md §2/§6)."""
+        ...
 
     async def read(self, run_id: str) -> list[dict[str, Any]]: ...
 
@@ -106,6 +115,7 @@ class MemoryJournalStore:
 
     async def complete(
         self, run_id: str, seq: int, result: Any, attempts: list[dict[str, Any]], ms: int,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         row = self._row(run_id, seq)
         row["status"] = "done"
@@ -114,16 +124,26 @@ class MemoryJournalStore:
         row["attempts"] = copy.deepcopy(list(attempts))
         row["ended_at"] = _now_iso()
         row["ms"] = int(ms)
+        if extra:
+            row.update(copy.deepcopy(dict(extra)))
 
     async def fail(
         self, run_id: str, seq: int, error_type: str, message: str,
-        attempts: list[dict[str, Any]],
+        attempts: list[dict[str, Any]], extra: dict[str, Any] | None = None,
     ) -> None:
         row = self._row(run_id, seq)
         row["status"] = "failed"
         row["error"] = {"type": error_type, "message": message}
         row["attempts"] = copy.deepcopy(list(attempts))
         row["ended_at"] = _now_iso()
+        if extra:
+            row.update(copy.deepcopy(dict(extra)))
+
+    async def mark_handled(self, run_id: str, seqs: list[int]) -> None:
+        entries = self._runs.get(run_id) or []
+        for seq in seqs:
+            if 1 <= int(seq) < len(entries) and entries[int(seq)].get("status") == "failed":
+                entries[int(seq)]["status"] = "failed_handled"
 
     async def read(self, run_id: str) -> list[dict[str, Any]]:
         return copy.deepcopy(self._entries(run_id))

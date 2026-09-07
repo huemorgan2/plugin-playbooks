@@ -302,8 +302,11 @@ class PlaybookRunner:
         self._tasks: dict[Any, asyncio.Task] = {}
         # plans/032 phase 02: the v2 segment loop (docs/v2.md §11). The
         # journal is in memory until phase 06 makes it durable.
+        # phase 03: the same facade v1's llm/agent steps use, and the bound
+        # blocking `start_run` for `ctx.subtask` (parent/child run rows).
         self._v2 = SegmentLoop(
             session_factory, tool_registry, events, context, MemoryJournalStore(),
+            agent=agent, start_run=self.start_run,
         )
 
     async def start_run(

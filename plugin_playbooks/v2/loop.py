@@ -15,6 +15,8 @@ resolution, the step-row shapes) are imported lazily inside functions —
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import secrets
 import time
@@ -62,9 +64,14 @@ class V2RunError(Exception):
 
 
 class _EffectFailure(Exception):
-    """Host-side effect failure with the journal `error.type`."""
+    """Host-side effect failure with the journal `error.type`; `extra` are
+    kind-specific fields merged onto the failed row (e.g. `child_run_id`)."""
 
     error_type = "EffectError"
+
+    def __init__(self, message: str, extra: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.extra = extra
 
 
 class _ToolError(_EffectFailure):
@@ -75,7 +82,30 @@ class _EffectTimeout(_EffectFailure):
     error_type = "EffectTimeout"
 
 
+class _Rejected(_EffectFailure):
+    error_type = "Rejected"
+
+
+class _ApprovalExpired(_EffectFailure):
+    error_type = "ApprovalExpired"
+
+
+class _SubtaskFailed(_EffectFailure):
+    error_type = "SubtaskFailed"
+
+
 _RETRYABLE = (_ToolError, _EffectTimeout)
+
+
+@dataclass
+class _RunState:
+    """Per-run loop state (phase 03): the playbook identity `ctx.approve`
+    stamps on its card and the ancestor playbook-name chain the subtask
+    cycle guard checks (parent chain + own name)."""
+
+    name: str
+    version: int
+    chain: list[str]
 
 
 def _parse_retry(retry: Any) -> tuple[int, float]:
@@ -137,16 +167,25 @@ class SegmentLoop:
     def __init__(
         self, session_factory: Any, tools: Any, events: Any, ctx: Any,
         journal: JournalStore, *, segment_timeout: int = 60,
-        max_effects: int = MAX_EFFECTS,
+        max_effects: int = MAX_EFFECTS, agent: Any = None, start_run: Any = None,
     ) -> None:
         self._sf = session_factory
         self._tools = tools
         self._events = events
         self._ctx = ctx
+        # phase 03: the PluginAgent facade v1 uses (`run_llm`/`run_turn`) and
+        # the bound `PlaybookRunner.start_run` that `ctx.subtask` goes through.
+        self._agent = agent
+        self._start_run = start_run
         self.journal = journal
         self.segment_timeout = segment_timeout
         self.max_effects = max_effects
         self.last_result: LoopResult | None = None
+        # phase 03: `run()` return values of finished CHILD runs, keyed by run
+        # id — `start_run` hands back the row, not the value; the parent pops
+        # its child's value here (one loop per runner, so both share it).
+        self._values: dict[str, Any] = {}
+        self._runs: dict[str, _RunState] = {}
 
     # ------------------------------------------------------------ drive
     async def drive(self, run: Any, playbook: Any, inputs: dict[str, Any]) -> LoopResult:
@@ -164,7 +203,9 @@ class SegmentLoop:
             max_effects=self.max_effects,
         ))
         result = LoopResult()
-        self.last_result = result
+        parent_id = getattr(run, "parent_run_id", None)
+        parent_chain = self._runs[str(parent_id)].chain if parent_id is not None and str(parent_id) in self._runs else []
+        self._runs[run_id] = _RunState(name=name, version=version, chain=[*parent_chain, name])
         try:
             rt = self._code_run_tool()
             while True:
@@ -190,8 +231,14 @@ class SegmentLoop:
                         f"segment {n}: the shim returned no result kind", "ShimFailure",
                     )
                 kind = res["kind"]
+                handled = res.get("handled")
+                if isinstance(handled, list) and handled:
+                    # phase 03: replayed failures the code caught and proceeded past
+                    await self.journal.mark_handled(run_id, [int(s) for s in handled])
                 if kind == "return":
                     result.value = res.get("value")
+                    if parent_id is not None:
+                        self._values[run_id] = result.value
                     return result
                 if kind == "error":
                     raise self._run_error(res, source, filename)
@@ -205,6 +252,10 @@ class SegmentLoop:
                     f"segment {n}: unknown result kind {kind!r}", "ShimFailure",
                 )
         finally:
+            # the most recently FINISHED drive: a subtask's child finishes
+            # before its parent, so the parent's result is what stays here
+            self.last_result = result
+            self._runs.pop(run_id, None)
             await self.journal.drop(run_id)
 
     # ------------------------------------------------------------ segments
@@ -280,10 +331,15 @@ class SegmentLoop:
         is completed/failed before the next segment."""
         effects = list(res.get("effects") or [])
         prepared = [await self._journal_and_start(run, eff) for eff in effects]
-        await asyncio.gather(
+        # phase 03: every element settles (each journals its own outcome);
+        # the first host-side exception, in argument order, is raised after.
+        settled = await asyncio.gather(
             *(self._execute_and_finish(run, eff, seq, step_run_id) for eff, seq, step_run_id in prepared),
-            return_exceptions=False,
+            return_exceptions=True,
         )
+        for outcome in settled:
+            if isinstance(outcome, BaseException):
+                raise outcome
 
     async def _effect(self, run: Any, eff: dict[str, Any]) -> None:
         eff, seq, step_run_id = await self._journal_and_start(run, eff)
@@ -307,10 +363,18 @@ class SegmentLoop:
                 "code edited under a run, or non-journaled randomness",
                 "JournalDivergence",
             )
-        step_run_id = await self._create_step(run.id, key, kind)
-        await self._events.emit("playbook.step.started", {
-            "run_id": run_id, "step_id": key, "step_kind": kind,
-        })
+        try:
+            step_run_id = await self._create_step(run.id, key, kind)
+            await self._events.emit("playbook.step.started", {
+                "run_id": run_id, "step_id": key, "step_kind": kind,
+            })
+        except asyncio.CancelledError:
+            # a cancel landing between the journal row and the effect body
+            # (phase 03: a subtask deadline cancelling its child) must not
+            # leave the row `in_flight`
+            with contextlib.suppress(Exception):
+                await self.journal.fail(run_id, seq, "RunCancelled", "run cancelled", [])
+            raise
         return eff, seq, step_run_id
 
     @staticmethod
@@ -341,8 +405,8 @@ class SegmentLoop:
                 n += 1
                 t_a = time.monotonic()
                 try:
-                    journal_result, outputs = await self._perform(
-                        run, kind, key, eff.get("name"), args, options,
+                    journal_result, outputs, fields = await self._perform(
+                        run, seq, kind, key, eff.get("name"), args, options,
                     )
                 except _EffectFailure as e:
                     attempts.append({
@@ -356,7 +420,7 @@ class SegmentLoop:
                         if wait > 0:
                             await asyncio.sleep(wait)
                         continue
-                    await self.journal.fail(run_id, seq, e.error_type, str(e), attempts)
+                    await self.journal.fail(run_id, seq, e.error_type, str(e), attempts, extra=e.extra)
                     await self._complete_step(step_run_id, "failed", error=f"{e.error_type}: {e}", inputs=args)
                     await self._events.emit("playbook.step.failed", {
                         "run_id": run_id, "step_id": key, "error": f"{e.error_type}: {e}",
@@ -366,7 +430,7 @@ class SegmentLoop:
                 attempts.append({"n": n, "error": None, "ms": int((time.monotonic() - t_a) * 1000)})
                 break
             ms = int((time.monotonic() - t_row) * 1000)
-            await self.journal.complete(run_id, seq, journal_result, attempts, ms)
+            await self.journal.complete(run_id, seq, journal_result, attempts, ms, extra=fields)
             await self._complete_step(step_run_id, "done", outputs=outputs, inputs=args)
             await self._events.emit("playbook.step.completed", {
                 "run_id": run_id, "step_id": key, "outputs": outputs,
@@ -384,24 +448,316 @@ class SegmentLoop:
             _active_run_id.reset(token)
 
     async def _perform(
-        self, run: Any, kind: str, key: str, name: str | None, args: dict[str, Any],
+        self, run: Any, seq: int, kind: str, key: str, name: str | None, args: dict[str, Any],
         options: dict[str, Any],
-    ) -> tuple[Any, Any]:
-        """Execute one effect attempt → (journal result, step-row outputs)."""
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        """Execute one effect attempt → (journal result, step-row outputs,
+        extra journal fields or None)."""
         if kind == "tool":
-            return await self._perform_tool(run, key, str(name), args, options)
+            result, outputs = await self._perform_tool(run, key, str(name), args, options)
+            return result, outputs, None
+        if kind == "llm":
+            return await self._effect_llm(run, key, args, options)
+        if kind == "agent":
+            return await self._effect_agent(run, key, args, options)
+        if kind == "subtask":
+            return await self._effect_subtask(run, key, str(name), args, options)
+        if kind == "approve":
+            return await self._effect_approve(run, seq, key, args, options)
         if kind == "now":
             iso = _now().isoformat()
-            return iso, {"now": iso}
+            return iso, {"now": iso}, None
         if kind == "random":
             value = SystemRandom().random()
-            return value, {"random": value}
+            return value, {"random": value}, None
         if kind == "log":
             msg = args.get("message")
             out = {"message": msg if isinstance(msg, str) else str(msg)}
             log.info("playbook.v2.log run_id=%s %s", run.id, out["message"])
-            return out, out
-        raise _EffectFailure(f"effect kind {kind!r} is not wired until plugin/03")
+            return out, out, None
+        raise _EffectFailure(f"effect kind {kind!r} is not available in this version")
+
+    # ------------------------------------------------------------ llm / agent
+    @staticmethod
+    def _timeout_for(kind: str, options: dict[str, Any]) -> float | None:
+        timeout = options.get("_timeout")
+        if timeout is None:
+            timeout = DEFAULT_TIMEOUTS.get(kind)
+        return None if timeout is None else float(timeout)
+
+    @staticmethod
+    async def _bounded(coro: Any, timeout: float | None, key: str, label: str) -> Any:
+        """`asyncio.wait_for` with the phase 02 `EffectTimeout` message; the
+        inner task is cancelled on expiry."""
+        if timeout is None:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout)
+        except asyncio.TimeoutError:
+            raise _EffectTimeout(
+                f"effect '{key}' ({label}) timed out after {timeout:g}s"
+            ) from None
+
+    @staticmethod
+    def _shape_answer(result: Any, output: Any) -> Any:
+        """Return rule (docs/v2.md §2): `output=` given → dict (a non-dict
+        answer is `{"_raw": result}`, v1's rule); else `str`."""
+        if output is not None:
+            return result if isinstance(result, dict) else {"_raw": result}
+        if isinstance(result, str):
+            return result
+        if isinstance(result, (dict, list)):
+            return json.dumps(result, default=str)
+        return "" if result is None else str(result)
+
+    @staticmethod
+    def _cost_fields(usage: Any) -> dict[str, Any]:
+        """`_record_step_cost`'s rule: cost only when `usage` carries a truthy
+        `cost_cents`; the target is the journal row, not a step row."""
+        cost = getattr(usage, "cost_cents", None) if usage else None
+        return {"cost_cents": cost} if cost else {}
+
+    def _require_agent(self, kind: str) -> Any:
+        if self._agent is None:
+            raise _EffectFailure(
+                f"ctx.{kind} requires an injected agent (ctx.agent) but none was "
+                "provided to the PlaybookRunner."
+            )
+        return self._agent
+
+    async def _effect_llm(
+        self, run: Any, key: str, args: dict[str, Any], options: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        agent = self._require_agent("llm")
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise _EffectFailure(f"effect '{key}': ctx.llm requires a prompt string")
+        output = args.get("output")
+        try:
+            result, usage = await self._bounded(
+                agent.run_llm(
+                    prompt, purpose=args.get("purpose") or "summarization",
+                    model=args.get("model"), system=args.get("system"),
+                    output_schema=output,
+                ),
+                self._timeout_for("llm", options), key, "llm",
+            )
+        except (_EffectFailure, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001 — a raising facade fails the effect
+            raise _EffectFailure(f"{type(e).__name__}: {e}" if str(e) else type(e).__name__) from e
+        value = self._shape_answer(result, output)
+        return value, {"llm": {"prompt": prompt[:2000]}, "result": value}, self._cost_fields(usage) or None
+
+    async def _effect_agent(
+        self, run: Any, key: str, args: dict[str, Any], options: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        from ..delegation import _TranscriptFeed
+
+        agent = self._require_agent("agent")
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise _EffectFailure(f"effect '{key}': ctx.agent requires a prompt string")
+        output = args.get("output")
+        feed = _TranscriptFeed()
+        try:
+            result, usage = await self._bounded(
+                agent.run_turn(
+                    prompt, output_schema=output, tools=args.get("tools"),
+                    memory_write=False, conversation_id=getattr(run, "report_to", None),
+                    event_stream_handler=feed.handle,
+                ),
+                self._timeout_for("agent", options), key, "agent",
+            )
+        except _EffectFailure as e:
+            e.extra = {"transcript": list(feed.events), **(e.extra or {})}
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise _EffectFailure(
+                f"{type(e).__name__}: {e}" if str(e) else type(e).__name__,
+                extra={"transcript": list(feed.events)},
+            ) from e
+        if isinstance(result, dict) and result.get("_aborted"):
+            # the facade gave up (turn limit / timeout): fail loud, never a value
+            raise _EffectFailure(
+                str(result.get("error") or f"turn aborted ({result['_aborted']})"),
+                extra={"transcript": list(feed.events)},
+            )
+        value = self._shape_answer(result, output)
+        fields = {"transcript": list(feed.events), **self._cost_fields(usage)}
+        return value, {"agent": {"prompt": prompt[:2000]}, "result": value}, fields
+
+    # ------------------------------------------------------------ subtask
+    async def _effect_subtask(
+        self, run: Any, key: str, name: str, args: dict[str, Any], options: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        from sqlalchemy import select
+
+        from ..models import Playbook
+        from .checker import sniff_format
+
+        if self._start_run is None:
+            raise _EffectFailure(
+                f"effect '{key}': ctx.subtask requires a run starter (start_run) but none "
+                "was provided to the segment loop."
+            )
+        async with self._sf() as session:
+            target = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+        if target is None:
+            raise _EffectFailure(f"Subtask playbook '{name}' not found")
+        if sniff_format(target.code) != "python":
+            raise _EffectFailure(f"subtask target '{name}' is not a v2 playbook")
+        state = self._runs.get(str(run.id))
+        chain = list(state.chain) if state else []
+        if name in chain:
+            raise _EffectFailure(
+                f"subtask '{name}' would recurse: it is already running in this "
+                f"chain ({' -> '.join([*chain, name])}). A playbook cannot start "
+                "itself or one of its ancestors."
+            )
+        inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
+        returns = args.get("returns")
+        timeout = self._timeout_for("subtask", options)
+        task = asyncio.create_task(
+            self._start_run(
+                target, inputs=dict(inputs), trigger=f"subtask:{run.id}",
+                parent_run_id=run.id, is_test=bool(getattr(run, "is_test", False)),
+            ),
+            name=f"playbook-subtask-{run.id}-{key}",
+        )
+        timed_out = False
+        child = None
+        try:
+            if timeout is None:
+                child = await task
+            else:
+                done, _ = await asyncio.wait({task}, timeout=timeout)
+                if not done:
+                    # the host owns the deadline: `_drive_run` swallows the
+                    # cancel and returns the row `cancelled`, so the flag —
+                    # never the child's status — decides (Risks 12)
+                    timed_out = True
+                    task.cancel()
+                child = await task
+        except asyncio.CancelledError:
+            # the parent was cancelled (or the cancelled child raised out of
+            # `_create_run`): never leave the child task running
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    child = await task
+            if not timed_out:
+                raise
+        extra = {"child_run_id": str(child.id)} if child is not None else None
+        value = self._values.pop(str(child.id), None) if child is not None else None
+        if timed_out:
+            raise _EffectTimeout(
+                f"effect '{key}' (subtask {name}) timed out after {timeout:g}s", extra=extra,
+            )
+        if child is None:
+            raise _SubtaskFailed(f"subtask '{name}' did not produce a run", extra=extra)
+        status = getattr(child, "status", None)
+        if status != "done":
+            detail = getattr(child, "error", None) or status or "unknown"
+            raise _SubtaskFailed(
+                f"subtask '{name}' (run {child.id}) {status}: {detail}", extra=extra,
+            )
+        if isinstance(returns, list):
+            if not isinstance(value, dict):
+                raise _SubtaskFailed(
+                    f"subtask '{name}' (run {child.id}): returns={returns!r} needs a dict "
+                    f"return value, got {type(value).__name__}", extra=extra,
+                )
+            missing = [k for k in returns if k not in value]
+            if missing:
+                raise _SubtaskFailed(
+                    f"subtask '{name}' (run {child.id}): return value has no key(s) "
+                    f"{missing}", extra=extra,
+                )
+            value = {k: value[k] for k in returns}
+        return value, {"subtask": name, "run_id": str(child.id), "result": value}, extra
+
+    # ------------------------------------------------------------ approve
+    async def _effect_approve(
+        self, run: Any, seq: int, key: str, args: dict[str, Any], options: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        approvals = getattr(self._ctx, "approval", None)
+        if approvals is None:
+            raise _EffectFailure(
+                f"effect '{key}': ctx.approve requires an approval engine (ctx.approval) "
+                "but none was provided."
+            )
+        state = self._runs.get(str(run.id))
+        name = state.name if state else ""
+        version = state.version if state else 0
+        show = args.get("show")
+        shown = show if isinstance(show, str) else json.dumps(show, indent=2, default=str)
+        headline = f"Playbook '{name}' is asking for your approval"
+        presentation = {
+            "eyebrow": "Playbook approval",
+            "headline": headline[:90],
+            "explanation": (
+                f"Run `{run.id}` of playbook `{name}` (version {version}) paused at "
+                f"effect #{seq} (`{key}`) until you decide. Approving lets the run "
+                "continue; rejecting raises `ctx.Rejected` inside the playbook."
+            ),
+            "changes": [{"label": "What the playbook shows", "kind": "text", "text": shown}],
+        }
+        summary = f"{headline}: {shown.splitlines()[0][:200] if shown else key}"
+        timeout = options.get("_timeout")
+        request_kw = {
+            "kind": "playbook_effect",
+            "summary": summary,
+            "payload": {"run_id": str(run.id), "seq": int(seq), "playbook": name, "version": version},
+            "requested_by_plugin": "plugin-playbooks",
+            "risk_level": "medium",
+            "conversation_id": getattr(run, "report_to", None),
+            "presentation": presentation,
+            "ttl_seconds": int(timeout) if timeout else None,
+        }
+        try:
+            decision = await approvals.request(**request_kw)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a failing engine fails the effect (closed)
+            raise _EffectFailure(f"approval request failed: {type(e).__name__}: {e}") from e
+        request_id = getattr(decision, "request_id", None)
+        rid = str(request_id) if request_id is not None else None
+        reason = getattr(decision, "reason", None)
+        decided_by = getattr(decision, "decided_by", None)
+        if getattr(decision, "decision", None) == "approved":
+            result = {"approved": True, "request_id": rid, "reason": reason, "decided_by": decided_by}
+            return result, {"approve": result}, None
+        expired = await self._approval_expired(approvals, request_id, reason, decided_by)
+        if expired:
+            raise _ApprovalExpired(
+                f"approval {rid or key} expired before a decision (ttl elapsed)"
+            )
+        raise _Rejected(
+            f"approval {rid or key} rejected" + (f": {reason}" if reason else "")
+        )
+
+    @staticmethod
+    async def _approval_expired(approvals: Any, request_id: Any, reason: Any, decided_by: Any) -> bool:
+        """`approvals.get(request_id).status == "expired"` first; when `get` is
+        absent (or knows no row) the TTL sweeper's stamp — reason "ttl elapsed"
+        by "system" — is the fallback."""
+        get = getattr(approvals, "get", None)
+        if callable(get) and request_id is not None:
+            try:
+                req = get(request_id)
+                if asyncio.iscoroutine(req):
+                    req = await req
+            except Exception:  # noqa: BLE001 — a failing lookup takes the fallback
+                req = None
+            status = getattr(req, "status", None) if req is not None else None
+            if status is not None:
+                return status == "expired"
+        return reason == "ttl elapsed" and decided_by == "system"
 
     async def _perform_tool(
         self, run: Any, key: str, name: str, args: dict[str, Any], options: dict[str, Any],

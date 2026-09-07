@@ -13,7 +13,10 @@ option A), silences stdout, compiles the saved source under the stable
 filename `playbook:<name>@v<N>`, replays the journal and runs `run()` until
 the first effect with no journal row, then returns ONE result:
 
-    {kind: "effect" | "return" | "error", ...}
+    {kind: "effect" | "gather" | "return" | "error", ..., handled: [seq, ...]}
+
+`handled` (phase 03) lists the replayed failures the code caught and
+proceeded past; the host re-stamps those rows `failed_handled`.
 
 The playbook coroutine is driven directly (`coro.send`), not through an
 event loop: `asyncio` is outside the checker's import whitelist, every
@@ -147,6 +150,28 @@ class _pb_Awaitable:
         return result
 
 
+class _pb_GatherRequest:
+    """What `ctx.gather(...)` yields: the pending requests in argument order."""
+
+    __slots__ = ("requests",)
+
+    def __init__(self, requests):
+        self.requests = requests
+
+
+class _pb_GatherAwaitable:
+    __slots__ = ("requests",)
+
+    def __init__(self, requests):
+        self.requests = requests
+
+    def __await__(self):
+        if not self.requests:
+            return []
+        results = yield _pb_GatherRequest(self.requests)
+        return results
+
+
 class _pb_NotWired:
     __slots__ = ("message",)
 
@@ -241,20 +266,45 @@ class _pb_Ctx:
         args["message"] = msg if isinstance(msg, str) else str(msg)
         return self._effect("log", _pb_sys._getframe(1), None, args)
 
-    def llm(self, *a, **kw):
-        return _pb_NotWired("ctx.llm is not wired until plugin/03")
+    # phase 03: the four awaited kinds. Every argument is journaled (JSON),
+    # `output=` is v1's schema dict; the host executes with v1 parity.
+    def llm(self, prompt, *, output=None, purpose=None, model=None, system=None, **options):
+        if not isinstance(prompt, str):
+            raise TypeError("ctx.llm: the prompt must be a string")
+        args = {"prompt": prompt, "output": output, "purpose": purpose,
+                "model": model, "system": system}
+        args.update(options)
+        return self._effect("llm", _pb_sys._getframe(1), None, args)
 
-    def agent(self, *a, **kw):
-        return _pb_NotWired("ctx.agent is not wired until plugin/03")
+    def agent(self, prompt, *, output=None, tools=None, **options):
+        if not isinstance(prompt, str):
+            raise TypeError("ctx.agent: the prompt must be a string")
+        args = {"prompt": prompt, "output": output, "tools": tools}
+        args.update(options)
+        return self._effect("agent", _pb_sys._getframe(1), None, args)
 
-    def subtask(self, *a, **kw):
-        return _pb_NotWired("ctx.subtask is not wired until plugin/03")
+    def subtask(self, playbook, inputs=None, *, returns=None, **options):
+        if not isinstance(playbook, str):
+            raise TypeError("ctx.subtask: the playbook name must be a string literal")
+        args = {"inputs": dict(inputs or {}), "returns": returns}
+        args.update(options)
+        return self._effect("subtask", _pb_sys._getframe(1), playbook, args)
 
-    def gather(self, *a, **kw):
-        return _pb_NotWired("ctx.gather is not wired until plugin/03")
+    def approve(self, *, show, **options):
+        args = {"show": show}
+        args.update(options)
+        return self._effect("approve", _pb_sys._getframe(1), None, args)
 
-    def approve(self, *a, **kw):
-        return _pb_NotWired("ctx.approve is not wired until plugin/03")
+    def gather(self, *handles):
+        requests = []
+        for h in handles:
+            if not isinstance(h, _pb_Awaitable):
+                raise TypeError(
+                    "ctx.gather takes un-awaited ctx effect calls only, got "
+                    f"{type(h).__name__}"
+                )
+            requests.append(h.request)
+        return _pb_GatherAwaitable(requests)
 
     def wait_event(self, *a, **kw):
         return _pb_NotWired("ctx.wait_event is not available in this version")
@@ -267,6 +317,9 @@ for _pb_cls in (EffectError, ToolError, EffectTimeout, OutcomeUnknown, Rejected,
 _pb_ctx = _pb_Ctx()
 _pb_occurrences = {}
 _pb_last_effect = None  # {seq, id, kind} of the last journal entry consumed
+# phase 03 `failed_handled`: seqs of replayed failures the code proceeded past
+# (the next effect was awaited or `run()` returned) — reported on every exit.
+_pb_handled = []
 
 
 def _pb_decode_result(kind, entry):
@@ -325,6 +378,7 @@ def _pb_error_payload(exc):
         "playbook_line": playbook_line,
         "last_completed_effect": _pb_last_effect,
         "locals_preview": preview,
+        "handled": list(_pb_handled),
     }
 
 
@@ -359,7 +413,7 @@ def _pb_serve(request, cursor):
         status = entry.get("status")
         if status == "done":
             return ("value", _pb_decode_result(request.kind, entry))
-        if status == "failed":
+        if status in ("failed", "failed_handled"):
             err = entry.get("error") or {}
             cls = _pb_FAILED_CLASSES.get(err.get("type"), EffectError)
             return ("raise", cls(err.get("message") or err.get("type") or "effect failed"))
@@ -404,6 +458,7 @@ def _pb_main():
         cursor = 1
         send_value = None
         throw_exc = None
+        thrown_seqs = []  # failures thrown into run() that are not yet known handled
         replay_done = len(_pb_journal) <= 1
         if replay_done:
             _pb_progress(0, "compute")
@@ -415,6 +470,9 @@ def _pb_main():
                 else:
                     request = coro.send(send_value)
             except StopIteration as stop:
+                # run() returned past every thrown failure: all handled
+                _pb_handled.extend(thrown_seqs)
+                thrown_seqs = []
                 value = stop.value
                 try:
                     _pb_json.dumps(value)
@@ -423,13 +481,37 @@ def _pb_main():
                             "message": f"run() returned a value that is not JSON: {e}",
                             "traceback": [], "playbook_line": 0,
                             "last_completed_effect": _pb_last_effect,
-                            "locals_preview": {}}
-                return {"kind": "return", "value": value}
+                            "locals_preview": {}, "handled": list(_pb_handled)}
+                return {"kind": "return", "value": value, "handled": list(_pb_handled)}
+            # the code proceeded to its next effect: every thrown failure was caught
+            _pb_handled.extend(thrown_seqs)
+            thrown_seqs = []
+            if isinstance(request, _pb_GatherRequest):
+                served = []
+                for req in request.requests:
+                    served.append((cursor, _pb_serve(req, cursor)))
+                    cursor += 1
+                if cursor >= len(_pb_journal) and not replay_done:
+                    replay_done = True
+                    _pb_progress(cursor - 1, "compute")
+                exits = [payload for _, (action, payload) in served if action == "exit"]
+                if exits:
+                    return {"kind": "gather", "seq": exits[0]["seq"], "effects": exits,
+                            "handled": list(_pb_handled)}
+                raises = [(seq, payload) for seq, (action, payload) in served if action == "raise"]
+                if raises:
+                    # every element settled; the lowest-seq failure is raised
+                    thrown_seqs = [seq for seq, _ in raises]
+                    throw_exc = raises[0][1]
+                else:
+                    send_value = [payload for _, (_, payload) in served]
+                continue
             if not isinstance(request, _pb_Request):
                 raise JournalDivergence(
                     f"run() awaited something that is not a ctx effect: {request!r}"
                 )
             action, payload = _pb_serve(request, cursor)
+            served_seq = cursor
             cursor += 1
             if cursor >= len(_pb_journal) and not replay_done:
                 # every journaled row is consumed: pure compute from here
@@ -439,7 +521,9 @@ def _pb_main():
                 send_value = payload
             elif action == "raise":
                 throw_exc = payload
+                thrown_seqs = [served_seq]
             else:
+                payload["handled"] = list(_pb_handled)
                 return payload
     except BaseException as e:  # noqa: BLE001 — every case is a payload
         return _pb_error_payload(e)

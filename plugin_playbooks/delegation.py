@@ -440,21 +440,24 @@ def _result_ok(content: Any) -> bool:
     return True
 
 
-class _EventFeed:
-    """Maps the pydantic-ai event stream to card events, throttled to the DB.
+class _TranscriptFeed:
+    """Maps the pydantic-ai event stream to transcript events (pure mapping,
+    no DB). plans/032 phase 03 extracted it from `_EventFeed` so the v2
+    `ctx.agent` effect can attach the same transcript to its journal row.
 
     Duck-typed on event attribute shapes (no pydantic_ai import — the plugin
     ships SDK-only). Tool timing keys on tool_call_id.
     """
 
-    def __init__(self, session_factory, delegation_id: uuid.UUID) -> None:
-        self._sf = session_factory
-        self._id = delegation_id
+    def __init__(self) -> None:
         self.events: list[dict] = []
         self.steps_used = 0
         self._t0: dict[str, float] = {}
-        self._last_flush = 0.0
         self._dirty = False
+
+    async def maybe_flush(self, force: bool = False) -> None:
+        """No persistence in the base feed; `_EventFeed` throttles to the DB."""
+        return None
 
     def _append(self, kind: str, label: str, detail: str = "",
                 phase: str | None = None, ms: int | None = None,
@@ -528,6 +531,16 @@ class _EventFeed:
             text = getattr(part, "content", None)
             if isinstance(text, str) and text.strip() and not tool_name:
                 self._append("thought", text.strip().splitlines()[0])
+
+
+class _EventFeed(_TranscriptFeed):
+    """The delegation card feed: `_TranscriptFeed` throttled to the DB."""
+
+    def __init__(self, session_factory, delegation_id: uuid.UUID) -> None:
+        super().__init__()
+        self._sf = session_factory
+        self._id = delegation_id
+        self._last_flush = 0.0
 
     async def maybe_flush(self, force: bool = False) -> None:
         loop = asyncio.get_running_loop()
