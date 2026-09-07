@@ -1,5 +1,5 @@
 # 032 — Phase 00: Specs (Tests tab) removal
-Status: pending
+Status: done
 Master: §2 Specs removal (owner decision 2026-09-07), §3 P1 Step 0, §4 Rollout (branch rules), §6 Test summary (the 7 red repro tests); checklist `luna-fixer plans/2026-09-06-fix-playbooks/specs-removal.md` (authoritative hook list; its "Order of operations" 1-6 and "DB migration"); master phase M0 (`luna-fixer plans/2026-09-06-fix-playbooks/phases/M0-specs-removal/PLAN.md`)
 Repo / branch: plugin-playbooks v2-runtime (code HEAD 8c31a60 at writing, plus the plan-only commit 5306f7f on top; origin/main 749f126, version 0.46.0)
 Depends on: — (P0 plans are master prerequisites, not phase inputs; no phase in any repo precedes this one)

@@ -87,7 +87,7 @@ specs (Tests tab) feature goes first, on the owner's decision of 2026-09-07
 | 05-dry-run-skill-and-go-no-go | Dry run on the same loop, the v2 skill, the bench go/no-go | M1 | 03, 04 | `tests/test_v2_dry_run.py` (once-iterating DryStub, `unreached_call_sites`, `DryStubError` text, per-occurrence stubs, `simulated` / `simulated_nothing_exercised`, no run rows, loud intake on the dry path); `tests/test_v2_skill.py` (size bound, both examples compile + dry-run, THE LOOP honesty rules verbatim); go/no-go verdict from dojop/01 recorded with the results folder id; STOP RULE applied |
 | 06-durable-journal-and-resume | Durable journal tables, write-ahead in_flight rows, resume on on_server_ready, OutcomeUnknown | M2 | 02, 05 (STOP RULE passed) | `tests/test_v2_resume.py`: kill mid-run → restart → resume with the same journal prefix (headline); kill between in_flight write and result write → tool NOT re-executed, row `timed_out_unknown`, segment gets `ctx.OutcomeUnknown`; gather + subtask across restart; v1 runs still swept, v2 running rows not; manifest tables 11 |
 | 07-parked-runs | Parked runs: ctx.approve park form, real ctx.wait_event, max_duration, cancel | M2 | 06, luna/02 | `tests/test_v2_parked.py`: approval decided while the server was down → resume on `on_server_ready`; reject / expiry exceptions catchable; wait_event fires across a restart, times out with `ctx.EventTimeout`, rejected by the checker without `timeout=`; cancel releases card + subscription; `max_duration` fails the park loudly; `playbook.run.parked` emitted; `playbook_status` says "parked on approval #N — nothing to poll" |
-| 08-lifecycle-integration-and-parity | Lifecycle integration and v1/v2 parity | M3 | 05, 07 | Full suite green; `tests/test_v2_parity.py` (wake, fix proposals, failure digest, trust badges, test_run gate identical for a v2 run; completed payload = 13 keys + `result`); live_version-writer invariant test red on a fixture adding a writer; `stubs_from_run` dry run reaches the corrected line and lists unreached sites; per-run card for `agent_must_confirm` (v2 parks at effect 0, v1 awaits in the task), result never names `playbook_set_autonomy`, gate text names a parked candidate run, test-run cards labelled |
+| 08-lifecycle-integration-and-parity | Lifecycle integration and v1/v2 parity | M3 | 05, 07 | Full suite green; `tests/test_v2_parity.py` (wake, fix proposals, failure digest, trust badges, test_run gate identical for a v2 run; completed payload = the HEAD key set (12 at 8c31a60, runner.py:1474-1490) + any keys phases 02-07 added + `result`); live_version-writer invariant test red on a fixture adding a writer; `stubs_from_run` dry run reaches the corrected line and lists unreached sites; per-run card for `agent_must_confirm` (v2 parks at effect 0, v1 awaits in the task), result never names `playbook_set_autonomy`, gate text names a parked candidate run, test-run cards labelled |
 | 09-provenance-and-overview | Result provenance envelope and playbook_overview | M4 | 07, 08, luna/03 | `tests/test_v2_provenance.py` (envelope first in key order on all five tools; dry run status `simulated`); `tests/test_v2_overview.py` (fresh / candidate-only / parked fixtures, caps + `more: N`, next hints); `test_manifest_drift` green with 26 tools; existing suite green |
 | 10-canvas | Canvas: server-side graph endpoint, compute/error_boundary nodes, run-trace overlay | M4 | 04, 06, 08 | `tests/test_v2_graph.py` snapshots (node ids stable under a non-call-site edit; a failed run's trace lands on the failing call-site node with the error); route test (version selection, 404); `npm test` green incl. the new node kinds, v1 canvas tests unchanged; owner visual check on a vaselin-* agent recorded |
 | 11-delegation-v2-and-keyhole-gate | Delegation v2 prompt, candidate-conflict guard, author stamping, end-to-end script, keyhole gate | M4 | 04, 08, dojop/02 | `tests/test_v2_delegation.py` (conflict guard names the author; author stamp on the row + versions UI; 11 sections unchanged, `test_delegate_prompt` green); end-to-end script green (no validate after a green write; publish gated by a card); keyhole verdict from dojop/02 recorded; existing suite green |
@@ -237,7 +237,7 @@ in the summary of the phase that meets it.
 2. Phase layout is `phases/NN-<slug>/PLAN.md` + `execution_summary.md`, not
    the repo skill's `phase-N-<slug>/PHASE.md`; the skill's per-phase push +
    publish step is suspended by the no-auto-ship rule.
-3. Versions: phase 00 proposes 0.47.0 (manifest counts, UI change); later
+3. Versions: phase 00 stamped 0.47.0 at 18b9ebe (manifest counts, UI change); later
    phases bump per the rule above; the ship version is fixed at M6.
 4. Repro-test flips: a runtime pin counts as flipped when the identical
    assertion passes against v2; the v1-shaped original stays red until the
@@ -245,8 +245,10 @@ in the summary of the phase that meets it.
    pins seed `playbook_propose` → live v1 + candidate v2; plugin/04's
    propose = candidate changes that fixture, so plugin/04 adjusts their
    setup (publish v1 through the gate first) without weakening assertions.
-5. The uncommitted `uv.lock` change is not part of any phase; it is
-   reconciled before phase 00's single commit.
+5. The uncommitted `uv.lock` change is not part of any phase; it was NOT
+   reconciled before phase 00's commit (standing rule: left as ` M uv.lock`,
+   never staged) and stays that way until the owner decides; after 0.47.0 its
+   root version is stale again.
 6. Real-jail tests skip (not fail) without the managed install; phase 02
    documents the harness.
 7. The dojoP `*-v2` twin tasks do not exist at f51915d; dojop/01 creates

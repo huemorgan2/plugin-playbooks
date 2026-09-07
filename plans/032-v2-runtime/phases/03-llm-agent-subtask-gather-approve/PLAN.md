@@ -1,7 +1,7 @@
 # 032 — Phase 03: Effects: ctx.llm, ctx.agent, ctx.subtask, ctx.gather, ctx.approve (in-process form)
 Status: pending
 Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §2 Language (effect contracts, `Rejected`/`ApprovalExpired`, `failed_handled` + its hoisting exclusion), §2 Execution model, §2 Effect execution semantics, §2 Sub-agents, §2 Lifecycle (`result` column), §3 P1; master phase M1
-Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
+Repo / branch: luna-plugins/plugins/plugin-playbooks, branch `v2-runtime` (HEAD 8c31a60 at writing; origin/main 749f126; version 0.46.0 — 0.47.0 since phase 00's 18b9ebe). Read-only reference: luna branch `fix-playbooks` @ f05bdf2 (approval engine, agent facade). Commits stay local on `v2-runtime`; nothing is pushed or published.
 Depends on: plugin/01 (checker admits `ctx.llm/agent/subtask/gather/approve`, rejects `ctx.wait_event` and `ctx.sleep`), plugin/02 (host segment loop in `v2/loop.py`, in-memory `JournalStore` in `v2/journal.py`, shim exit/replay in `v2/shim.py`, `ctx.tool`, the `ctx.EffectError` family)
 Unblocks: plugin/04, plugin/05 (dry stubs for these kinds), plugin/07 (park form of `ctx.approve`), plugin/08 (persisted subtask `result`, `failed_handled` hoisting exclusion)
 
@@ -106,6 +106,32 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
   `_nested_run_refusal` wording ("would recurse") and names the chain,
   before any child row is written. The static `detect_subtask_cycles`
   (definition.py:240, validation.py:255-263) does not apply to v2 code.
+- `_timeout` enforcement for the three new awaited kinds (master §2
+  Language: "`_timeout` is ENFORCED for all effect kinds"; §3 P1 exit
+  tests: "`_timeout` enforced per effect"). Phase 02 wraps only the `tool`
+  handler in `asyncio.wait_for` and tests only a tool
+  (`test_effect_timeout_enforced`), so this phase extends the rule:
+  `_effect_llm` and `_effect_agent` run the facade call under
+  `asyncio.wait_for(…, timeout=_timeout or DEFAULT_TIMEOUTS[kind])`
+  (plugin/01 `plugin_playbooks.v2.DEFAULT_TIMEOUTS`: llm 300, agent 900,
+  subtask None = unbounded until plugin/07's `max_duration`);
+  `asyncio.TimeoutError` → entry `failed` with `error_type ==
+  "EffectTimeout"` (the shim raises `ctx.EffectTimeout` on replay, phase
+  02's failed-entry rule), the inner facade task cancelled.
+  `_effect_subtask` enforces `_timeout` only when the author gives one
+  (default None): the awaited `start_run` runs in its own task under the
+  same deadline; on expiry the host cancels that task, which reaches
+  `_drive_run`'s `except asyncio.CancelledError` (runner.py:504-510) and
+  marks the child row `cancelled` — that handler SWALLOWS the
+  cancellation, so the cancelled `start_run` returns its row normally and
+  `asyncio.wait_for` alone would not raise (see Risks 12); the host
+  therefore records its own deadline-expired flag before cancelling and
+  raises `EffectTimeout` from it, never from the child's status. No
+  `cancel_run` call: blocking `start_run` registers nothing in
+  `PlaybookRunner._tasks` (only `start_run_background` does,
+  runner.py:279-300), so `cancel_run` (:614-631) would only take the DB
+  fallback. `ctx.approve` is the exception: its `_timeout` maps to
+  `ttl_seconds` (below, Risks 2), not to a host-side `wait_for`.
 - `ctx.gather(*handles)`. Shim: each `ctx.<effect>(...)` call returns an
   un-awaited effect handle; `gather` assigns `seq` to the handles in
   argument order, replays every seq present in the journal, and exits
@@ -213,23 +239,27 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
    `_effect_subtask`, `_effect_approve` registered in the dispatch table;
    `_playbook_origin_scope` around llm/agent/subtask execution;
    `_active_run_id` set/reset around every effect (verify phase 02 did it
-   for `ctx.tool`; keep one place); cost and transcript on the entry.
-   Done when: exit tests 1-5 pass.
+   for `ctx.tool`; keep one place); cost and transcript on the entry;
+   `asyncio.wait_for(…, _timeout or DEFAULT_TIMEOUTS[kind])` around the
+   llm and agent facade calls. Done when: exit tests 1-5 pass and the
+   `llm`/`agent` cases of exit test 17 pass.
 5. Gather batch executor: multi-element pending exits run through
    `asyncio.gather(return_exceptions=True)`, one task each, each entry
    journaled on settlement. Done when: exit tests 6-7 pass.
 6. Subtask: `start_run=` injected into `SegmentLoop`, child run through
    `start_run` → `_create_run` → `_drive_run`'s v2 branch (awaited
    in-process), the per-run value dict, ancestor chain + cycle guard,
-   child failure → `EffectError`. Done when: exit tests 8-11 pass and
-   `active_run_id()` inside the parent's next effect equals the parent
-   id (proves `_drive_run`'s set/reset at runner.py:478/:535 covers the
-   nested call).
+   child failure → `EffectError`; `_timeout` (when given) as a host-side
+   deadline over the `start_run` task with the deadline-expired flag
+   (Scope, Risks 12). Done when: exit tests 8-11 pass, the `subtask` case
+   of exit test 17 passes, and `active_run_id()` inside the parent's next
+   effect equals the parent id (proves `_drive_run`'s set/reset at
+   runner.py:478/:535 covers the nested call).
 7. Approve: request construction, blocking await, decision mapping,
    expiry detection (`get` first, reason/decided_by fallback). Done when:
    exit tests 12-14 pass.
 8. `failed_handled` re-stamp from the `handled` list. Done when: exit
-   tests 7, 10, 13 and 15 show the status.
+   tests 7, 10, 13, 15 and the catchable variant of 17 show the status.
 9. `send_chat_message` rule in the `tool` handler (phase 02's plan does
    not carry it; if its summary shows it was added anyway, step 9 only
    pins it). Done when: exit test 16 passes.
@@ -237,9 +267,10 @@ as `self._agent`, injected at `__init__.py:751` `agent=ctx.agent`) and
     lists its exceptions and journal fields, and the doc states that a
     caught effect failure is journaled `failed_handled`.
 11. Full suite from the repo root: `pytest -q` (asyncio_mode=auto,
-    pyproject.toml:13-14). Done when: the 403 pre-existing tests are
-    green, `tests/test_v2_effects.py` is green, and the red repro pins
-    are exactly those listed under Exit tests.
+    pyproject.toml:13-14). Done when: every pre-existing test that
+    plugin/02's summary records as green is still green,
+    `tests/test_v2_effects.py` is green, and the red repro pins are
+    exactly those listed under Exit tests.
 12. Commit on `v2-runtime` locally (no push). Write
     `execution_summary.md` in this folder per the template below,
     including "no version bump — batched into the next manifest/UI bump"
@@ -367,11 +398,32 @@ Tests and assertions:
     `args` carry it; run with `report_to=None`, `is_test=False` → effect
     `failed`, error contains "this run has no chat to report to", run
     `failed`.
+17. `test_effect_timeout_enforced_for_llm_agent_subtask` (extends phase
+    02's tool-only `test_effect_timeout_enforced` to the three kinds;
+    master §3 P1 "`_timeout` enforced per effect"), parametrized over
+    `llm`, `agent`, `subtask`, each with a gated fake and `_timeout=1`:
+    `llm` — a local `_Agent` subclass whose `run_llm` awaits an
+    `asyncio.Event` that is never set; `agent` — `FakeAgent(gate=
+    asyncio.Event())` never set; `subtask` — a child playbook whose code
+    awaits `ctx.tool("slow")` on the gated tool, gate never set. Code
+    `await ctx.<kind>(...)` with `_timeout=1`; `wait_for_run(timeout=2.5)`
+    → run `failed`, the entry `failed` with `error_type ==
+    "EffectTimeout"`, `run.error` contains "timed out"; for `subtask` the
+    child row is `cancelled` (runner.py:504-510) and the parent entry
+    still carries `child_run_id`. Catchable variant, same three kinds:
+    code `except ctx.EffectTimeout: return "late"` → run `done`, return
+    value `"late"`, entry `failed_handled`. The fake's gate is released
+    in teardown so no task outlives the test.
 
-Existing suite: `pytest -q` from the repo root — the 403 pre-existing
-tests stay green; `tests/test_manifest_drift.py` green with the three
-stamps unchanged at 0.46.0 (pyproject.toml:3, luna-plugin.toml:2,
-`plugin_playbooks/__init__.py:624`).
+Existing suite: `pytest -q` from the repo root — every pre-existing test
+plugin/02's summary records as green stays green (plugin/00 removed
+`tests/test_specs.py` and `tests/test_versioned_specs.py` and added
+`tests/test_no_spec_feature.py`, so the 8c31a60 figures 403/410 no
+longer apply — phase 00's summary records 378 green + 7 red = 385);
+`tests/test_manifest_drift.py::test_version_stamps_agree`
+green with the three stamps unchanged from plugin/02's summary (0.47.0
+if plugin/01-02 did not bump further; pyproject.toml:3, luna-plugin.toml:2,
+`plugin_playbooks/__init__.py:616` at 18b9ebe).
 
 Repro tests: this phase flips
 `test_repro_fixplaybooks_runtime.py::test_wait_for_approval_actually_gates`
@@ -384,8 +436,10 @@ other six pins (`interrupted_run_survives_restart` → plugin/06,
 `wait_for_event_actually_waits` → plugin/07,
 `tool_step_timeout_is_enforced` → plugin/02 (v2 twin only, original
 stays red), and the three lifecycle pins → P0 plans) are unchanged by
-this phase: 7 red before, 7 red after (410 collected = 403 green + 7 red
-at HEAD, `pytest --collect-only -q`).
+this phase: 7 red before, 7 red after (the collected total is the count
+plugin/02's summary records plus this phase's 17 tests; the 8c31a60
+figure of 410 = 403 green + 7 red predates plugin/00's test deletions
+and additions — see Existing suite above).
 
 ## Cross-repo checks
 
@@ -470,17 +524,36 @@ at HEAD, `pytest --collect-only -q`).
 11. Cost lands on the journal entry, not on a `PlaybookStepRun` row (v2
     writes none); `_record_step_cost`'s extraction rule is copied, its
     UPDATE target is not. Cost totals surfaced in results are plugin/08+.
+12. Subtask `_timeout` and the swallowed cancel: `_drive_run` catches
+    `asyncio.CancelledError` and returns normally after marking the run
+    `cancelled` (runner.py:504-510, plans/009 behaviour). Under
+    `asyncio.wait_for` (3.11 `_cancel_and_wait` + `fut.result()`; 3.12
+    `timeouts.timeout`, which converts only a propagating
+    `CancelledError`) a child that swallows the cancel makes `wait_for`
+    return the row instead of raising `TimeoutError`, so the host cannot
+    rely on the exception. Assumption: the host owns the deadline (set a
+    `timed_out` flag, cancel the child task, await it, then raise
+    `EffectTimeout` if the flag is set); the child row reads `cancelled`,
+    never `failed`. Exit test 17's `subtask` case pins this. The facade
+    fakes (`run_llm`/`run_turn`) do not swallow cancellation, so the plain
+    `wait_for` rule holds for llm/agent; a real facade that swallowed it
+    would need the same flag — check `agent_facade.py` at execution.
+    `DEFAULT_TIMEOUTS["subtask"]` is None (plugin/01), so without an
+    explicit `_timeout` a subtask is unbounded until plugin/07's
+    `max_duration`.
 
 ## Execution summary
 
 Written to `execution_summary.md` in this folder after the phase runs
 (never created empty up front), using this template:
 - Ran: (commands, dates, HEAD before/after; the `pytest -q` totals)
-- Results: (every exit test 1-16 with its outcome; the 7 red repro pins
-  confirmed unchanged; anything red and why)
+- Results: (every exit test 1-17 with its outcome; the 7 red repro pins
+  confirmed unchanged; the three version stamps and the green/red/collected
+  totals as recorded; anything red and why)
 - Deviations from this plan: (what changed and why — phase 02 name
-  reconciliation from step 1, the Risks 2-7 assumptions confirmed or
-  corrected, "no version bump — batched into the next manifest/UI bump")
+  reconciliation from step 1, the Risks 2-7 and 12 assumptions confirmed
+  or corrected, "no version bump — batched into the next manifest/UI
+  bump")
 - Learned: (facts that change later phases — the approve request shape
   plugin/07 must keep, the entry fields plugin/06 must persist)
 - Revised: (which later phase files were edited because of this, and how)
