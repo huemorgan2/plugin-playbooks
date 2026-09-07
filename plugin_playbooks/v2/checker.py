@@ -18,7 +18,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from plugin_playbooks.v2 import (
+# Relative imports only: luna's loader imports image-set/managed plugins under a
+# synthetic module name (`luna_plugin_plugin_playbooks`), so the name
+# `plugin_playbooks` does not exist at runtime. tests/test_loader_style_import.py
+# pins this.
+from . import (
     AVAILABLE_EFFECTS,
     CTX_EXCEPTIONS,
     CTX_UNCATCHABLE,
@@ -28,7 +32,7 @@ from plugin_playbooks.v2 import (
     MAX_EFFECTS,
     UNAVAILABLE_EFFECTS,
 )
-from plugin_playbooks.validation import _DEEP_COLLECTION_REF, _prompt_markers
+from ..validation import _DEEP_COLLECTION_REF, _prompt_markers
 
 # --------------------------------------------------------------------------- shapes
 

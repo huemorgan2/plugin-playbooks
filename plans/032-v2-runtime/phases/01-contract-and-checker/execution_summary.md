@@ -130,3 +130,19 @@ Status: done (independent verifier green, 0 fix rounds)
   Risks 13's `tool#1#1` collision marked void under the phase 01 rule.
 - Phase files 07 and 10 (also named in Step 8) are outside this docs pass's scope (02-05); their `fetch#1` /
   `step-x#2` expectations still need the phase 01 id rule applied when they are next revised.
+
+## Post-verification fix-up (2026-09-08, found by dojop/01 part B)
+
+The first bench smoke on 0.49.0 was void: luna's loader (`luna/plugins/loader.py::_import_module`) imports
+image-set/managed plugins under the synthetic name `luna_plugin_plugin_playbooks`, so the absolute
+`from plugin_playbooks.v2 import …` / `from plugin_playbooks.validation import …` lines added by 0f61ba6 in
+`plugin_playbooks/v2/checker.py` raised `ModuleNotFoundError` at `on_load` and luna fell back to the managed
+0.46.0 copy (`plugins.winner_load_failed … No module named 'plugin_playbooks'`). Invisible to this repo's pytest
+because the package is importable as `plugin_playbooks` from the repo root.
+
+Fix: relative imports in `v2/checker.py`; new guard `tests/test_loader_style_import.py` — loads the package in
+a subprocess under the synthetic name with the real name blocked and imports every submodule (red on the old
+checker: agent_tools, runner, triggers, v2.checker all failed; green after), plus a static twin that rejects any
+`from plugin_playbooks` / `import plugin_playbooks` line. Also confirmed through luna's real `_import_module` in
+luna's venv (`loaded as luna_plugin_plugin_playbooks`, `.agent_tools`, `.v2.checker`, `.runner`, `.triggers` ok).
+Version stays 0.49.0 (nothing published yet).
