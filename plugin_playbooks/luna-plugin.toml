@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.51.0"
+version = "0.52.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -55,13 +55,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_run"
-description = "Execute the LIVE version of a playbook for real; inputs are typed at intake and a compute failure is reported as one readable line."
+description = "Execute the LIVE version of a playbook for real; inputs are typed at intake, a done run carries `result`; an agent_must_confirm playbook parks on a per-run owner card (status 'parked'), manual_only is refused."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_status"
-description = "Get the full step/effect trace of a playbook run, with error, error_type, traceback and failed_at."
+description = "Get the full step/effect trace of a playbook run (running/parked/done/failed/timed_out_unknown), its `result`, and error, error_type, traceback and failed_at; a failed run's hint names playbook_dry_run(stubs_from_run=)."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -85,7 +85,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_set_autonomy"
-description = "Change per-playbook run/publish autonomy and publish gates (owner approval)."
+description = "Change per-playbook run autonomy PERMANENTLY (agent_must_confirm = a per-run owner card on every playbook_run) and the test-run publish gate (owner approval)."
 policy = "prompt_always"
 risk_level = "medium"
 
@@ -121,7 +121,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_runs"
-description = "List a playbook's runs with full failure output (error, error_type, failed_at); filter by version/status."
+description = "List a playbook's runs with `format`, `result` and full failure output (error, error_type, failed_at); filter by version/status (incl. parked, timed_out_unknown)."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -139,13 +139,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_dry_run"
-description = "Simulate a playbook run with every effect stubbed (scriptable via stubs) — no side effects; python playbooks dry-run on the segment loop, pblang on the step graph."
+description = "Simulate a playbook run with every effect stubbed (scriptable via stubs, per occurrence `id#n`; stubs_from_run=<run_id> replays a recorded run's real results) — no side effects, never run evidence; python playbooks dry-run on the segment loop, pblang on the step graph."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_edit"
-description = "Edit a playbook's candidate version in its stored format (read-stage ticket flow; a rejected write keeps the ticket)."
+description = "Edit a playbook's candidate version (read-stage ticket flow; a rejected write keeps the ticket); an edit may change the format — the candidate row carries it, live keeps its own until publish."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -169,7 +169,7 @@ risk_level = "medium"
 
 [[tools]]
 name = "playbook_run_candidate"
-description = "Test-run the candidate version for real (owner approval); inputs typed at intake, failures reported as one readable line."
+description = "Test-run the candidate version for real (owner approval); inputs typed at intake, a done run carries `result`, failures reported as one readable line."
 policy = "prompt_always"
 risk_level = "medium"
 
