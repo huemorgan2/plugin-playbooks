@@ -65,6 +65,10 @@ report a dry-run value as a real result.
 (asks the owner). Runs execute in the background: on 'running', poll
 `playbook_status(run_id)` until 'done'/'failed'; never re-run a 'running'
 playbook or invent results.
+When you report a run, quote its `kind` and `version` from the result —
+'real run of v3', 'candidate test run of v4', 'dry run of v4 — simulated,
+no side effects'. A dry run is never 'a run'. `playbook_overview(name)` is
+the truth surface — read it before describing a playbook's state.
 4. PUBLISH: `playbook_publish(name)` — gates: static check, a green
 candidate run since the last edit, tool probes. `playbook_rollback` restores
 the previous live version.

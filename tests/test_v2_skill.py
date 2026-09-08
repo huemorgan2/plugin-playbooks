@@ -129,3 +129,20 @@ async def run(ctx, inputs):
     r = check(code, name="failure-path", version=1)
     assert r.ok, [i.to_dict() for i in r.issues]
     assert not [i for i in r.issues if i.severity == "error"], [i.to_dict() for i in r.issues]
+
+
+# plans/032 phase 09 — the provenance rule (master §2 "Result provenance").
+def test_provenance_rule_in_both_skills():
+    v2, v1 = _norm(V2_SKILL_BODY), _norm(_AUTHORING_SKILL_BODY)
+    for phrase in (
+        "A dry run is never 'a run'.",
+        "`playbook_overview(name)` is the truth surface — read it before describing a playbook's state.",
+        "'real run of v3', 'candidate test run of v4', 'dry run of v4 — simulated",
+    ):
+        assert _norm(phrase) in v2, phrase
+        assert _norm(phrase) in v1, phrase
+    # the overview is NOT skill-gated (luna SkillDef: listed tools must be
+    # skill_gated) — it stays out of every SkillDef.tools list
+    for s in PlaybooksPlugin.manifest.skills:
+        assert "playbook_overview" not in s.tools, s.name
+    assert "playbook_overview" not in PlaybooksPlugin.AUTHORING_TOOLS

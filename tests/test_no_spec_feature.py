@@ -356,7 +356,8 @@ async def test_dry_run_tool_scripts_stubs_by_step_id_and_tool_name(env):
         name="greeter", inputs='{"greeting": "hi"}',
         stubs=json.dumps({"say": {"echo": "by-step"}}),
     ))
-    assert out["status"] == "done", out
+    # plans/032 phase 09: a dry run reports `simulated` at the tool boundary
+    assert out["status"] == "simulated", out
     assert out["references"]["say"]["stubbed"] is True
     assert out["references"]["say"]["result"] == {"echo": "by-step"}
 
@@ -365,7 +366,7 @@ async def test_dry_run_tool_scripts_stubs_by_step_id_and_tool_name(env):
         name="greeter", inputs={"greeting": "hi"},
         stubs={"send_chat_message": {"echo": "by-tool"}},
     ))
-    assert out["status"] == "done", out
+    assert out["status"] == "simulated", out
     assert out["references"]["say"]["result"] == {"echo": "by-tool"}
 
     # step id wins over tool name

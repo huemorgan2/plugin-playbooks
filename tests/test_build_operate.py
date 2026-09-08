@@ -360,6 +360,8 @@ def test_mode_declarations():
         # plans/022 P4: coding-agent-grade reads are mode-free
         "playbook_versions", "playbook_version_read",
         "playbook_version_diff", "playbook_runs",
+        # plans/032 phase 09: the truth surface is a read, mode-free
+        "playbook_overview",
     }
     # everything else (draft authoring, runs, autonomy, acks) is
     # building-only by default — absent while the owner is planning.

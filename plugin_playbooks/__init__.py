@@ -309,6 +309,10 @@ label — `steps.<id>.output.<field>` does not exist.
 4. RUN: `playbook_run(name, inputs)` for real. Runs execute in the
 background: on 'running', poll `playbook_status(run_id)` until
 'done'/'failed'; never re-run a 'running' playbook or invent results.
+Report a run by its `kind` and `version` — 'real run of v3', 'candidate
+test run of v4', 'dry run of v4 — simulated'. A dry run is never 'a run'.
+`playbook_overview(name)` is the truth surface — read it before describing
+a playbook's state.
 5. INSPECT: `playbook_status(run_id)` — each step's resolved inputs +
 outputs (your stack trace). Fix and repeat.
 
@@ -720,7 +724,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.52.0",
+        version="0.53.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

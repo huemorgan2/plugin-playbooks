@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.52.0"
+version = "0.53.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -33,7 +33,7 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 """
 
 [requires]
-tools = 25
+tools = 26
 tables = 11
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
@@ -55,13 +55,13 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_run"
-description = "Execute the LIVE version of a playbook for real; inputs are typed at intake, a done run carries `result`; an agent_must_confirm playbook parks on a per-run owner card (status 'parked'), manual_only is refused."
+description = "Execute the LIVE version of a playbook for real; inputs are typed at intake, a done run carries `result`; an agent_must_confirm playbook parks on a per-run owner card (status 'parked'), manual_only is refused. The result opens with kind / side_effects / version / version_role / run_id — quote kind and version when reporting it."
 policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
 name = "playbook_status"
-description = "Get the full step/effect trace of a playbook run (running/parked/done/failed/timed_out_unknown), its `result`, and error, error_type, traceback and failed_at; a failed run's hint names playbook_dry_run(stubs_from_run=)."
+description = "Get the full step/effect trace of a playbook run (running/parked/done/failed/timed_out_unknown), its `result`, and error, error_type, traceback and failed_at; a failed run's hint names playbook_dry_run(stubs_from_run=). The result opens with kind / side_effects / version / version_role / run_id — quote kind and version when reporting it."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -108,6 +108,12 @@ policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
+name = "playbook_overview"
+description = "The truth surface for one playbook (read-only, derived): which version playbook_run executes and why, the candidate and its last test run, real runs of the live version, parked runs, pending owner approvals, autonomy, newest versions, and `next`."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
 name = "playbook_version_read"
 description = "Full read of any stored version: code, manifest, recent runs."
 policy = "auto_approve"
@@ -121,7 +127,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_runs"
-description = "List a playbook's runs with `format`, `result` and full failure output (error, error_type, failed_at); filter by version/status (incl. parked, timed_out_unknown)."
+description = "List a playbook's runs with `format`, `result` and full failure output (error, error_type, failed_at); filter by version/status (incl. parked, timed_out_unknown). Each entry opens with kind / side_effects / version / version_role / run_id."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -139,7 +145,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_dry_run"
-description = "Simulate a playbook run with every effect stubbed (scriptable via stubs, per occurrence `id#n`; stubs_from_run=<run_id> replays a recorded run's real results) — no side effects, never run evidence; python playbooks dry-run on the segment loop, pblang on the step graph."
+description = "Simulate a playbook run with every effect stubbed (scriptable via stubs, per occurrence `id#n`; stubs_from_run=<run_id> replays a recorded run's real results) — no side effects, never run evidence; python playbooks dry-run on the segment loop, pblang on the step graph. The result opens with kind 'dry_run' / side_effects false / version / version_role / run_id null and says status 'simulated', never 'done'."
 policy = "auto_approve"
 risk_level = "low"
 
@@ -169,7 +175,7 @@ risk_level = "medium"
 
 [[tools]]
 name = "playbook_run_candidate"
-description = "Test-run the candidate version for real (owner approval); inputs typed at intake, a done run carries `result`, failures reported as one readable line."
+description = "Test-run the candidate version for real (owner approval); inputs typed at intake, a done run carries `result`, failures reported as one readable line. The result opens with kind 'candidate_test_run' / side_effects / version / version_role / run_id — quote kind and version when reporting it."
 policy = "prompt_always"
 risk_level = "medium"
 

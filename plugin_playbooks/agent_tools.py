@@ -35,6 +35,10 @@ from .models import (
 )
 from .pblang import PlaybookCompileError, compile_playbook, generate_code
 from .probes import preflight_note, run_preflight
+from .provenance import envelope as _envelope
+from .provenance import overview_hint as _overview_hint
+from .provenance import row_envelope as _row_envelope
+from .provenance import with_envelope as _with_envelope
 from .publish import (
     announce_publish,
     ops_conversation_id,
@@ -713,6 +717,14 @@ def build_tools(
             "publish_required": True,
             "validated": True,
             "warnings": warnings,
+            # plans/032 phase 09: the pointer — this write was validated,
+            # so the next step is a test, never another check.
+            "next": (
+                f"Candidate v{candidate_version} saved and validated. Test it "
+                "with playbook_run_candidate (playbook_dry_run simulates it "
+                f"first), then playbook_publish(name='{name}') to make it "
+                f"live. {_overview_hint(name)}"
+            ),
         })
 
     tools.append((
@@ -890,6 +902,13 @@ def build_tools(
                 "status": "rejected", "error": str(e),
                 "input": e.input, "expected": e.expected,
             })
+        # plans/032 phase 09: the envelope — a real run of the LIVE content;
+        # `version` is the row's stamp (runner: live_version or version).
+        env = _envelope(
+            "real_run", side_effects=True,
+            version=getattr(run, "playbook_version", None),
+            version_role="live", run_id=str(run.id),
+        )
         if needs_card and run.status == "parked":
             # the run outlives this call by definition — the wake delivers
             # the outcome (master "nothing to poll"); stamped regardless of
@@ -900,7 +919,7 @@ def build_tools(
                 if row is not None:
                     row.wake_on_complete = True
                     await session.commit()
-            return json.dumps({
+            return json.dumps(_with_envelope(env, {
                 "run_id": str(run.id),
                 "playbook": name,
                 "status": "parked",
@@ -909,7 +928,8 @@ def build_tools(
                     f"run {run.id} waiting on owner card #{approval_id} — "
                     "tell the user; nothing to poll"
                 ),
-            })
+                "next": _overview_hint(name),
+            }))
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
 
@@ -941,7 +961,9 @@ def build_tools(
         }
         if status == "parked":
             result["parked_on"] = parked_on
-            result["message"] = _parked_message(parked_on, wake_promised)
+            result["message"] = (
+                f"{_parked_message(parked_on, wake_promised)} {_overview_hint(name)}"
+            )
         if playbook.candidate_version:
             result["note"] = (
                 "This ran the LIVE version "
@@ -958,7 +980,7 @@ def build_tools(
                 "will be WOKEN with the result when it finishes — do NOT "
                 "poll playbook_status, do NOT re-run the playbook, and do "
                 "NOT report results yet. Finish anything else and end your "
-                "turn; a follow-up turn delivers the outcome."
+                f"turn; a follow-up turn delivers the outcome. {_overview_hint(name)}"
             )
         elif status == "running":
             result["message"] = (
@@ -966,7 +988,7 @@ def build_tools(
                 f"normal for runs longer than {int(wait_seconds)}s). Poll "
                 "playbook_status(run_id) to see step-by-step progress and "
                 "final outputs. Do NOT re-run the playbook, and do NOT report "
-                "results until playbook_status shows status 'done'."
+                f"results until playbook_status shows status 'done'. {_overview_hint(name)}"
             )
         elif status == "failed":
             # plans/032 phase 04 (docs/v2.md §7): the run's one-liner is
@@ -1007,7 +1029,8 @@ def build_tools(
                         "reporting results to the user."
                     )
 
-        return json.dumps(result)
+        result["next"] = _overview_hint(name)
+        return json.dumps(_with_envelope(env, result))
 
     tools.append((
         ToolDef(
@@ -1029,7 +1052,9 @@ def build_tools(
                 "results. An 'agent_must_confirm' playbook raises a per-run "
                 "owner card: the result says status 'parked' with the card "
                 "id — tell the user, nothing to poll, never re-run it. A "
-                "'manual_only' playbook is refused."
+                "'manual_only' playbook is refused. The result opens with "
+                "kind / side_effects / version / version_role / run_id — "
+                "quote kind and version when you report it."
             ),
             parameters={
                 "type": "object",
@@ -1078,8 +1103,16 @@ def build_tools(
             step_errors = [
                 s.error for s, st in zip(steps, shown) if st == "failed" and s.error
             ]
+            # plans/032 phase 09: one select, hoisted — the `playbook` key
+            # and every `next` hint name the playbook; the envelope is
+            # derived from the ROW (is_test / trigger), never from the
+            # playbook's current pointers.
+            playbook = await session.get(Playbook, run.playbook_id)
+            pb_name = playbook.name if playbook is not None else None
+            env = _row_envelope(run)
             payload: dict = {
                 "run_id": run_id,
+                "playbook": pb_name,
                 "status": run.status,
                 "trigger": run.trigger,
                 "started_at": run.started_at.isoformat() if run.started_at else None,
@@ -1110,25 +1143,23 @@ def build_tools(
                 payload["traceback"] = (
                     "\n".join(tb.splitlines()[-20:]) if tb else None
                 )
+            overview = _overview_hint(pb_name or "?")
             if run.status == "parked":
                 # plans/032 phase 07 (docs/v2.md §11): no task, nothing to
                 # poll — the service resumes it on the decision / event.
                 payload["parked_on"] = getattr(run, "parked_on", None)
-                payload["hint"] = _parked_hint(payload["parked_on"])
+                payload["hint"] = f"{_parked_hint(payload['parked_on'])} {overview}"
             elif run.status == "running":
                 payload["hint"] = (
                     "Still running — poll playbook_status again in a bit. "
-                    "Completed steps above already show their outputs."
+                    f"Completed steps above already show their outputs. {overview}"
                 )
             elif run.status == "failed":
                 # 012 phase 4: a failed run still recorded the REAL outputs
                 # of every step that ran — steer the agent to reuse them as
                 # dry-run stubs before it starts fixing from memory.
                 # plans/032 phase 08: `stubs_from_run` replays them directly.
-                pb_name = None
-                playbook = await session.get(Playbook, run.playbook_id)
-                if playbook is not None:
-                    pb_name = playbook.name
+                # plans/032 phase 09: the overview pointer comes AFTER it.
                 payload["hint"] = (
                     "Failed — but every step that ran recorded its real "
                     "output above. Reuse those shapes as `stubs` in "
@@ -1137,7 +1168,7 @@ def build_tools(
                     f"playbook_dry_run(name='{pb_name or '?'}', "
                     f"version='candidate', stubs_from_run='{run_id}') "
                     "replays this run's recorded effect results against the "
-                    "candidate, per occurrence."
+                    f"candidate, per occurrence. {overview}"
                 )
             elif run.status == "timed_out_unknown":
                 # plans/032 phase 06/08 (docs/v2.md §6): the outcome of an
@@ -1147,9 +1178,12 @@ def build_tools(
                     "Outcome unknown — an effect was in flight when the "
                     "process died and its result was never recorded. Do NOT "
                     "assume it did or did not happen; check the target "
-                    "system before re-running."
+                    f"system before re-running. {overview}"
                 )
-            return json.dumps(payload)
+            if run.status not in ("running", "parked"):
+                # terminal (done / failed / cancelled / timed_out_unknown)
+                payload["next"] = overview
+            return json.dumps(_with_envelope(env, payload))
 
     tools.append((
         ToolDef(
@@ -1162,7 +1196,9 @@ def build_tools(
                 "step-by-step trace with each step's outputs and errors. "
                 "Poll this after playbook_run returns status 'running'. A "
                 "'parked' run (waiting on an owner approval or an event) has "
-                "nothing to poll — it resumes by itself."
+                "nothing to poll — it resumes by itself. The result opens "
+                "with kind / side_effects / version / version_role / run_id "
+                "— quote kind and version when you report it."
             ),
             parameters={
                 "type": "object",
@@ -1398,6 +1434,7 @@ def build_tools(
             result["note"] = (
                 f"{result['note']} {publish_note}" if result.get("note") else publish_note
             )
+        result["next"] = _overview_hint(name)
         return json.dumps(result)
 
     tools.append((
@@ -1713,6 +1750,235 @@ def build_tools(
         _versions,
     ))
 
+    # --- playbook_overview (plans/032 phase 09: the truth surface) ---
+    _OVERVIEW_CAP = 10
+
+    def _req_field(req: Any, key: str, default: Any = None) -> Any:
+        """Read a field off an ApprovalRequest (model or dict)."""
+        if isinstance(req, dict):
+            return req.get(key, default)
+        return getattr(req, key, default)
+
+    async def _overview(*, name: str) -> str:
+        async with session_factory() as session:
+            playbook = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if not playbook:
+                return json.dumps({"error": f"Playbook '{name}' not found"})
+            live_n = _live_version_of(playbook)
+            cand_n = playbook.candidate_version
+            autonomy = playbook.agent_autonomy
+
+            # what playbook_run would execute, and why / why not
+            if live_n is None:
+                executes = {
+                    "version": None,
+                    "reason": (
+                        "no live version — candidate-only; playbook_run "
+                        "refuses, use playbook_run_candidate"
+                    ),
+                }
+            elif autonomy == AgentAutonomy.MANUAL_ONLY.value:
+                executes = {
+                    "version": live_n,
+                    "reason": f"live version {live_n} — manual_only, playbook_run refuses",
+                }
+            elif autonomy == AgentAutonomy.AGENT_MUST_CONFIRM.value:
+                executes = {
+                    "version": live_n,
+                    "reason": (
+                        f"live version {live_n} — runs after the owner "
+                        "approves the per-run card"
+                    ),
+                }
+            else:
+                executes = {"version": live_n, "reason": f"live version {live_n}"}
+
+            # the candidate, with its newest test run
+            candidate: dict[str, Any] | None = None
+            if cand_n:
+                row = await _get_version_row(session, playbook, cand_n)
+                last_test = (await session.execute(
+                    select(PlaybookRun)
+                    .where(
+                        PlaybookRun.playbook_id == playbook.id,
+                        PlaybookRun.playbook_version == cand_n,
+                        (PlaybookRun.is_test.is_(True))
+                        | (PlaybookRun.trigger == "agent-candidate"),
+                    )
+                    .order_by(PlaybookRun.started_at.desc())
+                    .limit(1)
+                )).scalars().first()
+                saved_at = None
+                if row is not None:
+                    ts = getattr(row, "last_edit_at", None) or row.created_at
+                    saved_at = ts.isoformat() if ts else None
+                at = None
+                if last_test is not None:
+                    ts = last_test.completed_at or last_test.started_at
+                    at = ts.isoformat() if ts else None
+                candidate = {
+                    "version": cand_n,
+                    "author": row.author if row is not None else None,
+                    "saved_at": saved_at,
+                    "last_test_run": (
+                        {"run_id": str(last_test.id), "status": last_test.status, "at": at}
+                        if last_test is not None else None
+                    ),
+                }
+
+            # real runs of the live number (candidate test runs excluded)
+            runs_of_live = 0
+            if live_n is not None:
+                rows = (await session.execute(
+                    select(PlaybookRun.is_test, PlaybookRun.trigger).where(
+                        PlaybookRun.playbook_id == playbook.id,
+                        PlaybookRun.playbook_version == live_n,
+                    )
+                )).all()
+                runs_of_live = sum(
+                    1 for is_test, trig in rows
+                    if not is_test and trig != "agent-candidate"
+                )
+
+            # parked runs (never finished / failed — docs/v2.md §11)
+            parked_rows = (await session.execute(
+                select(PlaybookRun)
+                .where(
+                    PlaybookRun.playbook_id == playbook.id,
+                    PlaybookRun.status == "parked",
+                )
+                .order_by(PlaybookRun.started_at.desc())
+            )).scalars().all()
+            parked_runs = [
+                {"run_id": str(r.id), "parked_on": getattr(r, "parked_on", None)}
+                for r in parked_rows
+            ]
+
+            # pending approvals: (a) every parked-on-approval row, (b) the
+            # approval system's pending list when the core exposes one
+            pending: list[dict[str, Any]] = []
+            by_id: dict[str, dict[str, Any]] = {}
+            for r in parked_rows:
+                po = getattr(r, "parked_on", None)
+                if not isinstance(po, dict) or po.get("kind") != "approval":
+                    continue
+                aid = po.get("approval_id")
+                if aid is None:
+                    continue
+                entry = {"approval_id": str(aid), "kind": "run", "run_id": str(r.id)}
+                pending.append(entry)
+                by_id[str(aid)] = entry
+            list_pending = getattr(getattr(ctx, "approval", None), "list_pending", None)
+            if list_pending is not None:
+                try:
+                    reqs = await list_pending()
+                except Exception:  # noqa: BLE001 — a read never fails on the core
+                    _log.exception("playbooks: approval.list_pending failed")
+                    reqs = []
+                for req in reqs or []:
+                    if _req_field(req, "requested_by_plugin") != "plugin-playbooks":
+                        continue
+                    payload = _req_field(req, "payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    if name not in (payload.get("name"), payload.get("playbook")):
+                        continue
+                    rid = str(_req_field(req, "id"))
+                    kind = _req_field(req, "kind") or "unknown"
+                    if rid in by_id:
+                        by_id[rid]["kind"] = kind
+                        continue
+                    run_ref = payload.get("run_id")
+                    entry = {
+                        "approval_id": rid, "kind": kind,
+                        "run_id": str(run_ref) if run_ref else None,
+                    }
+                    pending.append(entry)
+                    by_id[rid] = entry
+
+            # versions, newest first — the playbook_versions entry shape
+            # minus has_code / has_manifest / runs
+            version_rows = (await session.execute(
+                select(PlaybookVersion)
+                .where(PlaybookVersion.playbook_id == playbook.id)
+                .order_by(PlaybookVersion.version.desc())
+            )).scalars().all()
+            versions = [
+                {
+                    "version": r.version,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "author": r.author,
+                    "message": r.message,
+                    "promoted_from": r.promoted_from,
+                    "live": r.version == live_n,
+                    "candidate": r.version == cand_n,
+                }
+                for r in version_rows
+            ]
+
+        cap = _OVERVIEW_CAP
+        if cand_n:
+            next_text = (
+                f"Candidate v{cand_n} is not live: test it with "
+                f"playbook_run_candidate(name='{name}'), then "
+                f"playbook_publish(name='{name}') to make it live."
+            )
+        elif parked_runs:
+            next_text = (
+                f"playbook_status(run_id='{parked_runs[0]['run_id']}') — a "
+                "parked run has nothing to poll; it resumes by itself."
+            )
+        elif live_n is not None:
+            next_text = f"playbook_run(name='{name}') executes live version {live_n}."
+        else:
+            next_text = "Nothing is live and no candidate exists — playbook_propose first."
+        return json.dumps({
+            "playbook": name,
+            "format": getattr(playbook, "format", None) or "pblang",
+            "playbook_run_executes": executes,
+            "candidate": candidate,
+            "runs_of_live_since_publish": runs_of_live,
+            "parked_runs": parked_runs[:cap],
+            "pending_approvals": pending[:cap],
+            "autonomy": autonomy,
+            "versions": versions[:cap],
+            "more": {
+                "parked_runs": max(0, len(parked_runs) - cap),
+                "pending_approvals": max(0, len(pending) - cap),
+                "versions": max(0, len(versions) - cap),
+            },
+            "next": next_text,
+        })
+
+    tools.append((
+        ToolDef(
+            name="playbook_overview",
+            modes=["planning", "building"],
+            description=(
+                "The truth surface for ONE playbook — read it before "
+                "describing a playbook's state. Derived, not raw rows: which "
+                "version playbook_run executes and why (or why it refuses), "
+                "the candidate (version, author, saved_at, its last test "
+                "run), how many real runs the live version has had, parked "
+                "runs, pending owner approvals, autonomy, the newest "
+                "versions, and `next` — the one call that moves the "
+                "playbook forward. Read-only; writes nothing."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Playbook name"},
+                },
+                "required": ["name"],
+            },
+            policy="auto_approve",
+            risk_level="low",
+        ),
+        _overview,
+    ))
+
     async def _version_read(
         *, name: str, version: int, include_runs: bool = True,
     ) -> str:
@@ -1932,13 +2198,16 @@ def build_tools(
                         }
                         for s in failed_steps
                     ]
-                out_runs.append(entry)
+                # plans/032 phase 09: each entry is run-shaped → envelope
+                # per row (the list itself is not a run and carries none)
+                out_runs.append(_with_envelope(_row_envelope(r), entry))
             return json.dumps({
                 "playbook": name,
                 "count": len(out_runs),
                 "filters": {"version": version, "status": status or None},
                 "runs": out_runs,
                 **({"note": "No runs match these filters."} if not out_runs else {}),
+                "next": _overview_hint(name),
             })
 
     tools.append((
@@ -1951,7 +2220,10 @@ def build_tools(
                 "entry carries `format` and `result` (a python run's return "
                 "value). Failed runs include every failed step's FULL error "
                 "text and resolved inputs (read it like a CI log). Use "
-                "playbook_status for one run's complete step-by-step trace."
+                "playbook_status for one run's complete step-by-step trace. "
+                "Each entry opens with kind / side_effects / version / "
+                "version_role / run_id — quote kind and version when you "
+                "report a run."
             ),
             parameters={
                 "type": "object",
@@ -2229,6 +2501,17 @@ def build_tools(
         is_candidate = bool(
             playbook.candidate_version and tested == playbook.candidate_version
         )
+        # plans/032 phase 09: no row is written for a dry run — the envelope
+        # names the resolved target; an explicit older number is `historical`.
+        env = _envelope(
+            "dry_run", side_effects=False, version=tested,
+            version_role=(
+                "candidate" if is_candidate
+                else "live" if tested == _live_version_of(playbook)
+                else "historical"
+            ),
+            run_id=None,
+        )
         try:
             if fmt == "python":
                 # plans/032 phase 05: the same segment loop in dry mode
@@ -2270,6 +2553,13 @@ def build_tools(
                 stubs_source["occurrences_used"] = used
                 stubs_source["occurrences_unmatched"] = [k for k in derived if k not in used]
                 trace["stubs_source"] = stubs_source
+            # plans/032 phase 09 (master §2 Dry run): a simulation is never
+            # `done` at the tool boundary — the v1 runner keeps its own
+            # status word (its direct callers pin it); v2 already says
+            # `simulated` / `simulated_nothing_exercised`; `failed` stays.
+            if trace.get("status") == "done":
+                trace["status"] = "simulated"
+            return json.dumps(_with_envelope(env, trace))
         return json.dumps(trace)
 
     tools.append((
@@ -2295,7 +2585,11 @@ def build_tools(
                 "or a number overrides). `stubs_from_run=<run_id>` replays a "
                 "recorded run's real effect results as stubs, per occurrence; "
                 "the result is SIMULATED and never counts as run evidence "
-                "(`stubs_source` reports which occurrences were used)."
+                "(`stubs_source` reports which occurrences were used). The "
+                "result opens with kind / side_effects / version / "
+                "version_role / run_id (kind 'dry_run', side_effects false, "
+                "run_id null, status 'simulated') — quote kind and version "
+                "when you report it."
             ),
             parameters={
                 "type": "object",
@@ -2702,7 +2996,7 @@ def build_tools(
             "live_version": live_version,
             "validated": True,
             "warnings": warnings,
-            "next": next_text,
+            "next": f"{next_text} {_overview_hint(name)}",
         }
         return json.dumps(result)
 
@@ -3279,6 +3573,8 @@ def build_tools(
                 f"playbook_run execute it. playbook_rollback(name) "
                 f"restores version {old_live} if it misbehaves."
             ),
+            # plans/032 phase 09
+            "next": _overview_hint(name),
         })
 
     async def _publish(
@@ -3476,6 +3772,13 @@ def build_tools(
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
 
+        # plans/032 phase 09: the envelope — the row's stamp is the
+        # candidate number (the shim carries it as live_version).
+        env = _envelope(
+            "candidate_test_run", side_effects=True,
+            version=getattr(run, "playbook_version", candidate_version),
+            version_role="candidate", run_id=str(run.id),
+        )
         result: dict[str, Any] = {
             "run_id": str(run.id),
             "playbook": name,
@@ -3490,12 +3793,14 @@ def build_tools(
         if status == "parked":
             # plans/032 phase 07: the candidate run parked (approval / event)
             result["parked_on"] = getattr(waited, "parked_on", None)
-            result["message"] = _parked_message(result["parked_on"], False)
+            result["message"] = (
+                f"{_parked_message(result['parked_on'], False)} {_overview_hint(name)}"
+            )
         elif status == "running":
             result["message"] = (
                 "Still executing in the background — poll "
                 "playbook_status(run_id) until 'done'/'failed'. Do NOT "
-                "re-run, do NOT report results yet."
+                f"re-run, do NOT report results yet. {_overview_hint(name)}"
             )
         elif status == "failed":
             fabricate = (
@@ -3528,7 +3833,8 @@ def build_tools(
                 }
                 # plans/032 phase 08: what `run()` returned
                 result["result"] = getattr(row_run, "result", None) if row_run is not None else None
-        return json.dumps(result)
+        result["next"] = _overview_hint(name)
+        return json.dumps(_with_envelope(env, result))
 
     tools.append((
         ToolDef(
@@ -3543,7 +3849,10 @@ def build_tools(
                 "playbook stays untouched. A done run reports step_results "
                 "and `result` (what a python playbook's run() returned). "
                 "Prefer playbook_dry_run first; use this when the owner "
-                "wants proof against real systems before playbook_publish."
+                "wants proof against real systems before playbook_publish. "
+                "The result opens with kind / side_effects / version / "
+                "version_role / run_id — quote kind and version when you "
+                "report it."
             ),
             parameters={
                 "type": "object",
@@ -3598,13 +3907,15 @@ def build_tools(
                     f"{r['tool']} ({r['failure_class']})" for r in broken
                 ) + " — playbook_publish will refuse, and live runs would "
                 "fail at these steps. Fix the connection/plugin or edit the "
-                "playbook to stop using the tool."
+                f"playbook to stop using the tool. {_overview_hint(name)}"
             )
         elif summary["ok"] == 0:
             result["note"] = (
                 "No tool declares a probe yet — nothing verified, nothing "
                 "known-broken. This is normal today; probes arrive per-plugin."
             )
+        if "next" not in result:
+            result["next"] = _overview_hint(name)  # plans/032 phase 09
         return json.dumps(result)
 
     tools.append((
