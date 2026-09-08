@@ -263,13 +263,29 @@ def _declared_schema(kind: str, args: dict[str, Any]) -> Any:
     return None
 
 
+def raise_marker(value: Any) -> dict[str, str] | None:
+    """phase 08 (`stubs_from_run`): a stub `{"_raise": {"type", "message"}}`
+    answers the effect with the recorded FAILURE instead of a value — the
+    loop raises the matching `_EffectFailure`. Returns the normalised
+    `{type, message}` or None for a plain value."""
+    if isinstance(value, dict) and isinstance(value.get("_raise"), dict):
+        recorded = value["_raise"]
+        return {
+            "type": str(recorded.get("type") or "EffectError"),
+            "message": str(recorded.get("message") or ""),
+        }
+    return None
+
+
 def dry_answer(
     kind: str, effect_id: str, occurrence: int, stubs: dict[str, Any] | None,
     *, args: dict[str, Any] | None = None, rng: random.Random | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """The journaled answer for one effect occurrence in dry mode →
     (result, extra journal fields). `extra` always carries `stubbed`,
-    `effect` and `schema`; the jail rebuilds the placeholder from them."""
+    `effect` and `schema`; the jail rebuilds the placeholder from them.
+    A `{"_raise": …}` stub (phase 08) sets `extra["raise"]` instead of a
+    value; `now`/`random` take a stubbed value too (a replayed run)."""
     args = args or {}
     key = f"{effect_id}#{occurrence}"
     extra: dict[str, Any] = {"stubbed": False, "effect": key, "schema": None, "stub_key": None}
@@ -279,9 +295,23 @@ def dry_answer(
         if found:
             extra["stubbed"] = True
             extra["stub_key"] = matched
+            marker = raise_marker(value)
+            if marker:
+                extra["raise"] = marker
+                return None, extra
             return value, extra
         return None, extra
     if kind == "approve":
+        # phase 08: a stub is the recorded decision (or its `_raise`)
+        found, value, matched = resolve_stub(stubs, effect_id, occurrence)
+        if found:
+            extra["stubbed"] = True
+            extra["stub_key"] = matched
+            marker = raise_marker(value)
+            if marker:
+                extra["raise"] = marker
+                return None, extra
+            return value, extra
         return {
             "approved": True, "request_id": f"dry:{key}", "reason": None,
             "decided_by": None, "dry": True,
@@ -297,8 +327,18 @@ def dry_answer(
             if isinstance(value, dict) and value.get("_event_timeout"):
                 extra["event_timeout"] = True
                 return None, extra
+            marker = raise_marker(value)
+            if marker:
+                extra["raise"] = marker
+                return None, extra
             return value, extra
         return None, extra
+    if kind in ("now", "random"):
+        found, value, matched = resolve_stub(stubs, effect_id, occurrence)
+        if found:
+            extra["stubbed"] = True
+            extra["stub_key"] = matched
+            return value, extra
     if kind == "now":
         return DRY_NOW, extra
     if kind == "random":

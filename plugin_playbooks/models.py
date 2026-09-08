@@ -10,6 +10,7 @@ pre-split schema (existing rows must keep loading); creation happens in
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -104,6 +105,10 @@ class PlaybookVersion(Base):
     author: Mapped[str] = mapped_column(String(64), default="owner", nullable=False)
     message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     promoted_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # plans/032 phase 08: the language of THIS version's code (pblang | python).
+    # From here an edit may change a playbook's format: the candidate row
+    # carries its own format while the live row keeps the published one.
+    format: Mapped[str] = mapped_column(String(16), default="pblang", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -195,6 +200,14 @@ class PlaybookRun(Base):
     # plans/032 phase 07 (docs/v2.md §6): what a `parked` run waits on —
     # {kind: approval|event, since, due_at, approval_id|event_name}; NULL otherwise.
     parked_on: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # plans/032 phase 08: the runtime this run executed under, stamped at
+    # creation from the version row it ran (pblang | python). `_drive_run`
+    # dispatches on it — never re-sniffed.
+    format: Mapped[str] = mapped_column(String(16), default="pblang", nullable=False)
+    # plans/032 phase 08: what `run()` returned (python runs; JSON, secrets
+    # scrubbed back to `vault:<key>`). NULL for v1 runs and for failed runs.
+    # The additive last key of `playbook.run.completed`.
+    result: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
 
 
 class PlaybookStepRun(Base):

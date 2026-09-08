@@ -48,6 +48,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # matching the model's `JSONB` column.
     ("playbook_runs", "parked_on", "JSONB"),
     ("playbook_journal", "parked_on", "JSONB"),
+    # plans/032 phase 08: format per version row and per run; the run's
+    # `result` (what `run()` returned). Backfilled by `backfill_format`.
+    ("playbook_versions", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
+    ("playbook_runs", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
+    ("playbook_runs", "result", "JSONB"),
 ]
 
 # Indexes whose definition changed — dropped on load so the model's current
@@ -211,6 +216,33 @@ async def backfill_live_version(session_factory) -> int:
     if n:
         logger.info("playbooks: backfilled live_version for %d playbook(s)", n)
     return n
+
+
+async def backfill_format(session_factory) -> int:
+    """plans/032 phase 08: stamp `format` on version rows and run rows that
+    predate the column (migrated with DEFAULT 'pblang'). Rows of a python
+    playbook whose `format` is still the default take the playbook's format —
+    before phase 08 every row of a playbook shared its language, so the
+    parent's column is the truth. Idempotent. Returns rows updated."""
+    from sqlalchemy import select, update
+
+    from .models import Playbook, PlaybookRun, PlaybookVersion
+
+    python_ids = select(Playbook.id).where(Playbook.format == "python")
+    total = 0
+    async with session_factory() as session:
+        for model in (PlaybookVersion, PlaybookRun):
+            result = await session.execute(
+                update(model)
+                .where(model.playbook_id.in_(python_ids), model.format == "pblang")
+                .values(format="python")
+                .execution_options(synchronize_session=False)
+            )
+            total += result.rowcount or 0
+        await session.commit()
+    if total:
+        logger.info("playbooks: backfilled format for %d version/run row(s)", total)
+    return total
 
 
 # 0.8.0 (plans/002 phase 1): the authoring skill teaches playbook CODE —
@@ -843,6 +875,12 @@ class PlaybooksPlugin(LunaPlugin):
             await backfill_live_version(ctx.db_session_factory)
         except Exception as e:  # noqa: BLE001
             logger.warning("playbooks: live_version backfill failed: %s", e)
+
+        # plans/032 phase 08: format per version row / run row.
+        try:
+            await backfill_format(ctx.db_session_factory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("playbooks: format backfill failed: %s", e)
 
         # 0.38.0: drop redundant duplicate (playbook, version) rows left by
         # the pre-0.32 edit path (they 500ed version reads and doubled the

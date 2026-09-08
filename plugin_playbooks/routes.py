@@ -927,6 +927,9 @@ async def list_runs(name: str, version: int | None = None):
             "playbook_version": r.playbook_version,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            # plans/032 phase 08
+            "format": getattr(r, "format", None) or "pblang",
+            "result": getattr(r, "result", None),
         } for r in runs]
 
 
@@ -949,6 +952,9 @@ async def get_run(run_id: str):
             "trigger": run.trigger,
             "playbook_version": run.playbook_version,
             "inputs": run.inputs,
+            # plans/032 phase 08
+            "format": getattr(run, "format", None) or "pblang",
+            "result": getattr(run, "result", None),
             "steps": [{
                 "step_id": s.step_id,
                 "kind": s.step_kind,
@@ -1113,6 +1119,9 @@ def _apply_row_to_live(p: Playbook, row: PlaybookVersion, *, restore_manifest: b
     p.display_name = defn.get("display_name") or p.display_name
     p.inputs_schema = defn.get("inputs")
     p.live_version = row.version
+    # phase 08: the promoted row's language becomes the live format
+    if getattr(row, "format", None):
+        p.format = row.format
 
 
 @router.post("/playbooks/{name}/promote")

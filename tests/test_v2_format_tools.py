@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from evidence import EXPLANATION, green_run
 from readstage import parse_read_stage
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -96,46 +97,73 @@ async def test_propose_precedence_table(explicit, code, expect):
         await e.dispose()
 
 
-async def test_edit_default_is_stored_format_and_change_refused():
+# a python twin of the pblang greeter on the same registered tool
+PY_GREETER = (
+    "async def run(ctx, inputs):\n"
+    "    say = await ctx.tool('echo', message=inputs['greeting'])\n"
+    "    return say\n"
+)
+
+
+async def test_edit_may_change_format():
+    """plans/032 phase 08 rewrite of phase 04's
+    `test_edit_default_is_stored_format_and_change_refused`: the default is
+    still the stored format and an explicit mismatch is still refused, but a
+    format change is no longer refused — the candidate carries its own
+    `format` while the live version keeps its runtime until publish."""
     e = await env(echo=_echo)
     try:
-        for name, code in (("py", PY_CODE), ("pb", CODE.replace("greeter", "pb"))):
+        for name, code in (("py", PY_GREETER), ("pb", CODE.replace("greeter", "pb"))):
             out = json.loads(await e.tools["playbook_propose"](name=name, code=code))
             assert out["status"] == "candidate_saved", out
+            await green_run(e.sf, 1, name=name)
+            out = json.loads(await e.tools["playbook_publish"](name=name, explanation=EXPLANATION))
+            assert out["status"] == "published", out
         # default = stored: prose sniffs nothing, so python stays python
         # (checker error) and pblang stays pblang (compile error)
         read = parse_read_stage(await e.tools["playbook_edit"](name="py"))
-        assert read["format"] == "python"
+        assert read["format"] == "python" and read["live_format"] == "python"
         out = json.loads(await e.tools["playbook_edit"](name="py", ticket=read["ticket"], code=PROSE))
         assert out["saved"] is False and out["format"] == "python"
         assert out["errors"][0]["code"] == "v2-entry-point"
         read_pb = parse_read_stage(await e.tools["playbook_edit"](name="pb"))
-        assert read_pb["format"] == "pblang"
+        assert read_pb["format"] == "pblang" and read_pb["live_format"] == "pblang"
         out = json.loads(await e.tools["playbook_edit"](name="pb", ticket=read_pb["ticket"], code=PROSE))
         assert out["saved"] is False and out["format"] == "pblang"
         assert out["ticket_still_valid"] is True
 
-        # a format change is refused, ticket kept, nothing written
-        out = json.loads(await e.tools["playbook_edit"](name="py", ticket=read["ticket"], code=CODE))
-        assert out == {
-            "stage": "write", "saved": False, "format": "python",
-            "error": "This playbook is python; changing a playbook's format is "
-                     "not supported yet — create a new playbook.",
-            "ticket": read["ticket"], "ticket_still_valid": True,
-        }
+        # an explicit format that contradicts the code is still refused
         out = json.loads(await e.tools["playbook_edit"](
-            name="py", ticket=read["ticket"], code=PY_CODE, format="pblang",
+            name="py", ticket=read["ticket"], code=PY_GREETER, format="pblang",
         ))
         assert out["saved"] is False and out["errors"][0]["code"] == "v2-format-mismatch"
-        out = json.loads(await e.tools["playbook_edit"](
-            name="pb", ticket=read_pb["ticket"], code=PY_CODE,
-        ))
-        assert out["saved"] is False and out["format"] == "pblang"
-        assert "changing a playbook's format" in out["error"]
         assert (await _row(e.sf, "py")).version == 1
-        assert (await _row(e.sf, "pb")).version == 1
-        assert (await _row(e.sf, "py")).format == "python"
-        assert (await _row(e.sf, "pb")).format == "pblang"
+
+        # a format change SAVES a candidate of the new format; live keeps its own
+        out = json.loads(await e.tools["playbook_edit"](
+            name="py", ticket=read["ticket"], code=CODE.replace("greeter", "py"),
+        ))
+        assert out["status"] == "candidate_saved", out
+        assert out["format"] == "pblang" and out["live_format"] == "python"
+        assert "candidate v2 is pblang; live v1 stays python until publish" in out["next"]
+        out = json.loads(await e.tools["playbook_edit"](
+            name="pb", ticket=read_pb["ticket"], code=PY_GREETER,
+        ))
+        assert out["status"] == "candidate_saved", out
+        assert out["format"] == "python" and out["live_format"] == "pblang"
+        assert "candidate v2 is python; live v1 stays pblang until publish" in out["next"]
+        py, pb = await _row(e.sf, "py"), await _row(e.sf, "pb")
+        assert (py.live_version, py.candidate_version, py.format) == (1, 2, "python")
+        assert (pb.live_version, pb.candidate_version, pb.format) == (1, 2, "pblang")
+        # the READ stage now shows both: the candidate's format and live's
+        read = parse_read_stage(await e.tools["playbook_edit"](name="py"))
+        assert read["format"] == "pblang" and read["live_format"] == "python"
+        # publish flips the playbook's format to the promoted version's
+        await green_run(e.sf, 2, name="py")
+        out = json.loads(await e.tools["playbook_publish"](name="py", explanation=EXPLANATION))
+        assert out["status"] == "published", out
+        py = await _row(e.sf, "py")
+        assert (py.live_version, py.format) == (2, "pblang")
     finally:
         await e.dispose()
 

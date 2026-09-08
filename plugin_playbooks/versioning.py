@@ -73,7 +73,9 @@ def shim_playbook(playbook: Playbook, row: PlaybookVersion) -> Playbook:
         inputs_schema=dict(row.definition or {}).get("inputs"),
         definition=row.definition,
         code=row.code,
-        format=playbook.format,
+        # phase 08: the version row's own language (a candidate may differ
+        # from the live format).
+        format=row.format or playbook.format,
         manifest=row.manifest,
         version=row.version,
         live_version=row.version,
@@ -97,6 +99,7 @@ async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion
             definition=p.definition,
             code=p.code,
             manifest=p.manifest,
+            format=p.format or "pblang",
             author="system",
             message="live content (recorded on first candidate/promote)",
         )
@@ -114,10 +117,12 @@ async def mint_version(
     author: str,
     message: str,
     promoted_from: int | None = None,
+    format: str | None = None,
 ) -> PlaybookVersion:
     """Increment `p.version` and add the row for the new number. Callers
     decide what the number means (move `live_version` / `candidate_version`
-    themselves) and commit."""
+    themselves) and commit. phase 08: `format` stamps the row's language;
+    None = the playbook's current format."""
     from sqlalchemy import func
 
     # Mint ABOVE any stored row, not just above the counter — a counter that
@@ -137,6 +142,7 @@ async def mint_version(
         author=author,
         message=message,
         promoted_from=promoted_from,
+        format=format or p.format or "pblang",
     )
     session.add(row)
     # plans/022 P6: assert the snapshot row actually reached the DB — the

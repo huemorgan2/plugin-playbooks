@@ -361,6 +361,108 @@ def _parked_message(parked_on: Any, wake_promised: bool) -> str:
     return f"Parked on {_parked_what(parked_on)} — nothing to poll; {tail}"
 
 
+def _raise_stub(error_type: Any, message: Any) -> dict[str, Any]:
+    return {"_raise": {"type": str(error_type or "EffectError"), "message": str(message or "")}}
+
+
+async def _stubs_from_recorded_run(
+    session: AsyncSession, runner: Any, playbook: Playbook, run_id: str,
+    target_fmt: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | str:
+    """plans/032 phase 08 `stubs_from_run`: the per-occurrence stubs a
+    recorded run of `playbook` yields, or an error string.
+
+    A python run replays its journal: `done` → the recorded result under
+    `"<id>#<n>"`, `failed`/`failed_handled` → a `{"_raise": {type, message}}`
+    stub the dry loop raises as the recorded error (approve → the decision,
+    wait_event → the payload, now/random → the values, log skipped; rows
+    with no recorded outcome are left unstubbed). A pblang run replays its
+    step rows in `started_at` order under `"<step id>#<n>"` AND
+    `"<tool>#<n>"` (a tool row's `outputs["result"]`, other rows' outputs);
+    a pblang TARGET also gets the bare keys v1's stub lookup reads.
+
+    Returns (stubs, source) where `source` is `{run_id, version, format,
+    status}` — the caller adds `occurrences_used`/`occurrences_unmatched`
+    once the trace is in."""
+    try:
+        rid = uuid.UUID(str(run_id))
+    except ValueError:
+        return f"run {run_id} not found"
+    run = await session.get(PlaybookRun, rid)
+    if run is None:
+        return f"run {run_id} not found"
+    if run.playbook_id != playbook.id:
+        other = await session.get(Playbook, run.playbook_id)
+        return f"run {run_id} belongs to playbook '{other.name if other else run.playbook_id}'"
+    run_fmt = getattr(run, "format", None) or "pblang"
+    stubs: dict[str, Any] = {}
+    if run_fmt == "python":
+        try:
+            journal = await runner._v2.journal.read(str(run.id))
+        except KeyError:
+            journal = []
+        for e in journal[1:]:
+            if e.get("kind") == "log" or not e.get("id"):
+                continue
+            key = f"{e['id']}#{int(e.get('occurrence') or 1)}"
+            status = e.get("status")
+            if status == "done":
+                stubs[key] = e.get("result")
+            elif status in ("failed", "failed_handled"):
+                err = e.get("error") or {}
+                stubs[key] = _raise_stub(err.get("type"), err.get("message"))
+    else:
+        rows = (await session.execute(
+            select(PlaybookStepRun)
+            .where(PlaybookStepRun.run_id == run.id)
+            .order_by(PlaybookStepRun.started_at, PlaybookStepRun.id)
+        )).scalars().all()
+        seen: dict[str, int] = {}
+        for r in rows:
+            if r.status not in ("done", "failed", "failed_handled"):
+                continue
+            out = r.outputs if isinstance(r.outputs, dict) else {}
+            tool = out.get("tool") if isinstance(out.get("tool"), str) else None
+            if r.status == "done":
+                value = out.get("result") if tool else (r.outputs if r.outputs is not None else out)
+            else:
+                value = _raise_stub("ToolError" if tool else "EffectError", r.error)
+            names = [r.step_id] + ([tool] if tool and tool != r.step_id else [])
+            for nm in names:
+                seen[nm] = seen.get(nm, 0) + 1
+                stubs[f"{nm}#{seen[nm]}"] = value
+                if target_fmt == "pblang":
+                    stubs.setdefault(nm, value)
+    source = {
+        "run_id": str(run.id), "version": run.playbook_version,
+        "format": run_fmt, "status": run.status,
+    }
+    return stubs, source
+
+
+async def _handled_step_keys(runner: Any, run: Any) -> set[str]:
+    """plans/032 phase 08: the `"<id>#<n>"` keys of a python run's journal
+    rows the code caught and proceeded past (`failed_handled`). Empty for a
+    v1 run or when the runner has no journal for it."""
+    if (getattr(run, "format", None) or "pblang") != "python":
+        return set()
+    loop = getattr(runner, "_v2", None)
+    journal = getattr(loop, "journal", None)
+    if journal is None:
+        return set()
+    try:
+        entries = await journal.read(str(run.id))
+    except KeyError:
+        return set()
+    except Exception:  # noqa: BLE001 — a status read never fails on the journal
+        _log.exception("playbooks: journal read failed for run %s", run.id)
+        return set()
+    return {
+        f"{e.get('id')}#{e.get('occurrence')}"
+        for e in entries[1:] if e.get("status") == "failed_handled" and e.get("id")
+    }
+
+
 def _parked_hint(parked_on: Any) -> str:
     """playbook_status hint for a `parked` run."""
     po = parked_on if isinstance(parked_on, dict) else {}
@@ -876,10 +978,14 @@ def build_tools(
                 steps = (await session.execute(
                     select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
                 )).scalars().all()
+                row = await session.get(PlaybookRun, run.id)
                 result["step_results"] = {
                     s.step_id: s.outputs for s in steps if s.outputs
                 }
-                if not result["step_results"]:
+                # plans/032 phase 08: what `run()` returned (python runs;
+                # null for a pblang run)
+                result["result"] = getattr(row, "result", None) if row is not None else None
+                if not result["step_results"] and result["result"] is None:
                     result["warning"] = (
                         "Playbook completed but produced no step outputs. "
                         "Verify the playbook has working steps before "
@@ -900,7 +1006,8 @@ def build_tools(
                 "Trigger a playbook run. The run executes in the BACKGROUND: "
                 "this returns the run_id immediately and waits up to "
                 "wait_seconds (default 55) for completion. Fast playbooks "
-                "return their results directly (status 'done' + step_results). "
+                "return their results directly (status 'done' + step_results; "
+                "a python playbook's `result` is what its run() returned). "
                 "If the result says status 'running', the playbook is still "
                 "going and you will be WOKEN with the result when it "
                 "finishes — do not poll, never re-run it, and never invent "
@@ -940,21 +1047,36 @@ def build_tools(
             # plans/009: the polling target for background runs — surface
             # run-level timing and the failing step's error at top level so a
             # polling agent doesn't have to dig for them.
-            step_errors = [s.error for s in steps if s.error]
+            # plans/032 phase 08: a caught effect failure (journal status
+            # `failed_handled`, docs/v2.md §2.6) is shown as such on its own
+            # row — with its error — and is never hoisted: a done run with
+            # handled failures carries no `error`. The step row itself stays
+            # `failed` (phase 06/07 pin that); the journal is the truth.
+            handled = await _handled_step_keys(runner, run)
+            shown = [
+                "failed_handled" if s.status == "failed" and s.step_id in handled else s.status
+                for s in steps
+            ]
+            step_errors = [
+                s.error for s, st in zip(steps, shown) if st == "failed" and s.error
+            ]
             payload: dict = {
                 "run_id": run_id,
                 "status": run.status,
                 "trigger": run.trigger,
                 "started_at": run.started_at.isoformat() if run.started_at else None,
                 "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                # plans/032 phase 08: `run()`'s return value (null for v1 and
+                # unfinished/failed runs)
+                "result": getattr(run, "result", None),
                 "steps": [{
                     "step_id": s.step_id,
                     "kind": s.step_kind,
-                    "status": s.status,
+                    "status": st,
                     "inputs": s.inputs,
                     "outputs": s.outputs,
                     "error": s.error,
-                } for s in steps],
+                } for s, st in zip(steps, shown)],
             }
             # plans/032 phase 04 (docs/v2.md §7): the run row's own error
             # (a python one-liner, or v1's abort text) wins over the last
@@ -984,11 +1106,30 @@ def build_tools(
                 # 012 phase 4: a failed run still recorded the REAL outputs
                 # of every step that ran — steer the agent to reuse them as
                 # dry-run stubs before it starts fixing from memory.
+                # plans/032 phase 08: `stubs_from_run` replays them directly.
+                pb_name = None
+                playbook = await session.get(Playbook, run.playbook_id)
+                if playbook is not None:
+                    pb_name = playbook.name
                 payload["hint"] = (
                     "Failed — but every step that ran recorded its real "
                     "output above. Reuse those shapes as `stubs` in "
                     "playbook_dry_run (keyed by step id) to reproduce the "
-                    "failure before fixing."
+                    "failure before fixing. After saving a fix, "
+                    f"playbook_dry_run(name='{pb_name or '?'}', "
+                    f"version='candidate', stubs_from_run='{run_id}') "
+                    "replays this run's recorded effect results against the "
+                    "candidate, per occurrence."
+                )
+            elif run.status == "timed_out_unknown":
+                # plans/032 phase 06/08 (docs/v2.md §6): the outcome of an
+                # effect is unknown — the run is neither green nor a clean
+                # failure; nothing here proves the side effect did not happen.
+                payload["hint"] = (
+                    "Outcome unknown — an effect was in flight when the "
+                    "process died and its result was never recorded. Do NOT "
+                    "assume it did or did not happen; check the target "
+                    "system before re-running."
                 )
             return json.dumps(payload)
 
@@ -998,7 +1139,8 @@ def build_tools(
             modes=["planning", "building"],
             description=(
                 "Get the live state of a playbook run: overall status "
-                "(running/parked/done/failed/cancelled), timing, and the full "
+                "(running/parked/done/failed/cancelled), timing, `result` "
+                "(what a python playbook's run() returned), and the full "
                 "step-by-step trace with each step's outputs and errors. "
                 "Poll this after playbook_run returns status 'running'. A "
                 "'parked' run (waiting on an owner approval or an event) has "
@@ -1360,11 +1502,20 @@ def build_tools(
         (None when nothing is live)."""
         return await ensure_live_row(session, playbook)
 
+    def _row_format(row: PlaybookVersion) -> str:
+        """phase 08: a version row's OWN language — the column, else the
+        definition's marker, else pblang."""
+        fmt = getattr(row, "format", None)
+        if fmt in ("python", "pblang"):
+            return fmt
+        return "python" if (row.definition or {}).get("format") == "python" else "pblang"
+
     def _version_code(row: PlaybookVersion) -> str:
-        """Source of a version row (stored, or — pblang — derived on read)."""
+        """Source of a version row (stored, or — pblang — derived on read).
+        phase 08: the row's own format decides, never the playbook's."""
         if row.code:
             return row.code
-        if (row.definition or {}).get("format") == "python":
+        if _row_format(row) == "python":
             return row.code or ""
         return generate_code(PlaybookDef.model_validate(row.definition))
 
@@ -1384,6 +1535,9 @@ def build_tools(
         playbook.display_name = defn.get("display_name") or playbook.display_name
         playbook.inputs_schema = defn.get("inputs")
         playbook.live_version = row.version
+        # phase 08: the promoted row's language becomes the live format
+        if getattr(row, "format", None):
+            playbook.format = row.format
 
     def _shim_playbook(playbook: Playbook, row: PlaybookVersion) -> Playbook:
         """Transient Playbook carrying a version row's content — NEVER added
@@ -1398,7 +1552,9 @@ def build_tools(
             inputs_schema=dict(row.definition).get("inputs"),
             definition=row.definition,
             code=row.code,
-            format=playbook.format,  # plans/032 phase 04: the runner dispatches on it
+            # plans/032 phase 04: the runner dispatches on it; phase 08: the
+            # version row's OWN language (a candidate may differ from live)
+            format=getattr(row, "format", None) or playbook.format,
             manifest=row.manifest,
             version=row.version,
             live_version=row.version,
@@ -1713,7 +1869,14 @@ def build_tools(
                     "inputs": r.inputs,
                     "started_at": r.started_at.isoformat() if r.started_at else None,
                     "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    # plans/032 phase 08: the runtime and `run()`'s return
+                    "format": getattr(r, "format", None) or "pblang",
+                    "result": getattr(r, "result", None),
                 }
+                if r.status == "timed_out_unknown":
+                    entry["error"] = getattr(r, "error", None)
+                    entry["error_type"] = getattr(r, "error_type", None)
+                    entry["hint"] = "outcome unknown — an effect's result was never recorded"
                 if r.status == "failed":
                     # plans/032 phase 04 (docs/v2.md §7): the run-level
                     # error columns beside the per-step failures.
@@ -1753,9 +1916,10 @@ def build_tools(
             modes=["planning", "building"],
             description=(
                 "List a playbook's runs, newest first — filter by version= "
-                "and/or status= (running/parked/done/failed/cancelled). Failed "
-                "runs include every failed step's FULL error text and "
-                "resolved inputs (read it like a CI log). Use "
+                "and/or status= (running/parked/done/failed/cancelled). Each "
+                "entry carries `format` and `result` (a python run's return "
+                "value). Failed runs include every failed step's FULL error "
+                "text and resolved inputs (read it like a CI log). Use "
                 "playbook_status for one run's complete step-by-step trace."
             ),
             parameters={
@@ -1982,7 +2146,7 @@ def build_tools(
     # --- playbook_dry_run (the simulation harness) ---
     async def _dry_run(
         *, name: str, inputs: str = "{}", version: str = "auto",
-        stubs: str | dict = "{}",
+        stubs: str | dict = "{}", stubs_from_run: str | None = None,
     ) -> str:
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
@@ -2015,6 +2179,19 @@ def build_tools(
             target, tested = resolved
             fmt = "python" if getattr(target, "format", "pblang") == "python" else "pblang"
 
+            # plans/032 phase 08: a recorded run's effect results as stubs,
+            # per occurrence; explicit `stubs` win key by key.
+            stubs_source: dict[str, Any] | None = None
+            derived: dict[str, Any] = {}
+            if stubs_from_run:
+                got = await _stubs_from_recorded_run(
+                    session, runner, playbook, str(stubs_from_run), fmt,
+                )
+                if isinstance(got, str):
+                    return json.dumps({"error": got, "dry_run": True, "format": fmt})
+                derived, stubs_source = got
+                stub_data = {**derived, **stub_data}
+
         is_candidate = bool(
             playbook.candidate_version and tested == playbook.candidate_version
         )
@@ -2040,6 +2217,25 @@ def build_tools(
             trace["format"] = fmt
             trace["tested_version"] = tested
             trace["is_candidate"] = is_candidate
+            if stubs_source is not None:
+                if fmt == "python":
+                    ran = set((trace.get("steps_ran") or {}).keys())
+                    used = [k for k in derived if k in ran]
+                else:
+                    # v1 trace entries are keyed `step_id`; a stub reaches a
+                    # step by its id or by the tool name the step calls
+                    ids: set[str] = set()
+                    for t in (trace.get("trace") or []):
+                        if not isinstance(t, dict):
+                            continue
+                        ids.add(str(t.get("step_id") or t.get("id")))
+                        out_t = t.get("output")
+                        if isinstance(out_t, dict) and isinstance(out_t.get("tool"), str):
+                            ids.add(out_t["tool"])
+                    used = [k for k in derived if k.rpartition("#")[0] in ids or k in ids]
+                stubs_source["occurrences_used"] = used
+                stubs_source["occurrences_unmatched"] = [k for k in derived if k not in used]
+                trace["stubs_source"] = stubs_source
         return json.dumps(trace)
 
     tools.append((
@@ -2062,7 +2258,10 @@ def build_tools(
                 "stubbed by step id or tool name and the result is a trace of "
                 "resolved args, branches and loop iterations. Exercises the "
                 "CANDIDATE version by default when one exists (version='live' "
-                "or a number overrides)."
+                "or a number overrides). `stubs_from_run=<run_id>` replays a "
+                "recorded run's real effect results as stubs, per occurrence; "
+                "the result is SIMULATED and never counts as run evidence "
+                "(`stubs_source` reports which occurrences were used)."
             ),
             parameters={
                 "type": "object",
@@ -2076,7 +2275,19 @@ def build_tools(
                             "\"<call-site id>#<n>\" per occurrence, or "
                             "\"<call-site id>\" for every occurrence. pblang: "
                             "keyed by step id or tool name (step id wins). "
-                            "Values are the raw result payload."
+                            "Values are the raw result payload. Explicit "
+                            "stubs override stubs_from_run key by key."
+                        ),
+                    },
+                    "stubs_from_run": {
+                        "type": "string",
+                        "description": (
+                            "A run_id of THIS playbook (playbook_status / "
+                            "playbook_runs): its recorded effect results "
+                            "become the stubs, per occurrence — a recorded "
+                            "failure replays as the same error. Use it to "
+                            "exercise a candidate fix against the exact run "
+                            "that broke. Still a simulation."
                         ),
                     },
                     "version": {
@@ -2140,11 +2351,15 @@ def build_tools(
                 except Exception:  # noqa: BLE001 — legacy defs must stay editable
                     current = ""
                 t = await _issue_ticket(session, playbook)
-                pb_format = getattr(playbook, "format", "pblang") or "pblang"
+                live_format = getattr(playbook, "format", "pblang") or "pblang"
+                # phase 08: `format` is the language of what is being edited
+                # (the candidate row's own), `live_format` the live one
+                pb_format = _row_format(cand_row) if cand_row else live_format
                 header = {
                     "stage": "read",
                     "editing": "candidate" if cand_row else "live",
                     "format": pb_format,
+                    "live_format": live_format,
                     "version": playbook.version,
                     "live_version": _live_version_of(playbook),
                     "candidate_version": playbook.candidate_version,
@@ -2253,7 +2468,7 @@ def build_tools(
             if refusal:
                 return json.dumps({"error": refusal})
             seconds_left = await _ticket_seconds_left(session, ticket)
-            stored_fmt = getattr(playbook, "format", "pblang") or "pblang"
+            live_fmt = getattr(playbook, "format", "pblang") or "pblang"
             base_version = playbook.version
             # Edits build on the candidate when one exists (that's what the
             # read stage handed out), else on live.
@@ -2262,6 +2477,8 @@ def build_tools(
                 cand_row = await _get_version_row(
                     session, playbook, playbook.candidate_version,
                 )
+            # phase 08: the stored format is the EDITED row's own language
+            stored_fmt = _row_format(cand_row) if cand_row else live_fmt
             try:
                 old_code = _version_code(cand_row) if cand_row else _derive_code(playbook)
             except Exception:  # noqa: BLE001
@@ -2291,24 +2508,13 @@ def build_tools(
                 code = old_code.replace(old, new)
 
             # plans/032 phase 04 (docs/v2.md §9): explicit > sniff > stored.
-            # A format change is refused (per-version format is plugin/08).
+            # phase 08: a format change is ALLOWED — the candidate row carries
+            # its own format; the live row keeps its language until publish.
             fmt, fmt_issue = resolve_format(
                 format or None, code, stored=stored_fmt, default=stored_fmt,
             )
             if fmt_issue is not None:
                 return _rejected(fmt or stored_fmt, [fmt_issue.to_dict()], [], seconds_left)
-            if fmt != stored_fmt:
-                return json.dumps({
-                    "stage": "write",
-                    "saved": False,
-                    "format": stored_fmt,
-                    "error": (
-                        f"This playbook is {stored_fmt}; changing a playbook's "
-                        "format is not supported yet — create a new playbook."
-                    ),
-                    "ticket": ticket,
-                    "ticket_still_valid": True,
-                })
             stored_code = code
             if fmt == "python":
                 py_schema, perr = _parse_json_param(
@@ -2409,6 +2615,7 @@ def build_tools(
                 definition=data, code=stored_code, manifest=playbook.manifest,
                 author="agent",
                 message="candidate",
+                format=fmt,  # phase 08: the candidate row's own language
             )
             playbook.candidate_version = playbook.version
             if not had_live:
@@ -2417,9 +2624,11 @@ def build_tools(
                 playbook.definition = data
                 playbook.code = stored_code
                 playbook.inputs_schema = data.get("inputs")
+                playbook.format = fmt
             await session.commit()
             new_version = playbook.version
             live_version = _live_version_of(playbook)
+            live_format = getattr(playbook, "format", "pblang") or "pblang"
 
         await events.emit("playbook.candidate.saved", {
             "name": name, "candidate_version": new_version,
@@ -2444,9 +2653,16 @@ def build_tools(
                 "playbook_rollback restores the previous live version after "
                 "a publish."
             )
+            if fmt != live_format:
+                # phase 08: the format changed — say what runs where
+                next_text += (
+                    f" Note: candidate v{new_version} is {fmt}; live "
+                    f"v{live_version} stays {live_format} until publish."
+                )
         result: dict[str, Any] = {
             "playbook": name,
             "format": fmt,
+            "live_format": live_format,
             "status": "candidate_saved",
             "candidate_version": new_version,
             "live_version": live_version,
@@ -3272,9 +3488,12 @@ def build_tools(
                 steps = (await session.execute(
                     select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
                 )).scalars().all()
+                row_run = await session.get(PlaybookRun, run.id)
                 result["step_results"] = {
                     s.step_id: s.outputs for s in steps if s.outputs
                 }
+                # plans/032 phase 08: what `run()` returned
+                result["result"] = getattr(row_run, "result", None) if row_run is not None else None
         return json.dumps(result)
 
     tools.append((
@@ -3287,9 +3506,10 @@ def build_tools(
                 "REAL, supervised test run of a playbook's CANDIDATE version "
                 "— actual tools, actual side effects, recorded in run "
                 "history against the candidate version number. The live "
-                "playbook stays untouched. Prefer playbook_dry_run first; "
-                "use this when the owner wants proof against real systems "
-                "before playbook_publish."
+                "playbook stays untouched. A done run reports step_results "
+                "and `result` (what a python playbook's run() returned). "
+                "Prefer playbook_dry_run first; use this when the owner "
+                "wants proof against real systems before playbook_publish."
             ),
             parameters={
                 "type": "object",

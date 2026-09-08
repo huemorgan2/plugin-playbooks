@@ -279,11 +279,19 @@ class RunCompletionWake:
                 "results. playbook_status(run_id) shows the failing trace."
             )
         else:
+            # plans/032 phase 08: a python run's return value leads (the
+            # payload's additive `result` key), the step outputs follow
+            if payload.get("result") is not None:
+                text = json.dumps(payload["result"], indent=2, default=str)
+                if len(text) > _OUTPUTS_CAP:
+                    text = text[:_OUTPUTS_CAP] + "\n... (truncated)"
+                lines.append("")
+                lines.append(f"Result:\n{text}")
             outputs = await self._collect_outputs(run_id)
             if outputs:
                 lines.append("")
                 lines.append(f"Step outputs:\n{outputs}")
-            else:
+            elif payload.get("result") is None:
                 lines.append(
                     "The run produced no step outputs — check "
                     "playbook_status(run_id) before reporting."

@@ -504,9 +504,10 @@ def _pb_main():
                 value = stop.value
                 try:
                     value = _pb_json_norm(value)
-                except (TypeError, ValueError) as e:
-                    return {"kind": "error", "error_type": "ResultNotSerializable",
-                            "message": f"run() returned a value that is not JSON: {e}",
+                except (TypeError, ValueError):
+                    # phase 08: a non-JSON return fails the run loud
+                    return {"kind": "error", "error_type": "TypeError",
+                            "message": f"return value is not JSON: {type(value).__name__}",
                             "traceback": [], "playbook_line": 0,
                             "last_completed_effect": _pb_last_effect,
                             "locals_preview": {}, "handled": list(_pb_handled)}

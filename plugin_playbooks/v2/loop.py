@@ -108,6 +108,26 @@ class _EventTimeout(_EffectFailure):
     error_type = "EventTimeout"
 
 
+_FAILURE_CLASSES: dict[str, type[_EffectFailure]] = {
+    cls.error_type: cls
+    for cls in (_ToolError, _EffectTimeout, _Rejected, _ApprovalExpired, _SubtaskFailed, _EventTimeout)
+}
+
+
+def _dry_failure(
+    error_type: str, message: str, extra: dict[str, Any] | None = None,
+) -> _EffectFailure:
+    """phase 08: the `_EffectFailure` for a recorded `error.type` — a known
+    class, else a bare `_EffectFailure` stamped with that type (the shim maps
+    `OutcomeUnknown`/`EffectError` itself). `extra` rides to the journal row."""
+    cls = _FAILURE_CLASSES.get(error_type)
+    if cls is not None:
+        return cls(message, extra=extra)
+    exc = _EffectFailure(message, extra=extra)
+    exc.error_type = error_type or "EffectError"
+    return exc
+
+
 class _Parked(Exception):
     """Phase 07 signal (not a failure): the effect parked the run. Carries
     the `parked_on` the service wrote; the loop stops driving segments."""
@@ -143,6 +163,40 @@ class _RunState:
     name: str
     version: int
     chain: list[str]
+    # phase 08: every vault credential a tool effect resolved in this run
+    # (name → value) — `run()`'s return value is scrubbed against it before
+    # it is persisted as `playbook_runs.result` (a resolved secret never
+    # leaves the run as data; the literal `vault:<name>` takes its place).
+    secrets: dict[str, str] = field(default_factory=dict)
+
+
+def scrub_secrets(value: Any, secrets: dict[str, str]) -> Any:
+    """phase 08: replace every occurrence of a resolved vault value inside
+    `value` (strings, nested lists/dicts, dict keys included) with the
+    literal `vault:<name>`. Longest values first so a secret that contains
+    another is replaced whole."""
+    pairs = sorted(
+        ((v, f"vault:{k}") for k, v in (secrets or {}).items() if isinstance(v, str) and v),
+        key=lambda p: -len(p[0]),
+    )
+    if not pairs:
+        return value
+
+    def _scrub(x: Any) -> Any:
+        if isinstance(x, str):
+            for secret, ref in pairs:
+                if secret in x:
+                    x = x.replace(secret, ref)
+            return x
+        if isinstance(x, dict):
+            return {_scrub(k) if isinstance(k, str) else k: _scrub(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [_scrub(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(_scrub(v) for v in x)
+        return x
+
+    return _scrub(value)
 
 
 @dataclass
@@ -535,9 +589,22 @@ class SegmentLoop:
             handled = res.get("handled")
             if isinstance(handled, list) and handled:
                 # phase 03: replayed failures the code caught and proceeded past
-                await self.journal.mark_handled(run_id, [int(s) for s in handled])
+                seqs = [int(s) for s in handled]
+                await self.journal.mark_handled(run_id, seqs)
             if kind == "return":
-                result.value = res.get("value")
+                value = res.get("value")
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    # phase 08: the shim normalises to JSON before returning;
+                    # this is the host-side guard for a shim that did not
+                    raise V2RunError(
+                        f"return value is not JSON: {type(value).__name__}", "TypeError",
+                    )
+                state = self._runs.get(run_id)
+                if state is not None and state.secrets:
+                    value = scrub_secrets(value, state.secrets)
+                result.value = value
                 if parent_id is not None:
                     self._values[run_id] = result.value
                 return result
@@ -792,7 +859,17 @@ class SegmentLoop:
             # phase 07: a `{"_event_timeout": true}` stub answers wait_event
             # with the timeout failure — the one dry answer that raises
             raise _EventTimeout(
-                f"no '{args.get('name')}' event within {args.get('timeout')}s (dry stub)"
+                f"no '{args.get('name')}' event within {args.get('timeout')}s (dry stub)",
+                extra=extra,
+            )
+        recorded = extra.pop("raise", None)
+        if recorded:
+            # phase 08: a `{"_raise": {type, message}}` stub (what
+            # `stubs_from_run` derives from a failed journal row) replays the
+            # recorded failure — the jail sees the same exception class; the
+            # failed journal row keeps `stubbed`/`stub_key` like a value would
+            raise _dry_failure(
+                str(recorded.get("type")), str(recorded.get("message")), extra=extra,
             )
         return result, None, extra
 
@@ -1005,6 +1082,11 @@ class SegmentLoop:
                 raise
         extra = {"child_run_id": str(child.id)} if child is not None else None
         value = self._values.pop(str(child.id), None) if child is not None else None
+        if child is not None and not timed_out:
+            # phase 08: the child's PERSISTED `result` (secrets scrubbed) is
+            # what the parent receives; the in-memory value is the fallback
+            # for a child row that was never persisted (test doubles)
+            value = await self._persisted_result(child.id, value)
         if timed_out:
             raise _EffectTimeout(
                 f"effect '{key}' (subtask {name}) timed out after {timeout:g}s", extra=extra,
@@ -1031,6 +1113,18 @@ class SegmentLoop:
                 )
             value = {k: value[k] for k in returns}
         return value, {"subtask": name, "run_id": str(child.id), "result": value}, extra
+
+    async def _persisted_result(self, child_id: Any, fallback: Any) -> Any:
+        from ..models import PlaybookRun
+
+        try:
+            async with self._sf() as session:
+                row = await session.get(PlaybookRun, child_id)
+        except Exception:  # noqa: BLE001 — a double session factory
+            return fallback
+        if row is None or getattr(row, "status", None) != "done":
+            return fallback
+        return getattr(row, "result", None)
 
     # ------------------------------------------------------------ approve
     async def _effect_approve(
@@ -1180,9 +1274,12 @@ class SegmentLoop:
             raise _ToolError(
                 f"effect '{key}': unknown tool '{name}' — it is not in the tool registry."
             ) from None
+        state = self._runs.get(str(run.id))
         try:
             call_args = await resolve_vault_refs(
                 getattr(self._ctx, "vault", None), call_args, step_id=key,
+                # phase 08: the run remembers what it resolved (result scrub)
+                cache=state.secrets if state is not None else None,
             )
         except ValueError as e:
             raise _ToolError(str(e)) from None

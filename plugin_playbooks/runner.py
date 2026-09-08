@@ -175,10 +175,14 @@ def _iter_strings(value: Any):
             yield from _iter_strings(v)
 
 
-async def resolve_vault_refs(vault: Any, args: Any, *, step_id: str) -> Any:
+async def resolve_vault_refs(
+    vault: Any, args: Any, *, step_id: str, cache: dict[str, str] | None = None,
+) -> Any:
     """plans/031 vault-ref resolution on a COPY of `args` (see
     `PlaybookRunner._resolve_vault_refs`); shared with the v2 segment loop
-    (plans/032 phase 02) so both runtimes resolve refs identically."""
+    (plans/032 phase 02) so both runtimes resolve refs identically.
+    `cache` (phase 08): a caller-owned name → value dict that outlives the
+    call — the v2 loop keeps one per run to scrub `run()`'s return value."""
     if not any(_VAULT_REF_RE.match(s) for s in _iter_strings(args)):
         return args
     if vault is None:
@@ -186,7 +190,8 @@ async def resolve_vault_refs(vault: Any, args: Any, *, step_id: str) -> Any:
             f"Step '{step_id}': arguments use a vault:<name> reference "
             "but no vault is available to the playbook runtime."
         )
-    cache: dict[str, str] = {}
+    if cache is None:
+        cache = {}
 
     async def resolve(value: Any) -> Any:
         if isinstance(value, str):
@@ -598,7 +603,7 @@ class PlaybookRunner:
                 # phase 07: the row is `parked`; ParkService owns it now
                 run.status = "parked"
                 return
-            await self._complete_run(run.id, "done")
+            await self._complete_run(run.id, "done", result=res.value)
             run.status = "done"
         except V2RunError as e:
             # docs/v2.md §6/§7: an uncaught OutcomeUnknown ends the run
@@ -688,6 +693,10 @@ class PlaybookRunner:
                 conversation_id=conversation_id,
                 report_to=report_to,
                 is_test=is_test,
+                # plans/032 phase 08: the runtime this run executes under,
+                # decided ONCE here from the object being run (a candidate
+                # shim carries its version row's format).
+                format="python" if _is_python_playbook(playbook) else "pblang",
             )
             session.add(run)
             await session.commit()
@@ -731,7 +740,13 @@ class PlaybookRunner:
         # definition is a checker summary, never a PlaybookDef — so the v2
         # branch precedes model_validate). Rows without the column (phase
         # 02's test rows, transient shims) fall back to sniffing the code.
-        is_python = _is_python_playbook(playbook)
+        # plans/032 phase 08: the run row's `format` (stamped by _create_run)
+        # is authoritative; the sniff only covers a row without the stamp.
+        run_format = getattr(run, "format", None)
+        is_python = (
+            run_format == "python" if run_format in ("python", "pblang")
+            else _is_python_playbook(playbook)
+        )
         definition = None if is_python else PlaybookDef.model_validate(playbook.definition)
         # 0.26.0 (plans/015, 089 §1): the stamped report_to is authoritative
         # for chat delivery. plans/016 phase 2: no origin fallback — a
@@ -760,7 +775,7 @@ class PlaybookRunner:
                     # phase 07: the row is `parked`; ParkService owns it now
                     run.status = "parked"
                     return
-                await self._complete_run(run.id, "done")
+                await self._complete_run(run.id, "done", result=res.value)
                 run.status = "done"
                 return
             if not definition.steps:
@@ -1695,13 +1710,17 @@ class PlaybookRunner:
     async def _complete_run(
         self, run_id: Any, status: str, error: str | None = None,
         error_type: str | None = None, traceback: str | None = None,
-        failed_at: datetime | None = None,
+        failed_at: datetime | None = None, result: Any = None,
     ) -> None:
         async with self._sf() as session:
             run = await session.get(PlaybookRun, run_id)
             if run:
                 run.status = status
                 run.completed_at = datetime.now(timezone.utc)
+                # plans/032 phase 08: what `run()` returned (python runs;
+                # secrets already scrubbed by the loop). v1 runs pass None.
+                if result is not None:
+                    run.result = result
                 # plans/032 phase 02 (docs/v2.md §7): the error contract
                 # columns. v1 runs land `error` only; v2 fills all four.
                 if error is not None:
@@ -1769,6 +1788,9 @@ class PlaybookRunner:
                 "conversation_id": str(conversation_id) if conversation_id else None,
                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
                 "wake_on_complete": wake_on_complete,
+                # plans/032 phase 08: the additive LAST key — `run()`'s return
+                # value for a done python run, None for v1 and failed runs.
+                "result": result,
             })
         finally:
             _active_run_id.reset(token)

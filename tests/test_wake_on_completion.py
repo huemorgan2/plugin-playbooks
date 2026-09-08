@@ -190,6 +190,7 @@ def _payload(**over):
         "conversation_id": None,
         "parent_run_id": None,
         "wake_on_complete": False,
+        "result": None,
     }
     base.update(over)
     return base
