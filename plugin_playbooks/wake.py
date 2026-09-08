@@ -42,7 +42,7 @@ def _aware(dt: datetime) -> datetime:
     # sqlite returns naive datetimes; stored values are UTC
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-from .models import PlaybookStepRun, PlaybookWatch
+from .models import FAILED_RUN_STATUSES, PlaybookStepRun, PlaybookWatch
 from .publish import ops_conversation_id
 
 log = logging.getLogger(__name__)
@@ -54,6 +54,22 @@ _WAKE_TIMEOUT_S = 900.0
 # Step outputs are inlined into the moment body up to this cap; beyond it the
 # agent is steered to playbook_status for the full trace.
 _OUTPUTS_CAP = 4000
+
+# plans/032 phase 08: a `timed_out_unknown` run (docs/v2.md §6) reads as a
+# failure everywhere — plus this sentence, so nobody re-runs blind.
+_OUTCOME_UNKNOWN_LINE = (
+    "Outcome unknown — an effect was in flight when the process died and "
+    "its result was never recorded. Do NOT assume it did or did not "
+    "happen; check the target system before re-running."
+)
+
+
+def _failure_lines(payload: dict[str, Any]) -> list[str]:
+    status = payload.get("status") or ""
+    lines = [f"Error: {payload.get('error') or 'not recorded'}"]
+    if status == "timed_out_unknown":
+        lines.append(_OUTCOME_UNKNOWN_LINE)
+    return lines
 
 
 class RunCompletionWake:
@@ -159,7 +175,7 @@ class RunCompletionWake:
             return
 
         origin = payload.get("conversation_id")
-        failed = (payload.get("status") or "") == "failed"
+        failed = (payload.get("status") or "") in FAILED_RUN_STATUSES
         trigger = payload.get("trigger") or ""
         # Failure moments in the ops chat belong to FixProposalService.
         ops = await ops_conversation_id(self._ctx) if failed else None
@@ -213,8 +229,8 @@ class RunCompletionWake:
         ]
         if note:
             lines.append(f"Your note when you set the watch: {note}")
-        if status == "failed":
-            lines.append(f"Error: {payload.get('error') or 'not recorded'}")
+        if status in FAILED_RUN_STATUSES:
+            lines.extend(_failure_lines(payload))
             lines.append("")
             lines.append(
                 "Report the failure to the owner honestly — do NOT fabricate "
@@ -271,8 +287,8 @@ class RunCompletionWake:
             f"with status '{status}' after {duration_s}s.",
             f"Run: {run_id}",
         ]
-        if status == "failed":
-            lines.append(f"Error: {payload.get('error') or 'not recorded'}")
+        if status in FAILED_RUN_STATUSES:
+            lines.extend(_failure_lines(payload))
             lines.append("")
             lines.append(
                 "Report the failure to the owner honestly — do NOT fabricate "
@@ -329,8 +345,8 @@ class RunCompletionWake:
             f"Background run of '{name}' finished: {status} "
             f"(trigger: {payload.get('trigger') or '?'}, run {run_id})."
         )
-        if status == "failed":
-            body += f" Error: {payload.get('error') or 'not recorded'}"
+        if status in FAILED_RUN_STATUSES:
+            body += " " + " ".join(_failure_lines(payload))
         try:
             await send(
                 f"Playbook run {status}: {name}",

@@ -25,7 +25,7 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import PlaybookRun, PlaybookStepRun
+from .models import FAILED_RUN_STATUSES, PlaybookRun, PlaybookStepRun
 
 log = logging.getLogger("luna.plugin.playbooks.publish")
 
@@ -80,7 +80,10 @@ async def latest_run_evidence(
         .where(
             PlaybookRun.playbook_id == playbook_id,
             PlaybookRun.playbook_version == version,
-            PlaybookRun.status.in_(("done", "failed")),
+            # plans/032 phase 08: `timed_out_unknown` is a finished, failed
+            # run here (it rides the failed slot below, never the evidence
+            # slot); `parked` is neither and is named by _parked_run.
+            PlaybookRun.status.in_(("done", *FAILED_RUN_STATUSES)),
         )
         .order_by(PlaybookRun.started_at.desc())
         .limit(1)
@@ -252,7 +255,14 @@ async def test_run_gate(
         )).scalar_one_or_none()
         gate = {
             "gate": "test_run", "ok": False,
-            "note": f"latest test of version {version} FAILED (run {run.id})",
+            "note": (
+                f"latest test of version {version} FAILED (run {run.id})"
+                + (
+                    " — outcome unknown: an effect was in flight when the "
+                    "process died; check the target system"
+                    if run.status == "timed_out_unknown" else ""
+                )
+            ),
         }
         if not require:
             # plans/022 P1: the failed run is NOT evidence — it rides in the

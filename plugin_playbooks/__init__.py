@@ -539,12 +539,16 @@ async def failure_digest(session) -> list[dict]:
     """
     from sqlalchemy import case, func, select
 
-    from .models import Playbook, PlaybookRun, PlaybookVersion
+    from .models import FAILED_RUN_STATUSES, Playbook, PlaybookRun, PlaybookVersion
 
     eff_live = func.coalesce(func.nullif(Playbook.live_version, 0), Playbook.version)
-    failed = func.sum(case((PlaybookRun.status == "failed", 1), else_=0))
+    # plans/032 phase 08: `timed_out_unknown` (an effect in flight when the
+    # process died — docs/v2.md §6) is a failure here: the run ended without
+    # a green result and the owner must look. `parked` is neither finished
+    # nor failed anywhere.
+    failed = func.sum(case((PlaybookRun.status.in_(FAILED_RUN_STATUSES), 1), else_=0))
     finished = func.sum(
-        case((PlaybookRun.status.in_(("failed", "done")), 1), else_=0)
+        case((PlaybookRun.status.in_((*FAILED_RUN_STATUSES, "done")), 1), else_=0)
     )
     rows = (await session.execute(
         select(
@@ -584,7 +588,7 @@ async def failure_digest(session) -> list[dict]:
             .where(
                 PlaybookRun.playbook_id == pid,
                 PlaybookRun.playbook_version == live,
-                PlaybookRun.status == "failed",
+                PlaybookRun.status.in_(FAILED_RUN_STATUSES),
                 PlaybookRun.is_test.is_(False),
             )
             .order_by(PlaybookRun.started_at.desc())
@@ -608,6 +612,9 @@ async def failure_digest(session) -> list[dict]:
             # plans/032 phase 04: the run's one-liner (docs/v2.md §7) so the
             # digest names the failure, not just the count
             "error": (getattr(last, "error", None) or None) if last else None,
+            # plans/032 phase 08: `OutcomeUnknown` names a timed_out_unknown
+            # run — the owner must check the target system, not just re-run
+            "error_type": (getattr(last, "error_type", None) or None) if last else None,
             "promoted_at": promoted_at,
         })
     return out
@@ -624,6 +631,8 @@ def render_failure_section(digest: list[dict], now: datetime | None = None) -> s
             f", promoted {_rel_age(d['promoted_at'], now)}" if d["promoted_at"] else ""
         )
         error = d.get("error")
+        if d.get("error_type") == "OutcomeUnknown" and not (error or "").startswith("OutcomeUnknown"):
+            error = f"OutcomeUnknown: {error}" if error else "OutcomeUnknown"
         lines.append(
             f"- `{d['name']}`: {d['failed']} of {d['finished']} runs FAILED "
             f"since its last change (v{d['live_version']}{promoted}). "

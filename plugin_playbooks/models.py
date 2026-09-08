@@ -28,6 +28,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# plans/032 phase 08: the run statuses every consumer counts as a FAILURE —
+# `failed`, and `timed_out_unknown` (an effect was in flight when the process
+# died and its result was never recorded, docs/v2.md §6: the owner must look).
+# `parked` and `running` are never finished or failed; `cancelled` is neither.
+FAILED_RUN_STATUSES: tuple[str, ...] = ("failed", "timed_out_unknown")
+
+
 class Playbook(Base):
     __tablename__ = "playbooks"
 

@@ -24,7 +24,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .models import Playbook, PlaybookFixProposal, PlaybookRun, PlaybookStepRun
+from .models import (
+    FAILED_RUN_STATUSES, Playbook, PlaybookFixProposal, PlaybookRun, PlaybookStepRun,
+)
 from .publish import ops_conversation_id
 from .versioning import live_version_of
 
@@ -92,7 +94,10 @@ class FixProposalService:
     async def _on_completed(self, payload: Any) -> None:
         if not isinstance(payload, dict):
             return
-        if payload.get("status") != "failed" or payload.get("is_test"):
+        # plans/032 phase 08: `timed_out_unknown` files a proposal like a
+        # failure (error_type OutcomeUnknown rides on the card); `parked`
+        # never reaches here (no completion event) and is never a failure.
+        if payload.get("status") not in FAILED_RUN_STATUSES or payload.get("is_test"):
             return
         task = asyncio.create_task(
             self._file_proposal(payload), name="playbook-fix-proposal",
@@ -174,6 +179,10 @@ class FixProposalService:
                 "run_id": str(run.id),
                 "version": run.playbook_version,
                 "error": (error or "")[:400],
+                # plans/032 phase 08: `OutcomeUnknown` on a timed_out_unknown
+                # run — the wake says so; the fixer checks the target first
+                "error_type": getattr(run, "error_type", None),
+                "status": run.status,
             }
             playbook_name = playbook.name
             if existing is not None:
@@ -247,6 +256,17 @@ class FixProposalService:
             + f". It has now failed {times}.",
             f"Run: {card.get('run_id', '?')} (version {card.get('version', '?')})",
             f"Error: {card.get('error') or 'not recorded'}",
+            *(
+                [
+                    "Outcome unknown (OutcomeUnknown): an effect was in flight "
+                    "when the process died and its result was never recorded — "
+                    "check the target system before assuming it did or did "
+                    "not happen.",
+                ]
+                if card.get("status") == "timed_out_unknown"
+                or card.get("error_type") == "OutcomeUnknown"
+                else []
+            ),
             "",
             "Investigate now: playbook_status(run_id) shows the failing "
             "trace. If a change is needed, fix the candidate, test it for "

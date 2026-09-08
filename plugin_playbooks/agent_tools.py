@@ -648,15 +648,10 @@ def build_tools(
                     playbook.code = stored_code
                     playbook.format = fmt
                     playbook.manifest = manifest
-                elif playbook.format != fmt:
-                    return json.dumps({
-                        "error": (
-                            f"Playbook '{name}' exists (archived) as "
-                            f"{playbook.format}; changing a playbook's format "
-                            "is not supported yet — pick a new name."
-                        ),
-                        "format": playbook.format,
-                    })
+                # phase 08: a live version in the OTHER language is fine —
+                # the live fields keep their format; the candidate row below
+                # carries its own (`format=fmt`) and publish flips the live
+                # format via _apply_version_to_live.
                 await session.flush()
             else:
                 playbook = Playbook(
@@ -681,6 +676,7 @@ def build_tools(
                 definition=defn, code=stored_code,
                 manifest=manifest or playbook.manifest or "",
                 author="agent", message="candidate",
+                format=fmt,  # phase 08: the candidate row's own language
             )
             playbook.candidate_version = playbook.version
             await session.commit()
@@ -1964,7 +1960,10 @@ def build_tools(
                     "version": {"type": "integer", "description": "Only runs of this version"},
                     "status": {
                         "type": "string",
-                        "enum": ["running", "parked", "done", "failed", "cancelled"],
+                        "enum": [
+                            "running", "parked", "done", "failed", "cancelled",
+                            "timed_out_unknown",
+                        ],
                     },
                     "limit": {"type": "integer", "default": 10, "maximum": 50},
                 },
