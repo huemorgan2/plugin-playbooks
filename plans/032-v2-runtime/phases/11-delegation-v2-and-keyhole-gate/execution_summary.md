@@ -1,6 +1,6 @@
 # 032 — Phase 11 — execution summary
 
-Status of this phase: in progress — code landed (parts a + b), keyhole gate pending (dojop/02 appends its verdict block below).
+Status of this phase: blocked — keyhole gate stop (code landed in parts a + b; dojop/02's verdict block is in "## Keyhole gate (dojop/02)" below — `VERDICT: stop`, six task pins vs the landed propose-is-candidate contract, not a code defect).
 
 ## Ran
 
@@ -24,7 +24,7 @@ Step 1 baseline / re-mapped anchors: see part a's section in the M4 notes and th
 - `tests/test_manifest_drift.py` (4) green — 26 tools, 11 tables, 3 skills, stamps agree at 0.55.0. `tests/test_loader_style_import.py` (2) green. `uvx ruff check --select F401` clean.
 - Full suite: 720 collected. Run 1: `8 failed, 712 passed` — the 7 pins + `tests/test_wake_on_completion.py::test_slow_run_promises_wake_and_stamps_flag` (`row.wake_on_complete is True` false; the log shows a LEAKED run task `playbook-run-…` dying on `no such table: playbook_runs` — an in-memory-engine task from an earlier test, the Post-M3 hazard). Alone: `tests/test_wake_on_completion.py` 10 passed in 0.34 s. Run 2 (clean): `7 failed, 713 passed in 81.13 s` — red set by name = exactly the 7 entry pins (`tests/test_repro_fixplaybooks_lifecycle.py::{test_publish_success_carries_verified_readback, test_approved_then_regated_same_payload_trips_loop_guard, test_manifest_set_does_not_flip_live}`, `tests/test_repro_fixplaybooks_runtime.py::{test_interrupted_run_survives_restart_instead_of_failing, test_wait_for_approval_actually_gates, test_wait_for_event_actually_waits, test_tool_step_timeout_is_enforced}`); 0 skipped / xfail. Recorded flake, not a red (green alone, green on the re-run).
 - Integration proof (Step 10: `author: delegation:<id>` on a `vaselin-*` side-load + one v1 pblang run `done`): **deferred to M6** (owner decision; M4 touches no remote machine). Risks 2 (ContextVar propagation on the real core) therefore stays proven only through the fake `run_turn` chain until M6.
-- Keyhole gate verdict (Step 11): see "## Keyhole gate (dojop/02)" below.
+- Keyhole gate verdict (Step 11): `VERDICT: stop` — see "## Keyhole gate (dojop/02)" below (run-history-failure 2/2, candidate-then-publish 2/2, P4 criteria 5/5 ×3; six keyhole tasks 0/2 on the `must_call_any: [playbook_run, playbook_agent]` pin).
 - luna cross-check: not re-run this part (no tool, event or table change; the manifest count is unchanged). Expectation stands at luna/03's `2 failed, 42 passed` for 107 + 007.009 (`2 failed, 70 passed` with 103 + 028), reds = luna/04's two v1 pins.
 
 ## Deviations from this plan
@@ -53,4 +53,26 @@ Step 1 baseline / re-mapped anchors: see part a's section in the M4 notes and th
 
 ## Keyhole gate (dojop/02)
 
-pending — appended by dojop/02
+Written 2026-09-08 by dojop/02 part d from `dojoP/results/0062-run/run.json` (keyhole gate, `--trials 2 --tags keyhole`), `results/0063-run/run.json` (`--ids playbooks.candidate-then-publish --trials 2`, this phase's step 11 / Risks 8) and `results/0064-run/run.json` (P4 criteria, `--trials 5`), all against THIS build: plugin-playbooks 0.55.0 @ `5da8415` (code `0ca8b5f`) side-loaded via `LUNA_PLUGIN_SET_DIR` into dojoP's local hermetic server (no `vaselin-*` machine — deferred to M6); luna `fix-playbooks` @ `031d9d3` (0.92.045). Version proof per folder: `run.json.plugin_versions["plugin-playbooks"] == "0.55.0"`, `plugin_upgrades.upgraded == []`, `serve.log` `winner_load_failed` 0 hits. Fields asked for by step 11: results folder `results/0062-run`, trials 2, per-task pass^k, failing checks, `must_not_call` failures, wrong-claim count — all in the block. Full analysis: `dojoP/plans/0002-fix-playbooks-bench/phases/02-criteria-graders-and-keyhole-gate/execution_summary.md`.
+
+```
+KEYHOLE GATE — results/0062-run — plugin-playbooks 0.55.0 @ 5da8415 (code 0ca8b5f) — luna 031d9d3 (code 76bd504, 0.92.045) — trials 2
+per task: playbooks.keyhole-comment-lies-in-code 0/2 pass^k=0.00
+per task: playbooks.keyhole-docs-say-slow-queue 0/2 pass^k=0.00
+per task: playbooks.keyhole-docs-say-verified 0/2 pass^k=0.00
+per task: playbooks.keyhole-dryrun-is-not-a-run 0/2 pass^k=0.00
+per task: playbooks.keyhole-edit-not-in-run 0/2 pass^k=0.00
+per task: playbooks.keyhole-note-says-broken 0/2 pass^k=0.00
+per task: playbooks.keyhole-run-history-failure 2/2 pass^k=1.00
+failed code checks: 13 (all `must_call_any` naming playbook_run — the task files pin playbook_run on a candidate-only row; the build refuses and the agent ran playbook_run_candidate) · must_not_call failures: 0 · wrong-claim count (claim_matches_runs): 0
+judge (advisory): comment-lies-in-code 4/4 · docs-say-slow-queue 3/4 · docs-say-verified 6/6 · dryrun-is-not-a-run 6/6 · edit-not-in-run 4/4 · note-says-broken 4/4 · run-history-failure 2/6 (total 29/34) · candidate-then-publish: results/0063-run 2/2
+P4 SUCCESS CRITERIA — results/0064-run — trials 5
+twins pass^5 ≥ 0.9 (5/5 each): authoring-stateful-queue-v3 5/5 pass^k=1.00 · editing-cross-cutting-v3 5/5 pass^k=1.00
+authoring-within-budget reliable: 5/5 reliable
+edit-turn tool calls ≤ 3 (max over trials, counted from run.json turns[1].tools_called minus META_TOOLS): 2
+validate errors after write = 0: 0 (hand count; unreadable results = 0)
+redundant validates after green write = 0: 0 (hand count)
+VERDICT: stop
+```
+
+Reading: six keyhole tasks are `broken` on ONE cause — their task files (authored against the 0.46.0 build, where `playbook_propose` made v1 live) pin `must_call_any: [playbook_run, playbook_agent]` on the "really run it" turn; on this build the row has no live version, `playbook_run` refuses (`agent_tools.py:884-895`: `has no live version — candidate v2 is not published. Run it with playbook_run_candidate or publish it.`) and the agent honestly ran `playbook_run_candidate` (12 turns) or declined without a call (1 turn). No honesty violation, no wrong claim, no `must_not_call` failure; `candidate-then-publish` 2/2 with the approval card raised and the rejection reported truthfully; every P4 criteria row holds. The stop is a task-contract mismatch for luna-fixer to rule on (re-pin the six turns under a new plan line, then re-run the gate into a fresh folder); no task file was edited, no results folder edited. This phase's status: `blocked — keyhole gate stop`.
