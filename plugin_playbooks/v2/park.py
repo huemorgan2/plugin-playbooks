@@ -43,6 +43,26 @@ log = logging.getLogger("luna.plugins.playbooks.v2.park")
 
 PARK_KINDS = frozenset({"approve", "wait_event"})
 
+# plans/032 phase 08: the per-run owner card (`playbook_run` on an
+# `agent_must_confirm` playbook) parks the run BEFORE effect 1 — a row-only
+# park: `parked_on["gate"] == RUN_GATE`, no journal entry (a python run has no
+# entry 0 yet; a pblang run has no journal at all).
+RUN_GATE = "run"
+
+
+def label_test_run(request_kw: dict[str, Any], run: Any) -> None:
+    """plans/032 phase 08 (Risks 10): every card an `is_test` run raises —
+    `playbook_effect` (`ctx.approve`) and `playbook_run` — is labelled on
+    the ADVISORY surfaces only: `presentation["eyebrow"]` and a `summary`
+    prefix. `payload` is identity (dedupe/supersede) and stays untouched."""
+    if not getattr(run, "is_test", False):
+        return
+    label = f"test run of candidate v{getattr(run, 'playbook_version', None)}"
+    presentation = request_kw.get("presentation")
+    if isinstance(presentation, dict):
+        presentation["eyebrow"] = label
+    request_kw["summary"] = f"[{label}] {request_kw.get('summary') or ''}"
+
 # Card expiry has no bus signal: the timer polls `approvals.get()` and, when
 # the engine still says `pending` (no sweeper — the in-memory engine), releases
 # the card itself after `EXPIRY_POLLS` × `EXPIRY_POLL_S` (Risks 3).
@@ -125,6 +145,10 @@ class ParkService:
         # their `approval.decided` echo must not resume anything
         self._muted: set[str] = set()
         self._unsub_decided: Callable[[], Any] | None = None
+        # phase 08: run-gate parks awaited IN a task (a pblang run keeps its
+        # task alive) — run_id -> future resolved with ("done", payload) or
+        # ("failed", (error_type, message)) by `_resume` / `release`
+        self._waiters: dict[str, asyncio.Future] = {}
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -182,6 +206,70 @@ class ParkService:
         log.info("playbook.v2.park.approval run_id=%s effect=%s approval=%s due=%s", run.id, effect_id, approval_id, parked_on["due_at"])
         return None, parked_on
 
+    async def park_run(
+        self, run: Any, request_kw: dict[str, Any], *, in_task: bool = False,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """plans/032 phase 08: the per-run owner card — a ROW-ONLY park
+        (`parked_on["gate"] == RUN_GATE`, no journal entry) raised before the
+        run's first effect. Same return shape as `park_approval`: (decision,
+        None) when the engine answered inline (or has no `request_nowait`),
+        else (None, parked_on) after the row is stamped and the deadline armed.
+
+        `in_task=True` (a pblang run): the caller's task stays alive and
+        awaits `wait_run(run_id)`; the future is created BEFORE the card is
+        raised so an inline-dispatched decision can never miss it."""
+        run_id = str(run.id)
+        approvals = getattr(self._ctx, "approval", None)
+        nowait = getattr(approvals, "request_nowait", None) if approvals is not None else None
+        if not callable(nowait):
+            log.info("playbook.v2.park: approval engine has no request_nowait — in-process run card (run %s)", run_id)
+            return await approvals.request(**request_kw), None
+        if in_task:
+            self._waiters[run_id] = asyncio.get_running_loop().create_future()
+        try:
+            decision = await nowait(**request_kw)
+        except BaseException:
+            self._waiters.pop(run_id, None)
+            raise
+        if getattr(decision, "decision", None) != "pending":
+            self._waiters.pop(run_id, None)
+            return decision, None
+        approval_id = str(getattr(decision, "request_id", None))
+        since = _now()
+        ttl = request_kw.get("ttl_seconds")
+        effect_deadline = since + timedelta(seconds=float(ttl)) if ttl else None
+        parked_on = {
+            "kind": "approval", "approval_id": approval_id,
+            "since": _iso(since), "due_at": _iso(self._due(run, effect_deadline)),
+            "gate": RUN_GATE,
+        }
+        await self._write_row_park(run, parked_on)
+        self._index[approval_id] = run_id
+        self._arm(run_id, parked_on["due_at"])
+        log.info("playbook.v2.park.run run_id=%s approval=%s due=%s", run_id, approval_id, parked_on["due_at"])
+        return None, parked_on
+
+    async def wait_run(self, run_id: Any) -> tuple[str, Any]:
+        """The in-task half of `park_run(in_task=True)`: block until the
+        owner decides (or the park is released). → ("done", payload) or
+        ("failed", (error_type, message)); the service has already completed
+        the run row on "failed" — the caller just returns."""
+        fut = self._waiters.get(str(run_id))
+        if fut is None:
+            return "failed", ("RunLost", "run card wait has no waiter")
+        try:
+            return await fut
+        finally:
+            if self._waiters.get(str(run_id)) is fut:
+                self._waiters.pop(str(run_id), None)
+
+    def _settle_waiter(self, run_id: str, outcome: tuple[str, Any]) -> bool:
+        fut = self._waiters.pop(run_id, None)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(outcome)
+        return True
+
     async def park_event(
         self, run: Any, seq: int, effect_id: str, name: str, filter: dict[str, Any] | None, timeout: float,
     ) -> dict[str, Any]:
@@ -210,9 +298,12 @@ class ParkService:
     async def _write_park(self, run: Any, seq: int, parked_on: dict[str, Any]) -> None:
         """Journal first (the entry goes `parked`, so `in_flight()` never
         returns it), then the run row."""
+        await self._journal.park(str(run.id), int(seq), parked_on)
+        await self._write_row_park(run, parked_on)
+
+    async def _write_row_park(self, run: Any, parked_on: dict[str, Any]) -> None:
         from ..models import PlaybookRun
 
-        await self._journal.park(str(run.id), int(seq), parked_on)
         async with self._sf() as session:
             row = await session.get(PlaybookRun, run.id)
             if row is not None:
@@ -413,6 +504,8 @@ class ParkService:
             row.parked_on = None
             await session.commit()
         self._forget(run_id, parked_on)
+        if parked_on.get("gate") == RUN_GATE:
+            return await self._resume_run_gate(run_id, parked_on, done=done, failed=failed)
         entry = await self._parked_entry(run_id)
         if entry is not None:
             seq = int(entry["seq"])
@@ -442,6 +535,58 @@ class ParkService:
         log.info("playbook.v2.park.resume run_id=%s outcome=%s", run_id, "done" if failed is None else failed[0])
         self._spawn(run)
         return True
+
+    async def _resume_run_gate(
+        self, run_id: str, parked_on: dict[str, Any], *, done: Any, failed: tuple[str, str] | None,
+    ) -> bool:
+        """plans/032 phase 08: the per-run card was decided (the row is
+        already `running`). No journal entry to close. Rejection / expiry
+        completes the run `failed` HERE (both formats — `playbook.run.completed`
+        fires, the wake delivers it); approval hands a pblang run back to its
+        waiting task, and spawns a python run's first segment (phase 06's
+        `_resume_run` drives it fresh: no entry 0 exists yet)."""
+        approval_id = parked_on.get("approval_id")
+        if failed is not None:
+            error_type, message = failed
+            if error_type == "Rejected":
+                error = f"run rejected by owner card #{approval_id}"
+                if message and message != "rejected":
+                    error += f": {message}"
+            elif error_type == "ApprovalExpired":
+                error = f"owner card #{approval_id} expired before a decision ({message})"
+            else:
+                error = message
+            log.info("playbook.v2.park.run_gate run_id=%s outcome=%s", run_id, error_type)
+            if self._complete_run is not None:
+                await self._complete_run(
+                    _uuid(run_id), "failed", error=error, error_type=error_type, failed_at=_now(),
+                )
+            # the row is terminal before the pblang task is released
+            self._settle_waiter(run_id, ("failed", (error_type, error)))
+            return True
+        if self._settle_waiter(run_id, ("done", done)):
+            log.info("playbook.v2.park.run_gate run_id=%s outcome=approved (in-task)", run_id)
+            return True
+        run = await self._load(run_id)
+        if run is None:
+            return False
+        if getattr(run, "format", "pblang") != "python":
+            # a pblang run's task died with the process (v1 parity, Risks 9)
+            await self._lost_v1_run(run_id, approval_id)
+            return True
+        log.info("playbook.v2.park.run_gate run_id=%s outcome=approved (spawn)", run_id)
+        self._spawn(run)
+        return True
+
+    async def _lost_v1_run(self, run_id: str, approval_id: Any) -> None:
+        if self._complete_run is not None:
+            await self._complete_run(
+                _uuid(run_id), "failed", error_type="RunLost", failed_at=_now(),
+                error=(
+                    f"parked on owner card #{approval_id} when the process restarted — "
+                    "a pblang run does not survive a restart"
+                ),
+            )
 
     @staticmethod
     def _outputs(entry: dict[str, Any], done: Any) -> Any:
@@ -483,6 +628,9 @@ class ParkService:
             row.parked_on = None
             await session.commit()
         self._forget(run_id, parked_on)
+        # phase 08: a pblang run awaiting its per-run card returns quietly;
+        # the caller completes the row
+        self._settle_waiter(run_id, ("failed", (error_type, message)))
         if parked_on.get("kind") == "approval":
             await self._decide(
                 getattr(self._ctx, "approval", None), str(parked_on.get("approval_id")),
@@ -529,6 +677,15 @@ class ParkService:
             kind = po.get("kind")
             due = _parse(po.get("due_at"))
             n += 1
+            if po.get("gate") == RUN_GATE and getattr(row, "format", "pblang") != "python":
+                # phase 08 (Risks 9): a pblang run's in-task card wait died
+                # with the process — the card is released, the run fails
+                await self._fail_loudly(
+                    run_id, "RunLost",
+                    f"parked on owner card #{po.get('approval_id')} when the process restarted — "
+                    "a pblang run does not survive a restart",
+                )
+                continue
             if kind == "event":
                 if due is not None and due <= _now():
                     await self.on_due(run_id)

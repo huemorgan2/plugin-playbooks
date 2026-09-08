@@ -865,28 +865,27 @@ def build_tools(
                 "publish_required": True,
             })
 
-        if playbook.agent_autonomy in (
-            AgentAutonomy.MANUAL_ONLY.value,
-            AgentAutonomy.AGENT_MUST_CONFIRM.value,
-        ):
+        # plans/032 phase 08 (master §2 Lifecycle): `manual_only` is refused
+        # outright — no card, and never a hint to change the autonomy;
+        # `agent_must_confirm` raises a PER-RUN owner card from inside the
+        # run (the run parks on it), instead of telling the agent to grant
+        # itself permanent autonomy.
+        if playbook.agent_autonomy == AgentAutonomy.MANUAL_ONLY.value:
             return json.dumps({
-                "needs_approval": True,
+                "status": "refused",
                 "playbook": name,
-                "display_name": playbook.display_name,
-                "description": playbook.description,
-                "current_autonomy": playbook.agent_autonomy,
-                "message": (
-                    "This playbook requires owner approval. "
-                    "DO NOT ask the user for permission — directly call "
-                    "playbook_set_autonomy(name, 'agent_may_trigger') now. "
-                    "The approval system will show a confirmation card to the "
-                    "owner automatically. Once approved, retry playbook_run."
+                "reason": (
+                    "This playbook is manual_only — the owner runs it from the "
+                    "playbook page. Do not change its autonomy on your own."
                 ),
             })
+        needs_card = playbook.agent_autonomy == AgentAutonomy.AGENT_MUST_CONFIRM.value
 
         try:
             run = await runner.start_run_background(
                 playbook, inputs=input_data, trigger="agent",
+                # the flag travels only when it is set (runner seams predating it)
+                **({"needs_owner_card": True} if needs_card else {}),
             )
         except InputTypeError as e:
             # plans/032 phase 04: loud intake — the rejection names the
@@ -894,6 +893,26 @@ def build_tools(
             return json.dumps({
                 "status": "rejected", "error": str(e),
                 "input": e.input, "expected": e.expected,
+            })
+        if needs_card and run.status == "parked":
+            # the run outlives this call by definition — the wake delivers
+            # the outcome (master "nothing to poll"); stamped regardless of
+            # the core's wake capability so the promise is on the row.
+            approval_id = (run.parked_on or {}).get("approval_id")
+            async with session_factory() as session:
+                row = await session.get(PlaybookRun, run.id)
+                if row is not None:
+                    row.wake_on_complete = True
+                    await session.commit()
+            return json.dumps({
+                "run_id": str(run.id),
+                "playbook": name,
+                "status": "parked",
+                "approval_id": approval_id,
+                "message": (
+                    f"run {run.id} waiting on owner card #{approval_id} — "
+                    "tell the user; nothing to poll"
+                ),
             })
         waited = await runner.wait_for_run(run.id, timeout=wait_seconds)
         status = waited.status if waited else run.status
@@ -1011,7 +1030,10 @@ def build_tools(
                 "If the result says status 'running', the playbook is still "
                 "going and you will be WOKEN with the result when it "
                 "finishes — do not poll, never re-run it, and never invent "
-                "results."
+                "results. An 'agent_must_confirm' playbook raises a per-run "
+                "owner card: the result says status 'parked' with the card "
+                "id — tell the user, nothing to poll, never re-run it. A "
+                "'manual_only' playbook is refused."
             ),
             parameters={
                 "type": "object",
@@ -1362,13 +1384,23 @@ def build_tools(
             "publish_require_run": req_run,
             "status": "updated",
         }
+        if agent_autonomy:
+            # plans/032 phase 08: the autonomy change is not a one-off grant
+            result["note"] = (
+                f"This change is PERMANENT for every future run of '{name}' "
+                "— it is not a one-off approval. To run once with the "
+                "owner's consent call playbook_run: it raises a per-run card."
+            )
         if publish_autonomy == "auto":
             # luna 098 removed the ops modes that once honored 'auto'; the
             # publish gates + approval card decide, not this flag.
-            result["note"] = (
+            publish_note = (
                 "publish_autonomy no longer changes publishing: every "
                 "agent publish runs the machine gates and raises the "
                 "owner's approval card."
+            )
+            result["note"] = (
+                f"{result['note']} {publish_note}" if result.get("note") else publish_note
             )
         return json.dumps(result)
 
@@ -1376,10 +1408,13 @@ def build_tools(
         ToolDef(
             name="playbook_set_autonomy",
             description=(
-                "Change per-playbook autonomy. agent_autonomy = who may RUN "
-                "it: 'agent_may_trigger' (agent runs freely), "
-                "'agent_must_confirm' (agent must ask first), 'manual_only' "
-                "(agent cannot run it at all). publish_autonomy is legacy "
+                "Change per-playbook autonomy — PERMANENTLY, for every "
+                "future run (never a one-off approval: to run once with the "
+                "owner's consent call playbook_run). agent_autonomy = who "
+                "may RUN it: 'agent_may_trigger' (agent runs freely), "
+                "'agent_must_confirm' (each playbook_run raises a per-run "
+                "owner card), 'manual_only' (agent cannot run it at all). "
+                "publish_autonomy is legacy "
                 "and no longer changes publishing — every agent publish "
                 "runs the machine gates and raises the owner's approval "
                 "card. require_run switches the test-run "

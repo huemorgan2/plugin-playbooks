@@ -34,7 +34,7 @@ from .publish import ops_conversation_id as _ops_conversation_id
 from .v2 import MAX_DURATION_S, DbJournalStore, JournalStore, SegmentLoop
 from .v2.checker import sniff_format
 from .v2.loop import V2RunError, code_sha256
-from .v2.park import ParkService
+from .v2.park import ParkService, label_test_run
 from .versioning import get_version_row, shim_playbook
 
 log = logging.getLogger("luna.playbooks.runner")
@@ -390,6 +390,7 @@ class PlaybookRunner:
         trigger: str | None = None,
         parent_run_id: Any = None,
         is_test: bool = False,
+        needs_owner_card: bool = False,
     ) -> PlaybookRun:
         """Create a run and execute it in a background task.
 
@@ -397,18 +398,116 @@ class PlaybookRunner:
         real run_id up front — a slow playbook can never orphan a run behind
         a tool/HTTP timeout again. Pair with `wait_for_run` for a bounded
         wait, `playbook_status` for polling, `cancel_run` to stop it.
+
+        plans/032 phase 08 `needs_owner_card` (`playbook_run` on an
+        `agent_must_confirm` playbook): a per-run owner card is raised BEFORE
+        anything runs. Pending → the row is `parked` on it (`parked_on`
+        carries the card id) and the returned run says so: a python run has
+        no task until the owner decides (`ParkService` spawns its first
+        segment — restart-safe); a pblang run's task waits in-process for
+        the decision (lost on a restart — v1 parity). Rejected/expired →
+        `failed` (`Rejected` / `ApprovalExpired`). Approved inline (a grant)
+        → runs at once.
         """
         inputs = _coerce_inputs(playbook, inputs or {})
         run = await self._create_run(
             playbook, inputs=inputs, trigger=trigger,
             parent_run_id=parent_run_id, is_test=is_test,
         )
+        await_card = False
+        if needs_owner_card:
+            outcome = await self._raise_run_card(run, playbook, inputs)
+            if outcome == "failed":
+                return run
+            if outcome == "parked":
+                if run.format == "python":
+                    return run  # no task: the decision spawns the first segment
+                await_card = True
         task = asyncio.create_task(
-            self._drive_run(run, playbook, inputs),
+            self._drive_run(run, playbook, inputs, await_card=await_card),
             name=f"playbook-run-{run.id}",
         )
         self._track(run.id, task)
         return run
+
+    async def _raise_run_card(self, run: PlaybookRun, playbook: Playbook, inputs: dict[str, Any]) -> str:
+        """The per-run owner card (phase 08). → "approved" | "parked" |
+        "failed" (the row is completed here on "failed"; `run.status` /
+        `run.parked_on` mirror the row on every return)."""
+        request_kw = await self._run_card_kw(run, playbook, inputs)
+        try:
+            decision, parked_on = await self.park.park_run(
+                run, request_kw, in_task=run.format != "python",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — fail CLOSED: no card, no run
+            log.exception("playbook.run.card_failed run_id=%s", run.id)
+            error = f"owner card could not be raised: {type(e).__name__}: {e}"
+            await self._complete_run(
+                run.id, "failed", error=error, error_type="ApprovalUnavailable",
+                failed_at=datetime.now(timezone.utc),
+            )
+            run.status = "failed"
+            return "failed"
+        if parked_on is not None:
+            run.status = "parked"
+            run.parked_on = parked_on
+            await self._events.emit("playbook.run.parked", {
+                "run_id": str(run.id),
+                "playbook_id": str(run.playbook_id or ""),
+                "playbook_name": playbook.name,
+                "playbook_version": run.playbook_version,
+                "is_test": bool(run.is_test),
+                "trigger": run.trigger,
+                "conversation_id": str(run.conversation_id) if run.conversation_id else None,
+                "parent_run_id": str(run.parent_run_id) if run.parent_run_id else None,
+                "wake_on_complete": bool(getattr(run, "wake_on_complete", False)),
+                "seq": 0, "step_id": None, "parked_on": dict(parked_on),
+            })
+            return "parked"
+        if getattr(decision, "decision", None) == "approved":
+            return "approved"
+        rid = getattr(decision, "request_id", None)
+        reason = getattr(decision, "reason", None)
+        error_type = "ApprovalExpired" if reason == "ttl elapsed" else "Rejected"
+        error = (
+            f"owner card #{rid} expired before a decision (ttl elapsed)"
+            if error_type == "ApprovalExpired"
+            else f"run rejected by owner card #{rid}" + (f": {reason}" if reason else "")
+        )
+        await self._complete_run(
+            run.id, "failed", error=error, error_type=error_type,
+            failed_at=datetime.now(timezone.utc),
+        )
+        run.status = "failed"
+        return "failed"
+
+    async def _run_card_kw(self, run: PlaybookRun, playbook: Playbook, inputs: dict[str, Any]) -> dict[str, Any]:
+        """The `kind="playbook_run"` card: payload `{playbook, version, inputs}`
+        is identity (luna pins the shape); presentation is advisory."""
+        name = playbook.name
+        version = run.playbook_version
+        wake_conv = run.conversation_id or await _ops_conversation_id(self._ctx)
+        request_kw = {
+            "kind": "playbook_run",
+            "summary": f"Run playbook '{name}' v{version} (agent request)",
+            "payload": {"playbook": name, "version": version, "inputs": dict(inputs or {})},
+            "requested_by_plugin": "plugin-playbooks",
+            "risk_level": "medium",
+            "conversation_id": wake_conv,
+            "presentation": {
+                "eyebrow": "Playbook run",
+                "headline": (playbook.display_name or name)[:90],
+                "explanation": (
+                    "The agent asked to run this playbook now.\n\n"
+                    f"Inputs: {json.dumps(inputs or {}, indent=2, default=str)}"
+                ),
+                "changes": [],
+            },
+        }
+        label_test_run(request_kw, run)
+        return request_kw
 
     def _track(self, run_id: Any, task: asyncio.Task) -> None:
         """Register a run's driving task. The done-callback pops only ITS
@@ -565,7 +664,12 @@ class PlaybookRunner:
                 error_type="VersionMissing",
             )
             return
-        e0 = await self._v2.journal.entry0(str(run.id)) or {}
+        e0 = await self._v2.journal.entry0(str(run.id))
+        # plans/032 phase 08: a run approved off its per-run owner card has
+        # no journal yet (the park preceded effect 1) — drive it fresh from
+        # the row's inputs; every other resume continues its journal.
+        fresh = e0 is None
+        e0 = e0 or {}
         pinned = e0.get("code_sha256")
         if pinned and code_sha256(row.code or "") != pinned:
             # code edited under a run: refuse BEFORE any jail spawn (Risks 8)
@@ -598,7 +702,11 @@ class PlaybookRunner:
         )
         try:
             with _playbook_origin_scope(shim):
-                res = await self._v2.resume(run, shim, from_park=from_park)
+                res = (
+                    await self._v2.drive(run, shim, dict(run.inputs or {}))
+                    if fresh else
+                    await self._v2.resume(run, shim, from_park=from_park)
+                )
             if res.parked:
                 # phase 07: the row is `parked`; ParkService owns it now
                 run.status = "parked"
@@ -715,8 +823,26 @@ class PlaybookRunner:
         run: PlaybookRun,
         playbook: Playbook,
         inputs: dict[str, Any],
+        *,
+        await_card: bool = False,
     ) -> None:
-        """Execute a created run to its terminal status (mutates run.status)."""
+        """Execute a created run to its terminal status (mutates run.status).
+
+        plans/032 phase 08 `await_card`: the run is `parked` on its per-run
+        owner card and this (pblang) task waits for the decision BEFORE
+        `activity.started`, the heartbeat and the first step (Risks 9). A
+        rejection/expiry/cancel was completed by `ParkService` — return."""
+        if await_card:
+            outcome, detail = await self.park.wait_run(run.id)
+            if outcome != "done":
+                # the row is completed by whoever settled the wait (the
+                # decision path / cancel) — no DB read here, so this task
+                # never touches the row under that writer
+                error_type = detail[0] if isinstance(detail, tuple) and detail else "failed"
+                run.status = "cancelled" if error_type == "RunCancelled" else "failed"
+                return
+            run.status = "running"
+            run.parked_on = None
         # 008.006: generic presence channel. The list/brain react to
         # `activity.*` (not `playbook.*`), so any long task can light the same
         # indicators. A heartbeat task beats while the run is alive; its

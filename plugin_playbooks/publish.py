@@ -95,6 +95,38 @@ async def latest_run_evidence(
     return (await session.execute(q)).scalar_one_or_none()
 
 
+async def _parked_run(
+    session: AsyncSession,
+    playbook_id: Any,
+    version: int,
+    since: datetime | None,
+    *,
+    include_live: bool = False,
+) -> PlaybookRun | None:
+    """plans/032 phase 08: the newest run of exactly `version` that is
+    `parked` (on an owner card or an event) — same candidate/since filters as
+    `latest_run_evidence`, which never returns it (a parked run is not
+    evidence)."""
+    q = (
+        select(PlaybookRun)
+        .where(
+            PlaybookRun.playbook_id == playbook_id,
+            PlaybookRun.playbook_version == version,
+            PlaybookRun.status == "parked",
+        )
+        .order_by(PlaybookRun.started_at.desc())
+        .limit(1)
+    )
+    if not include_live:
+        q = q.where(or_(
+            PlaybookRun.is_test.is_(True),
+            PlaybookRun.trigger == "agent-candidate",
+        ))
+    if since is not None:
+        q = q.where(PlaybookRun.started_at > since)
+    return (await session.execute(q)).scalar_one_or_none()
+
+
 def _aware(dt: datetime | None) -> datetime | None:
     if dt is not None and dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -136,6 +168,45 @@ async def test_run_gate(
         session, playbook_id, version, since, include_live=include_live,
     )
     if run is None:
+        # plans/032 phase 08: a candidate run PARKED on an owner card is
+        # neither green nor failed — name it instead of asking for another
+        # run (which would raise a second card).
+        parked = await _parked_run(
+            session, playbook_id, version, since, include_live=include_live,
+        )
+        if parked is not None:
+            po = parked.parked_on if isinstance(parked.parked_on, dict) else {}
+            on = (
+                f"owner card #{po.get('approval_id')}" if po.get("kind") == "approval"
+                else f"event '{po.get('event_name')}'" if po.get("kind") == "event"
+                else "a park"
+            )
+            note = f"candidate run {parked.id} of version {version} is parked on {on}"
+            gate = {"gate": "test_run", "ok": False, "note": note}
+            if not require:
+                gate["enforced"] = False
+                gate["note"] += " — not enforced (Settings → Publish)"
+                return gate, None, None, None
+            refusal = json.dumps({
+                "error": (
+                    "Publish refused — gate 'test_run' failed: candidate run "
+                    f"{parked.id} of version {version} is parked on {on} — it "
+                    "is neither green nor failed yet."
+                ),
+                "gate": "test_run",
+                "run_id": str(parked.id),
+                "parked_on": po or None,
+                "hint": (
+                    f"Wait for the owner to decide {on} (nothing to poll — you "
+                    "will be woken), then publish again. Do NOT start another "
+                    "candidate run — it would raise a second card."
+                ) if po.get("kind") == "approval" else (
+                    f"Wait for the run to resume from {on} (nothing to poll — "
+                    "you will be woken), then publish again. Do NOT start "
+                    "another candidate run."
+                ),
+            })
+            return gate, refusal, None, None
         if include_live:
             note = f"version {version} has never completed a run"
             error = (

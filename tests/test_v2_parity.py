@@ -192,3 +192,111 @@ async def test_handled_failure_is_a_green_run_in_status_runs_digest_and_proposal
             assert (await s.execute(select(PlaybookFixProposal))).scalars().all() == []
     finally:
         await e.dispose()
+
+
+# ------------------------------------------------------------------ 3-4 the publish gate (phase 08 part 2a)
+async def _version_row(e: Env, name: str, version: int):
+    from plugin_playbooks.models import Playbook, PlaybookVersion
+
+    async with e.sf() as s:
+        pb = (await s.execute(select(Playbook).where(Playbook.name == name))).scalar_one()
+        row = (await s.execute(select(PlaybookVersion).where(
+            PlaybookVersion.playbook_id == pb.id, PlaybookVersion.version == version,
+        ))).scalar_one()
+        return pb, row
+
+
+@real_jail
+@requires_jail()
+async def test_gate_names_a_parked_candidate_run(tmp_path):
+    """A candidate run parked on an owner card is neither green nor failed:
+    the gate names the card and forbids a second run (Step 10)."""
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from plugin_playbooks import publish
+
+    e = await twin_env(tmp_path, "greeter", "python", publish=False)
+    try:
+        pb, row = await _version_row(e, "greeter", 1)
+        later = datetime.now(timezone.utc) + timedelta(seconds=5)
+        parked_on = {
+            "kind": "approval", "approval_id": "7", "since": later.isoformat(),
+            "due_at": None, "gate": "run",
+        }
+        async with e.sf() as s:
+            run = PlaybookRun(
+                playbook_id=pb.id, playbook_version=1, status="parked",
+                trigger="agent-candidate", is_test=True, started_at=later,
+                parked_on=parked_on,
+            )
+            s.add(run)
+            await s.commit()
+            run_id = run.id
+        async with e.sf() as s:
+            gate, refusal, evidence, failed = await publish.test_run_gate(s, pb.id, 1, row.created_at)
+            assert await publish.latest_run_evidence(s, pb.id, 1, publish._aware(row.created_at)) is None
+        assert evidence is None and failed is None
+        assert gate["ok"] is False and gate["gate"] == "test_run"
+        assert f"candidate run {run_id} of version 1 is parked on owner card #7" in gate["note"]
+        body = json.loads(refusal)
+        assert "parked on owner card #7" in body["error"] and str(run_id) in body["error"]
+        assert "Do NOT start another candidate run" in body["hint"] and "nothing to poll" in body["hint"]
+        assert body["run_id"] == str(run_id) and body["parked_on"] == parked_on
+        # the refusal reaches the agent through playbook_publish unchanged
+        out = json.loads(await e.tools["playbook_publish"](name="greeter", explanation=EXPLANATION))
+        assert out["error"] == body["error"] and out["hint"] == body["hint"], out
+        # not enforced: reported, never refused
+        async with e.sf() as s:
+            gate2, refusal2, _, _ = await publish.test_run_gate(s, pb.id, 1, row.created_at, require=False)
+        assert refusal2 is None and gate2["enforced"] is False and "owner card #7" in gate2["note"]
+        assert uuid.UUID(body["run_id"]) == run_id
+    finally:
+        await e.dispose()
+
+
+@real_jail
+@requires_jail()
+async def test_gate_identical_for_green_and_failed_v2_candidate_runs(tmp_path):
+    """Real python candidate runs feed the gate exactly like v1 evidence:
+    a green run is the evidence, a failed run rides the failed slot only."""
+    from plugin_playbooks import publish
+
+    e = await twin_env(tmp_path, "greeter", "python", publish=False)
+    try:
+        out = json.loads(await e.tools["playbook_run_candidate"](
+            name="greeter", inputs=json.dumps({"greeting": "hi"}), wait_seconds=30,
+        ))
+        assert out["status"] == "done" and out["candidate_version"] == 1, out
+        green_id = out["run_id"]
+        pb, row = await _version_row(e, "greeter", 1)
+        async with e.sf() as s:
+            gate, refusal, evidence, failed = await publish.test_run_gate(s, pb.id, 1, row.created_at)
+        assert gate["ok"] is True and refusal is None and failed is None
+        assert evidence is not None and str(evidence.id) == green_id
+        assert evidence.is_test is True and evidence.status == "done"
+
+        # a python candidate whose run fails (unhandled tool error)
+        out = json.loads(await e.tools["playbook_propose"](
+            name="failer", agent_autonomy="agent_may_trigger",
+            code="async def run(ctx, inputs):\n    await ctx.tool('boom')\n",
+        ))
+        assert out["status"] == "candidate_saved" and out["format"] == "python", out
+        out = json.loads(await e.tools["playbook_run_candidate"](name="failer", inputs="{}", wait_seconds=30))
+        assert out["status"] == "failed", out
+        failed_id = out["run_id"]
+        pb2, row2 = await _version_row(e, "failer", 1)
+        async with e.sf() as s:
+            gate, refusal, evidence, failed = await publish.test_run_gate(
+                s, pb2.id, 1, row2.created_at, require=False,
+            )
+        assert evidence is None                       # NEVER a failed run
+        assert failed is not None and str(failed.id) == failed_id
+        assert gate["ok"] is False and gate["enforced"] is False and refusal is None
+        async with e.sf() as s:
+            gate, refusal, evidence, failed = await publish.test_run_gate(s, pb2.id, 1, row2.created_at)
+        assert evidence is None and str(failed.id) == failed_id
+        assert gate["ok"] is False and refusal is not None
+        assert "the latest test run of version 1 FAILED" in json.loads(refusal)["error"]
+    finally:
+        await e.dispose()

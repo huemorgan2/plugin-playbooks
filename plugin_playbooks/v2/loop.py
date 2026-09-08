@@ -35,6 +35,7 @@ from . import DEFAULT_TIMEOUTS as _DEFAULT_TIMEOUTS
 from . import MAX_EFFECTS
 from .dry import DRY_BANNER, dry_answer
 from .journal import JournalStore, MemoryJournalStore, make_effect_entry, make_entry0
+from .park import label_test_run
 from .shim import SHIM_SOURCE
 
 log = logging.getLogger("luna.playbooks.v2")
@@ -1175,6 +1176,8 @@ class SegmentLoop:
             "presentation": presentation,
             "ttl_seconds": int(timeout) if timeout else None,
         }
+        # plans/032 phase 08: a candidate's test run labels its cards
+        label_test_run(request_kw, run)
         try:
             if self.park is not None:
                 # phase 07 park form: `request_nowait`; `pending` parks the run
