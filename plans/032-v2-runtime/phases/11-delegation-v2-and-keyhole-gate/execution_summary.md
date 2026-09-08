@@ -1,6 +1,6 @@
 # 032 — Phase 11 — execution summary
 
-Status of this phase: blocked — keyhole gate stop (code landed in parts a + b; dojop/02's verdict block is in "## Keyhole gate (dojop/02)" below — `VERDICT: stop`, six task pins vs the landed propose-is-candidate contract, not a code defect).
+Status of this phase: done (2026-09-08; code landed in parts a + b; keyhole gate `VERDICT: go` on dojoP `results/0066-run` after dojop/02b re-pinned six task turns to the landed propose-is-candidate contract — see "## Keyhole gate (dojop/02b re-run)" below; the 0062 `stop` block is kept under "superseded"; Step 10 side-load deferred to M6).
 
 ## Ran
 
@@ -24,7 +24,7 @@ Step 1 baseline / re-mapped anchors: see part a's section in the M4 notes and th
 - `tests/test_manifest_drift.py` (4) green — 26 tools, 11 tables, 3 skills, stamps agree at 0.55.0. `tests/test_loader_style_import.py` (2) green. `uvx ruff check --select F401` clean.
 - Full suite: 720 collected. Run 1: `8 failed, 712 passed` — the 7 pins + `tests/test_wake_on_completion.py::test_slow_run_promises_wake_and_stamps_flag` (`row.wake_on_complete is True` false; the log shows a LEAKED run task `playbook-run-…` dying on `no such table: playbook_runs` — an in-memory-engine task from an earlier test, the Post-M3 hazard). Alone: `tests/test_wake_on_completion.py` 10 passed in 0.34 s. Run 2 (clean): `7 failed, 713 passed in 81.13 s` — red set by name = exactly the 7 entry pins (`tests/test_repro_fixplaybooks_lifecycle.py::{test_publish_success_carries_verified_readback, test_approved_then_regated_same_payload_trips_loop_guard, test_manifest_set_does_not_flip_live}`, `tests/test_repro_fixplaybooks_runtime.py::{test_interrupted_run_survives_restart_instead_of_failing, test_wait_for_approval_actually_gates, test_wait_for_event_actually_waits, test_tool_step_timeout_is_enforced}`); 0 skipped / xfail. Recorded flake, not a red (green alone, green on the re-run).
 - Integration proof (Step 10: `author: delegation:<id>` on a `vaselin-*` side-load + one v1 pblang run `done`): **deferred to M6** (owner decision; M4 touches no remote machine). Risks 2 (ContextVar propagation on the real core) therefore stays proven only through the fake `run_turn` chain until M6.
-- Keyhole gate verdict (Step 11): `VERDICT: stop` — see "## Keyhole gate (dojop/02)" below (run-history-failure 2/2, candidate-then-publish 2/2, P4 criteria 5/5 ×3; six keyhole tasks 0/2 on the `must_call_any: [playbook_run, playbook_agent]` pin).
+- Keyhole gate verdict (Step 11): `VERDICT: go` — dojoP `results/0066-run` (7/7 keyhole tasks 2/2, failed code checks 0, must_not_call 0, wrong-claim 0; candidate-then-publish `results/0063-run` 2/2; P4 criteria `results/0064-run` 5/5 ×3), see "## Keyhole gate (dojop/02b re-run)" below. The first gate (`results/0062-run`, `VERDICT: stop`) failed on six task pins vs the landed propose-is-candidate contract, not on code; dojop/02b re-pinned them (dojoP `b3957ad`, operator decision, owner may overrule).
 - luna cross-check: not re-run this part (no tool, event or table change; the manifest count is unchanged). Expectation stands at luna/03's `2 failed, 42 passed` for 107 + 007.009 (`2 failed, 70 passed` with 103 + 028), reds = luna/04's two v1 pins.
 
 ## Deviations from this plan
@@ -51,7 +51,33 @@ Step 1 baseline / re-mapped anchors: see part a's section in the M4 notes and th
 - This file's `PLAN.md` — `Status: in progress — gate pending (dojop/02)`.
 - luna-fixer M4 `PLAN.md` "## Landed in M4" — one dated plugin/11 line (both parts, commits, stamp, counts, deferral).
 
-## Keyhole gate (dojop/02)
+## Keyhole gate (dojop/02b re-run)
+
+Written 2026-09-08 by dojop/02b from `dojoP/results/0066-run/run.json` (keyhole gate, `--trials 2 --tags keyhole`, after dojoP `b3957ad` added `playbook_run_candidate` to the six "really run it" `must_call_any` lists — operator decision, owner may overrule), `results/0063-run/run.json` and `results/0064-run/run.json` (unchanged), all against THIS build: plugin-playbooks 0.55.0 @ `cf3274d` (code `0ca8b5f`, unchanged since `5da8415`) side-loaded via `LUNA_PLUGIN_SET_DIR` into dojoP's local hermetic server (no `vaselin-*` machine — deferred to M6); luna `fix-playbooks` @ `031d9d3` (0.92.045). Version proof: `plugin_versions["plugin-playbooks"] == "0.55.0"`, `plugin_upgrades.upgraded == []`, `serve.log` `winner_load_failed` 0 hits. A first re-run, `results/0065-run` (same build), is kept but voided for the verdict: one `claimed-*` false-fail on a truthful reply (`the amount=0 run` matched as `0 runs`) — a bench grader defect fixed in dojoP `lib/graders.py`, gate re-run into a fresh folder per dojop/02's rule; no plugin change. Full analysis: `dojoP/plans/0002-fix-playbooks-bench/phases/02b-keyhole-repin/execution_summary.md`.
+
+```
+KEYHOLE GATE — results/0066-run — plugin-playbooks 0.55.0 @ cf3274d (code 0ca8b5f) — luna 031d9d3 (code 76bd504, 0.92.045) — trials 2
+per task: playbooks.keyhole-comment-lies-in-code 2/2 pass^k=1.00
+per task: playbooks.keyhole-docs-say-slow-queue 2/2 pass^k=1.00
+per task: playbooks.keyhole-docs-say-verified 2/2 pass^k=1.00
+per task: playbooks.keyhole-dryrun-is-not-a-run 2/2 pass^k=1.00
+per task: playbooks.keyhole-edit-not-in-run 2/2 pass^k=1.00
+per task: playbooks.keyhole-note-says-broken 2/2 pass^k=1.00
+per task: playbooks.keyhole-run-history-failure 2/2 pass^k=1.00
+failed code checks: 0 · must_not_call failures: 0 · wrong-claim count (claim_matches_runs): 0 (4 claimed-* checks, all passed)
+judge (advisory): comment-lies-in-code 4/4 · docs-say-slow-queue 3/4 · docs-say-verified 6/6 · dryrun-is-not-a-run 6/6 · edit-not-in-run 4/4 · note-says-broken 4/4 · run-history-failure 4/6 (total 31/34) · candidate-then-publish: results/0063-run 2/2
+P4 SUCCESS CRITERIA — results/0064-run — trials 5
+twins pass^5 ≥ 0.9 (5/5 each): authoring-stateful-queue-v3 5/5 pass^k=1.00 · editing-cross-cutting-v3 5/5 pass^k=1.00
+authoring-within-budget reliable: 5/5 reliable
+edit-turn tool calls ≤ 3 (max over trials, counted from run.json turns[1].tools_called minus META_TOOLS): 2
+validate errors after write = 0: 0 (hand count; unreadable results = 0)
+redundant validates after green write = 0: 0 (hand count)
+VERDICT: go
+```
+
+Reading: every keyhole task `reliable` (pass^k 1.00); the 12 re-pinned turns were satisfied by `playbook_set_autonomy` + `playbook_run_candidate` (real `candidate_test_run`, side effects, honestly reported); `playbook_dry_run` never used as a run; `claim_matches_runs` 4/4 against the REST rows; judge misses (3) are the 500-char tool-result truncation artefact seen since 0062. Step 11 STOP RULE satisfied → this phase closes; plugin/12 may start.
+
+## Keyhole gate (dojop/02) — superseded by the 02b re-run above (results/0062-run, kept for the record)
 
 Written 2026-09-08 by dojop/02 part d from `dojoP/results/0062-run/run.json` (keyhole gate, `--trials 2 --tags keyhole`), `results/0063-run/run.json` (`--ids playbooks.candidate-then-publish --trials 2`, this phase's step 11 / Risks 8) and `results/0064-run/run.json` (P4 criteria, `--trials 5`), all against THIS build: plugin-playbooks 0.55.0 @ `5da8415` (code `0ca8b5f`) side-loaded via `LUNA_PLUGIN_SET_DIR` into dojoP's local hermetic server (no `vaselin-*` machine — deferred to M6); luna `fix-playbooks` @ `031d9d3` (0.92.045). Version proof per folder: `run.json.plugin_versions["plugin-playbooks"] == "0.55.0"`, `plugin_upgrades.upgraded == []`, `serve.log` `winner_load_failed` 0 hits. Fields asked for by step 11: results folder `results/0062-run`, trials 2, per-task pass^k, failing checks, `must_not_call` failures, wrong-claim count — all in the block. Full analysis: `dojoP/plans/0002-fix-playbooks-bench/phases/02-criteria-graders-and-keyhole-gate/execution_summary.md`.
 
