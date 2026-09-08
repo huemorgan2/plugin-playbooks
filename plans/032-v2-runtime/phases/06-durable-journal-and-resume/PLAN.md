@@ -1,6 +1,6 @@
 # 032 — Phase 06: Durable journal tables, write-ahead in_flight rows, resume on on_server_ready, OutcomeUnknown
 
-Status: pending
+Status: done (2026-09-08, code c8eaf3e; see execution_summary.md)
 
 Master: /Users/roy/Documents/my-projects-docs/luna-fixer/plans/2026-09-06-fix-playbooks/PLAN.md — §1.1 (no resume today; the sweep fails every `running` row), §1.7 (`on_load` runs in a throwaway loop, background work belongs in `on_server_ready`), §2 Execution model (items 1-3: write-ahead `in_flight` row, `idempotency_key`, `timed_out_unknown`, `OutcomeUnknown`, llm/now/random re-execute), §2 Properties ("a parked or crashed run resumes from the journal on `on_server_ready` — REAL resume, closing sweep-to-failed"; raw `vault:` refs only; gather batches), §2 Lifecycle (the 13 completion keys stay byte-identical), §3 P2, §5 Risks ("Lost outcomes", "the run pins the exact version row it started on"); master phase M2 (luna-fixer `phases/M2-durability/PLAN.md` step 1)
 
