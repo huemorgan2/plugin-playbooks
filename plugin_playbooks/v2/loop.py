@@ -601,10 +601,7 @@ class SegmentLoop:
                     raise V2RunError(
                         f"return value is not JSON: {type(value).__name__}", "TypeError",
                     )
-                state = self._runs.get(run_id)
-                if state is not None and state.secrets:
-                    value = scrub_secrets(value, state.secrets)
-                result.value = value
+                result.value = self._scrub(run_id, value)
                 if parent_id is not None:
                     self._values[run_id] = result.value
                 return result
@@ -757,6 +754,14 @@ class SegmentLoop:
             raise
         return eff, seq, step_run_id
 
+    def _scrub(self, run_id: str, value: Any) -> Any:
+        """phase 08: replace every vault value this run resolved with its
+        `vault:<name>` literal (see `scrub_secrets`)."""
+        state = self._runs.get(run_id)
+        if state is None or not state.secrets:
+            return value
+        return scrub_secrets(value, state.secrets)
+
     @staticmethod
     def _split_key(eff: dict[str, Any], key: str) -> tuple[str, int]:
         if eff.get("call_site_id") and eff.get("occurrence"):
@@ -813,9 +818,10 @@ class SegmentLoop:
                     if self.dry:
                         # no step row, no step event (docs/v2.md §10)
                         return False
-                    await self._complete_step(step_run_id, "failed", error=f"{e.error_type}: {e}", inputs=args)
+                    shown = self._scrub(run_id, f"{e.error_type}: {e}")
+                    await self._complete_step(step_run_id, "failed", error=shown, inputs=args)
                     await self._events.emit("playbook.step.failed", {
-                        "run_id": run_id, "step_id": key, "error": f"{e.error_type}: {e}",
+                        "run_id": run_id, "step_id": key, "error": shown,
                         "retry_count": n - 1,
                     })
                     return False
@@ -825,6 +831,11 @@ class SegmentLoop:
             await self.journal.complete(run_id, seq, journal_result, attempts, ms, extra=fields)
             if self.dry:
                 return False
+            # phase 08 (Risks 6): the step row and the step event are what
+            # the wake (`_collect_outputs`) and `playbook_status` show — a
+            # secret a tool echoed back must not reach them. The journal row
+            # keeps the raw result (it is what the code replays against).
+            outputs = self._scrub(run_id, outputs)
             await self._complete_step(step_run_id, "done", outputs=outputs, inputs=args)
             await self._events.emit("playbook.step.completed", {
                 "run_id": run_id, "step_id": key, "outputs": outputs,

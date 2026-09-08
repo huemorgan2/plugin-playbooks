@@ -2,8 +2,8 @@
 playbook's `run()` returned, persisted on the run row, the additive LAST key
 of `playbook.run.completed`, and surfaced on every reader (docs/v2.md §7).
 A v1 run's result is null everywhere; a non-JSON return fails loud; a
-resolved vault value never lands in the column; `ctx.subtask` returns the
-child's PERSISTED result.
+resolved vault value never lands in the column, the step rows or the wake
+text; `ctx.subtask` returns the child's PERSISTED result.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from v2harness import CODE, env
 
 from _jail import real_jail, requires_jail
 from plugin_playbooks import routes
-from plugin_playbooks.models import PlaybookRun
+from plugin_playbooks.models import PlaybookRun, PlaybookStepRun
 from plugin_playbooks.wake import RunCompletionWake
 
 PY_GREETER = (
@@ -198,6 +198,25 @@ async def test_resolved_secret_never_stored(db):
     payload = bus.named("playbook.run.completed")[-1]
     assert payload["result"] == row.result
     assert "s3cret-value" not in json.dumps({"row": row.result, "event": payload}, default=str)
+    # the step row and the step event (what the wake and playbook_status
+    # show) carry the literal ref, never the secret
+    async with db() as s:
+        steps = (await s.execute(select(PlaybookStepRun).where(PlaybookStepRun.run_id == row.id))).scalars().all()
+    assert [st.outputs for st in steps] == [{"tool": "http", "result": {"echoed": "vault:my_key", "status": 200}}]
+    step_events = bus.named("playbook.step.completed")
+    assert step_events and "s3cret-value" not in json.dumps(step_events, default=str)
+    # the wake text: Result block AND Step outputs block
+    wctx = _WakeCtx()
+    svc = RunCompletionWake(db, _WakeBus(), wctx)
+    await svc._on_completed(_payload(
+        run_id=str(row.id), playbook_name="leaky", wake_on_complete=True,
+        conversation_id=str(uuid.uuid4()), result=payload["result"],
+    ))
+    await _drain(svc)
+    content = wctx.sent[0]["content"]
+    assert "Result:\n" in content and "Step outputs:" in content
+    assert "s3cret-value" not in content
+    assert content.count("vault:my_key") >= 3  # result (2 places) + step output
 
 
 # ------------------------------------------------------------------ 5

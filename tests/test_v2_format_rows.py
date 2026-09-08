@@ -91,23 +91,49 @@ async def test_columns_migrate_and_backfill():
             r_after = await conn.run_sync(_cols("playbook_runs"))
         assert "format" in v_after
         assert "format" in r_after and "result" in r_after
-        # migrated rows read the DEFAULT — pblang for everything, result null
+        # migrated rows: the python playbook's history inherits its format
+        # AT MIGRATION TIME (same transaction as the ADD), everything else
+        # reads the DEFAULT pblang; result null
         async with sf() as s:
-            vrows = (await s.execute(select(PlaybookVersion))).scalars().all()
             rrows = (await s.execute(select(PlaybookRun))).scalars().all()
-        assert {v.format for v in vrows} == {"pblang"}
-        assert {r.format for r in rrows} == {"pblang"}
         assert all(r.result is None for r in rrows)
-        # the backfill stamps the python playbook's rows from the parent
-        assert await backfill_format(sf) == 2
         for name, fmt in (("py", "python"), ("pb", "pblang")):
             assert [v.format for v in await _versions(sf, name)] == [fmt]
             assert [r.format for r in await _runs(sf, name)] == [fmt]
-        assert await backfill_format(sf) == 0  # idempotent
+        # the load-time backfill only fills NULLs — nothing to do here
+        assert await backfill_format(sf) == 0
+        # a post-phase-08 edit may mint a pblang candidate under a python
+        # playbook: a later load (columns present, backfill run again) must
+        # NOT rewrite it to python
+        async with sf() as s:
+            pyrow = (await s.execute(select(Playbook).where(Playbook.name == "py"))).scalar_one()
+            s.add(PlaybookVersion(playbook_id=pyrow.id, version=2, definition={"name": "py", "steps": []},
+                                  code="playbook(name='py')\n", author="agent", message="candidate",
+                                  format="pblang"))
+            s.add(PlaybookRun(playbook_id=pyrow.id, playbook_version=2, status="done", trigger="agent",
+                              is_test=True, format="pblang"))
+            await s.commit()
         await _ensure_columns(engine)  # idempotent: nothing added twice
+        assert await backfill_format(sf) == 0  # idempotent
         async with engine.connect() as conn:
             assert await conn.run_sync(_cols("playbook_versions")) == v_after
             assert await conn.run_sync(_cols("playbook_runs")) == r_after
+        assert [v.format for v in await _versions(sf, "py")] == ["python", "pblang"]
+        assert [r.format for r in await _runs(sf, "py")] == ["python", "pblang"]
+        assert [v.format for v in await _versions(sf, "pb")] == ["pblang"]
+        # the defensive half: a row that somehow carries NULL reads pblang
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE playbook_versions DROP COLUMN format"))
+            await conn.execute(text("ALTER TABLE playbook_runs DROP COLUMN format"))
+            await conn.execute(text("ALTER TABLE playbook_versions ADD COLUMN format VARCHAR(16)"))
+            await conn.execute(text("ALTER TABLE playbook_runs ADD COLUMN format VARCHAR(16)"))
+        async with sf() as s:
+            assert {v.format for v in (await s.execute(select(PlaybookVersion))).scalars().all()} == {None}
+        assert await backfill_format(sf) == 6  # 3 version rows + 3 run rows
+        async with sf() as s:
+            assert {v.format for v in (await s.execute(select(PlaybookVersion))).scalars().all()} == {"pblang"}
+            assert {r.format for r in (await s.execute(select(PlaybookRun))).scalars().all()} == {"pblang"}
+        assert await backfill_format(sf) == 0
     finally:
         await engine.dispose()
 

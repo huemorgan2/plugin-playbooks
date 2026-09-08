@@ -55,6 +55,24 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_runs", "result", "JSONB"),
 ]
 
+# plans/032 phase 08: SQL run ONCE, in the same transaction that adds the
+# column. Rows that predate `format` on the row tables all shared their
+# playbook's language, so the parent's column is the truth for them — the
+# DDL default (`pblang`) is wrong for a python playbook's history. This
+# never runs again: after phase 08 an edit may mint a pblang candidate
+# under a python playbook (test_v2_format_tools.py::test_edit_may_change_format),
+# and a load-time rewrite would flip that legitimate row.
+_POST_ADD_SQL: dict[tuple[str, str], str] = {
+    ("playbook_versions", "format"): (
+        "UPDATE playbook_versions SET format = 'python' WHERE playbook_id IN "
+        "(SELECT id FROM playbooks WHERE format = 'python')"
+    ),
+    ("playbook_runs", "format"): (
+        "UPDATE playbook_runs SET format = 'python' WHERE playbook_id IN "
+        "(SELECT id FROM playbooks WHERE format = 'python')"
+    ),
+}
+
 # Indexes whose definition changed — dropped on load so the model's current
 # index (a different name) can be created next to them without conflicts.
 _LEGACY_INDEXES: list[tuple[str, str]] = [
@@ -81,6 +99,13 @@ async def _ensure_columns(engine) -> None:
         for table, col, ddl in await conn.run_sync(_missing):
             await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
             logger.info("playbooks: added %s column to %s", col, table)
+            post = _POST_ADD_SQL.get((table, col))
+            if post:
+                n = (await conn.execute(text(post))).rowcount
+                logger.info(
+                    "playbooks: %s.%s inherited from the playbook on %d row(s)",
+                    table, col, n if n is not None and n >= 0 else 0,
+                )
 
 
 async def _drop_legacy_indexes(engine) -> None:
@@ -219,29 +244,31 @@ async def backfill_live_version(session_factory) -> int:
 
 
 async def backfill_format(session_factory) -> int:
-    """plans/032 phase 08: stamp `format` on version rows and run rows that
-    predate the column (migrated with DEFAULT 'pblang'). Rows of a python
-    playbook whose `format` is still the default take the playbook's format —
-    before phase 08 every row of a playbook shared its language, so the
-    parent's column is the truth. Idempotent. Returns rows updated."""
-    from sqlalchemy import select, update
+    """plans/032 phase 08: defensive — a version row or run row that somehow
+    carries NULL `format` reads `pblang` so it never dispatches on nothing.
+    (`UPDATE ... SET format='pblang' WHERE format IS NULL`, both tables.)
+    The one-time inheritance of a python playbook's format by its pre-phase-08
+    rows happens in `_ensure_columns` when the column is added
+    (`_POST_ADD_SQL`), never here: a load must not rewrite a row whose
+    language legitimately differs from its playbook's. Idempotent. Returns
+    rows updated."""
+    from sqlalchemy import update
 
-    from .models import Playbook, PlaybookRun, PlaybookVersion
+    from .models import PlaybookRun, PlaybookVersion
 
-    python_ids = select(Playbook.id).where(Playbook.format == "python")
     total = 0
     async with session_factory() as session:
         for model in (PlaybookVersion, PlaybookRun):
             result = await session.execute(
                 update(model)
-                .where(model.playbook_id.in_(python_ids), model.format == "pblang")
-                .values(format="python")
+                .where(model.format.is_(None))
+                .values(format="pblang")
                 .execution_options(synchronize_session=False)
             )
             total += result.rowcount or 0
         await session.commit()
     if total:
-        logger.info("playbooks: backfilled format for %d version/run row(s)", total)
+        logger.info("playbooks: backfilled NULL format for %d version/run row(s)", total)
     return total
 
 
