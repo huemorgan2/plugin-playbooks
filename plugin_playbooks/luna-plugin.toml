@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.54.0"
+version = "0.55.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -187,7 +187,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_agent"
-description = "Delegate a playbook authoring job to a focused background agent with a live progress card."
+description = "Delegate a playbook authoring job (create, fix, edit) to a focused background agent that works the full loop — read, write (validated on save), dry-run, real candidate run, publish — with a live progress card; new playbooks are written as python (v2), an edit follows the target's format."
 policy = "auto_approve"
 risk_level = "medium"
 

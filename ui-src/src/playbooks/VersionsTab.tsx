@@ -178,8 +178,15 @@ function fmtAbsolute(iso: string): string {
   })
 }
 
-function authorLabel(a: string): string {
-  return a === 'agent' ? 'agent' : a === 'owner' ? 'you' : a || '—'
+// plans/032 phase 11: every version row says who wrote it — `agent`,
+// `owner` (rendered "you"), `system`, or `delegation:<uuid>` (rendered as
+// the first 8 chars; the full id rides on the span's title).
+export function authorLabel(a: string): string {
+  if (a === 'agent') return 'agent'
+  if (a === 'owner') return 'you'
+  if (a === 'system') return 'system'
+  if (a && a.startsWith('delegation:')) return `delegation ${a.slice('delegation:'.length, 'delegation:'.length + 8)}`
+  return a || '—'
 }
 
 export function LiveBadge({ className }: { className?: string }) {
@@ -731,7 +738,7 @@ export function VersionsTab({
                       </p>
                     )}
                     <div className="flex items-center gap-1.5 mt-1.5 text-[11px] text-ink-500">
-                      <span>{authorLabel(v.author)}</span>
+                      <span data-testid={`version-author-${v.version}`} title={v.author}>{authorLabel(v.author)}</span>
                       <span>·</span>
                       <span title={fmtAbsolute(v.created_at)}>{timeAgo(v.created_at)}</span>
                       <span>·</span>

@@ -22,7 +22,7 @@ vi.mock('../ConnectionsTab', () => ({ ConnectionsTab: () => <div data-testid="co
 vi.mock('../RunsTab', () => ({ RunsTab: () => <div data-testid="runs-tab" /> }))
 
 import { playbooksApi } from '../api'
-import { VersionsTab, promoteRefusalMessage, promoteRefusalGate } from '../VersionsTab'
+import { VersionsTab, authorLabel, promoteRefusalMessage, promoteRefusalGate } from '../VersionsTab'
 
 const api = playbooksApi as unknown as Record<string, ReturnType<typeof vi.fn>>
 
@@ -50,7 +50,7 @@ const def: PlaybookDef = {
 
 function entry(
   version: number,
-  extra: Partial<{ current: boolean; candidate: boolean; runs: number }> = {},
+  extra: Partial<{ current: boolean; candidate: boolean; runs: number; author: string }> = {},
 ) {
   return {
     version, title: `v${version} edit`, author: 'agent',
@@ -167,6 +167,34 @@ describe('VersionsTab', () => {
     expect(await screen.findByTestId('runs-tab')).toBeTruthy()
     // 0.47.0: the Tests view went with the specs feature
     expect(screen.queryByTestId('view-tests')).toBeNull()
+  })
+
+  // plans/032 phase 11: every row says who wrote it; a delegation shows
+  // its first 8 chars with the full id on the title.
+  it('renders author labels', async () => {
+    const DELEGATION = 'delegation:1234abcd-5678-4efa-9bcd-0123456789ab'
+    api.listVersions.mockResolvedValue([
+      entry(3, { candidate: true, runs: 0, author: DELEGATION }),
+      entry(2, { current: true, author: 'owner' }),
+      entry(1, { author: 'agent' }),
+    ])
+    api.getVersion.mockImplementation((_n: string, v: number) =>
+      Promise.resolve(detailOf(v, v === 2, v === 3)),
+    )
+    render(
+      <VersionsTab
+        name="greeter" agentName="Luna" liveVersion={2} candidateVersion={3}
+        onPromoted={() => {}} onManifestSaved={() => {}}
+      />,
+    )
+    const delegated = await screen.findByTestId('version-author-3')
+    expect(delegated.textContent).toBe('delegation 1234abcd')
+    expect(delegated.getAttribute('title')).toBe(DELEGATION)
+    expect(screen.getByTestId('version-author-2').textContent).toBe('you')
+    expect(screen.getByTestId('version-author-2').getAttribute('title')).toBe('owner')
+    expect(screen.getByTestId('version-author-1').textContent).toBe('agent')
+    expect(authorLabel('system')).toBe('system')
+    expect(authorLabel('')).toBe('—')
   })
 })
 
