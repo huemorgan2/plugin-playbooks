@@ -42,6 +42,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_runs", "failed_at", "TIMESTAMP"),
     # plans/032 phase 04: the playbook's language (pblang | python)
     ("playbooks", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
+    # plans/032 phase 07: parked runs — `parked_on` on the run row and on the
+    # parking journal entry. First JSON-typed entry: SQLite takes any type name
+    # (affinity NUMERIC, the JSON type serialises to text), PG gets `jsonb`
+    # matching the model's `JSONB` column.
+    ("playbook_runs", "parked_on", "JSONB"),
+    ("playbook_journal", "parked_on", "JSONB"),
 ]
 
 # Indexes whose definition changed — dropped on load so the model's current
@@ -809,6 +815,10 @@ class PlaybooksPlugin(LunaPlugin):
             agent=ctx.agent,
             context=ctx,
         )
+        # plans/032 phase 07: parked runs — subscribe `approval.decided` now
+        # (loop-independent); timers/subscriptions are rebuilt by
+        # `park.reconcile()` in on_server_ready on the serving loop.
+        self._runner.park.start()
 
         # 0.5.1: rows still "running" from before this process existed
         # (restart/upgrade, or pre-0.5.0 cancelled-mid-run coroutines) would
@@ -1168,8 +1178,18 @@ class PlaybooksPlugin(LunaPlugin):
         Not called for runtime installs, where nothing was interrupted."""
         n = await self._runner.resume_interrupted_runs()
         logger.info("playbooks: resumed %d interrupted v2 run(s)", n)
+        # plans/032 phase 07: parked rows — rebuild subscriptions/timers, or
+        # resume the ones decided / timed out while the server was down.
+        try:
+            p = await self._runner.park.reconcile()
+            logger.info("playbooks: reconciled %d parked v2 run(s)", p)
+        except Exception:  # noqa: BLE001 — never block the server on it
+            logger.exception("playbooks: park reconcile failed")
 
     async def on_unload(self) -> None:
+        runner = getattr(self, "_runner", None)
+        if runner is not None:
+            runner.park.stop()
         if self._trigger_service:
             await self._trigger_service.stop()
         if self._fix_proposals:

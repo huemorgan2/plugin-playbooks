@@ -339,6 +339,47 @@ async def _ticket_seconds_left(session: AsyncSession, ticket: str) -> int:
 _EDIT_RETRY_TEXT = "fix and call playbook_edit again with this ticket — do NOT re-read"
 
 
+def _parked_what(parked_on: Any) -> str:
+    """plans/032 phase 07: `approval #<id>` / `event '<name>'` from `parked_on`."""
+    po = parked_on if isinstance(parked_on, dict) else {}
+    if po.get("kind") == "approval":
+        return f"approval #{po.get('approval_id')}"
+    if po.get("kind") == "event":
+        return f"event '{po.get('event_name')}'"
+    return "an external signal"
+
+
+def _parked_message(parked_on: Any, wake_promised: bool) -> str:
+    """playbook_run / playbook_run_candidate: the run parked (docs/v2.md §11)."""
+    tail = (
+        "you will be WOKEN when it finishes. Do NOT poll playbook_status, do NOT "
+        "re-run the playbook, and do NOT report results yet."
+        if wake_promised else
+        "it resumes by itself; check playbook_status(run_id) later. Do NOT re-run "
+        "the playbook, and do NOT report results yet."
+    )
+    return f"Parked on {_parked_what(parked_on)} — nothing to poll; {tail}"
+
+
+def _parked_hint(parked_on: Any) -> str:
+    """playbook_status hint for a `parked` run."""
+    po = parked_on if isinstance(parked_on, dict) else {}
+    due = po.get("due_at")
+    if po.get("kind") == "approval":
+        return (
+            f"parked on approval #{po.get('approval_id')} — nothing to poll. The "
+            f"owner has the card; the run resumes by itself when they decide "
+            f"(due {due})."
+        )
+    if po.get("kind") == "event":
+        return (
+            f"parked on event '{po.get('event_name')}' — nothing to poll. The run "
+            f"resumes by itself when the event fires, or fails with EventTimeout "
+            f"at {due}."
+        )
+    return "parked — nothing to poll; the run resumes by itself."
+
+
 def build_tools(
     session_factory: async_sessionmaker[AsyncSession],
     events: EventBus,
@@ -761,13 +802,18 @@ def build_tools(
         # sweep honors it across restarts. Old cores (no send_muted_message)
         # can't deliver a wake, so they keep the poll contract.
         wake_promised = False
-        if status == "running" and _wake_capable:
+        parked_on = getattr(waited, "parked_on", None) if waited else None
+        # plans/032 phase 07: a `parked` run has no task but finishes later —
+        # the wake stamp covers it exactly like a running one.
+        if status in ("running", "parked") and _wake_capable:
             async with session_factory() as session:
                 row = await session.get(PlaybookRun, run.id)
-                if row is not None and row.status == "running":
+                if row is not None and row.status in ("running", "parked"):
                     row.wake_on_complete = True
                     await session.commit()
                     wake_promised = True
+                    status = row.status
+                    parked_on = row.parked_on
                 elif row is not None:
                     status = row.status  # finished during the stamp window
 
@@ -776,6 +822,9 @@ def build_tools(
             "playbook": name,
             "status": status,
         }
+        if status == "parked":
+            result["parked_on"] = parked_on
+            result["message"] = _parked_message(parked_on, wake_promised)
         if playbook.candidate_version:
             result["note"] = (
                 "This ran the LIVE version "
@@ -921,7 +970,12 @@ def build_tools(
                 payload["traceback"] = (
                     "\n".join(tb.splitlines()[-20:]) if tb else None
                 )
-            if run.status == "running":
+            if run.status == "parked":
+                # plans/032 phase 07 (docs/v2.md §11): no task, nothing to
+                # poll — the service resumes it on the decision / event.
+                payload["parked_on"] = getattr(run, "parked_on", None)
+                payload["hint"] = _parked_hint(payload["parked_on"])
+            elif run.status == "running":
                 payload["hint"] = (
                     "Still running — poll playbook_status again in a bit. "
                     "Completed steps above already show their outputs."
@@ -944,9 +998,11 @@ def build_tools(
             modes=["planning", "building"],
             description=(
                 "Get the live state of a playbook run: overall status "
-                "(running/done/failed/cancelled), timing, and the full "
+                "(running/parked/done/failed/cancelled), timing, and the full "
                 "step-by-step trace with each step's outputs and errors. "
-                "Poll this after playbook_run returns status 'running'."
+                "Poll this after playbook_run returns status 'running'. A "
+                "'parked' run (waiting on an owner approval or an event) has "
+                "nothing to poll — it resumes by itself."
             ),
             parameters={
                 "type": "object",
@@ -968,7 +1024,7 @@ def build_tools(
         ToolDef(
             name="playbook_cancel",
             modes=["planning", "building"],
-            description="Cancel a running playbook.",
+            description="Cancel a running or parked playbook run.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1697,7 +1753,7 @@ def build_tools(
             modes=["planning", "building"],
             description=(
                 "List a playbook's runs, newest first — filter by version= "
-                "and/or status= (running/done/failed/cancelled). Failed "
+                "and/or status= (running/parked/done/failed/cancelled). Failed "
                 "runs include every failed step's FULL error text and "
                 "resolved inputs (read it like a CI log). Use "
                 "playbook_status for one run's complete step-by-step trace."
@@ -1709,7 +1765,7 @@ def build_tools(
                     "version": {"type": "integer", "description": "Only runs of this version"},
                     "status": {
                         "type": "string",
-                        "enum": ["running", "done", "failed", "cancelled"],
+                        "enum": ["running", "parked", "done", "failed", "cancelled"],
                     },
                     "limit": {"type": "integer", "default": 10, "maximum": 50},
                 },
@@ -3181,7 +3237,11 @@ def build_tools(
                 "playbook_publish when it completes green."
             ),
         }
-        if status == "running":
+        if status == "parked":
+            # plans/032 phase 07: the candidate run parked (approval / event)
+            result["parked_on"] = getattr(waited, "parked_on", None)
+            result["message"] = _parked_message(result["parked_on"], False)
+        elif status == "running":
             result["message"] = (
                 "Still executing in the background — poll "
                 "playbook_status(run_id) until 'done'/'failed'. Do NOT "

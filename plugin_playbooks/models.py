@@ -192,6 +192,9 @@ class PlaybookRun(Base):
     failed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # plans/032 phase 07 (docs/v2.md §6): what a `parked` run waits on —
+    # {kind: approval|event, since, due_at, approval_id|event_name}; NULL otherwise.
+    parked_on: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class PlaybookStepRun(Base):
@@ -371,7 +374,7 @@ class PlaybookJournal(Base):
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     args: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    # in_flight | done | failed | failed_handled | timed_out_unknown (phase 07 adds parked)
+    # in_flight | done | failed | failed_handled | timed_out_unknown | parked (phase 07)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -388,3 +391,5 @@ class PlaybookJournal(Base):
     )
     # host wall time of the whole row (docs/v2.md §6 `ms`)
     ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # plans/032 phase 07: mirror of `playbook_runs.parked_on` on the parking effect's row
+    parked_on: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

@@ -55,6 +55,7 @@ _MINIMAL = {
     "now": "await ctx.now()",
     "random": "await ctx.random()",
     "log": 'await ctx.log("m")',
+    "wait_event": 'await ctx.wait_event("x", timeout=1)',
 }
 
 

@@ -17,20 +17,26 @@ MAX_EFFECTS = 200
 # Playbook code formats accepted by `resolve_format` (docs/v2.md §9).
 FORMATS = ("pblang", "python")
 
-# `ctx` effects the checker admits at this phase (docs/v2.md §2).
+# `ctx` effects the checker admits at this phase (docs/v2.md §2); phase 07
+# added `wait_event` (the park form — still gated by the `wait_event` feature
+# flag, so `check(features=frozenset())` rejects it).
 AVAILABLE_EFFECTS = frozenset({
     "tool", "llm", "agent", "subtask", "gather", "approve", "now", "random", "log",
+    "wait_event",
 })
 
 # Effects the doc names but this version does not run — rejected by rule
 # `v2-effect-unavailable` with exactly this message text (docs/v2.md §2, §8).
 UNAVAILABLE_EFFECTS = {
-    "wait_event": "not available in this version",
     "sleep": "not available in this version",
 }
 
-# Feature flags handed to `check(features=...)`; phase 07 adds "wait_event".
-DEFAULT_FEATURES = frozenset()
+# Feature flags handed to `check(features=...)`; "wait_event" since phase 07.
+DEFAULT_FEATURES = frozenset({"wait_event"})
+
+# Upper bound of a park (approve card / wait_event), seconds — docs/v2.md §12.
+# Above the card TTL and the wait timeout; `ParkService(max_duration=)` (phase 07).
+MAX_DURATION_S = 24 * 3600
 
 # Exception classes exposed on `ctx` (docs/v2.md §4).
 CTX_EXCEPTIONS = frozenset({
@@ -57,7 +63,7 @@ from .shim import SHIM_SOURCE  # noqa: E402
 
 __all__ = [
     "MAX_EFFECTS", "FORMATS", "AVAILABLE_EFFECTS", "UNAVAILABLE_EFFECTS",
-    "DEFAULT_FEATURES", "CTX_EXCEPTIONS", "CTX_UNCATCHABLE", "DEFAULT_TIMEOUTS",
-    "APPROVE_RESULT_KEYS", "SegmentLoop", "JournalStore", "MemoryJournalStore",
+    "DEFAULT_FEATURES", "MAX_DURATION_S", "CTX_EXCEPTIONS", "CTX_UNCATCHABLE",
+    "DEFAULT_TIMEOUTS", "APPROVE_RESULT_KEYS", "SegmentLoop", "JournalStore", "MemoryJournalStore",
     "DbJournalStore", "SHIM_SOURCE",
 ]

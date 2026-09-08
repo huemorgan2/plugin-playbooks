@@ -286,6 +286,19 @@ def dry_answer(
             "approved": True, "request_id": f"dry:{key}", "reason": None,
             "decided_by": None, "dry": True,
         }, extra
+    if kind == "wait_event":
+        # phase 07: a stub is the event payload the run "received";
+        # `{"_event_timeout": true}` answers with the EventTimeout failure
+        # (the loop raises it); unstubbed → placeholder, like a tool
+        found, value, matched = resolve_stub(stubs, effect_id, occurrence)
+        if found:
+            extra["stubbed"] = True
+            extra["stub_key"] = matched
+            if isinstance(value, dict) and value.get("_event_timeout"):
+                extra["event_timeout"] = True
+                return None, extra
+            return value, extra
+        return None, extra
     if kind == "now":
         return DRY_NOW, extra
     if kind == "random":

@@ -138,6 +138,15 @@ class DbJournalStore:
             self._apply_extra(row, extra)
             await session.commit()
 
+    async def park(self, run_id: str, seq: int, parked_on: dict[str, Any]) -> None:
+        # phase 07: the parking effect's row — `parked` is not `in_flight`, so a
+        # restart's reconciliation (`SegmentLoop.resume`) leaves it alone.
+        async with self._sf() as session:
+            row = await self._get(session, run_id, seq)
+            row.status = "parked"
+            row.parked_on = copy.deepcopy(dict(parked_on))
+            await session.commit()
+
     async def mark_handled(self, run_id: str, seqs: list[int]) -> None:
         # Risks 9: only `failed` rows are re-stamped — a handled OutcomeUnknown
         # keeps `timed_out_unknown` (the memory store does the same).
@@ -193,6 +202,8 @@ class DbJournalStore:
             entry["transcript"] = copy.deepcopy(row.transcript)
         if row.child_run_id is not None:
             entry["child_run_id"] = str(row.child_run_id)
+        if row.parked_on is not None:
+            entry["parked_on"] = copy.deepcopy(row.parked_on)
         return entry
 
     async def _rows(self, run_id: str, *, status: str | None = None) -> list[PlaybookJournal]:

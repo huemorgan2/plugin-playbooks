@@ -11,6 +11,7 @@ each step boundary. DBOS integration can be added later for crash recovery.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -30,9 +31,10 @@ from luna_sdk import EventBus, PluginContext, ToolRegistry, message_source
 from .definition import OnError, PlaybookDef, StepDef, StepKind
 from .models import Playbook, PlaybookRun, PlaybookStepRun
 from .publish import ops_conversation_id as _ops_conversation_id
-from .v2 import DbJournalStore, JournalStore, SegmentLoop
+from .v2 import MAX_DURATION_S, DbJournalStore, JournalStore, SegmentLoop
 from .v2.checker import sniff_format
 from .v2.loop import V2RunError, code_sha256
+from .v2.park import ParkService
 from .versioning import get_version_row, shim_playbook
 
 log = logging.getLogger("luna.playbooks.runner")
@@ -322,6 +324,7 @@ class PlaybookRunner:
         agent: Any = None,
         context: PluginContext | None = None,
         journal: JournalStore | None = None,
+        max_duration: float = MAX_DURATION_S,
     ) -> None:
         self._sf = session_factory
         self._tools = tool_registry
@@ -340,10 +343,17 @@ class PlaybookRunner:
         # keep their own MemoryJournalStore inside SegmentLoop.dry_run.
         # phase 03: the same facade v1's llm/agent steps use, and the bound
         # blocking `start_run` for `ctx.subtask` (parent/child run rows).
+        journal = journal if journal is not None else DbJournalStore(session_factory)
+        # phase 07: parked runs (docs/v2.md §6 / §11 "Parked") — the service
+        # that owns a run while no task drives it; `resume` spawns the
+        # continuation, `_complete_run` fails it loudly (max_duration).
+        self.park = ParkService(
+            session_factory, events, context, journal, self.resume,
+            max_duration=max_duration, complete_run=self._complete_run,
+        )
         self._v2 = SegmentLoop(
-            session_factory, tool_registry, events, context,
-            journal if journal is not None else DbJournalStore(session_factory),
-            agent=agent, start_run=self.start_run,
+            session_factory, tool_registry, events, context, journal,
+            agent=agent, start_run=self.start_run, park=self.park,
         )
 
     async def start_run(
@@ -392,9 +402,34 @@ class PlaybookRunner:
             self._drive_run(run, playbook, inputs),
             name=f"playbook-run-{run.id}",
         )
-        self._tasks[run.id] = task
-        task.add_done_callback(lambda _t, _id=run.id: self._tasks.pop(_id, None))
+        self._track(run.id, task)
         return run
+
+    def _track(self, run_id: Any, task: asyncio.Task) -> None:
+        """Register a run's driving task. The done-callback pops only ITS
+        task: a parked run's continuation (phase 07 `resume`) registers a
+        new task under the same id before the old one is collected."""
+        self._tasks[run_id] = task
+        task.add_done_callback(
+            lambda _t, _id=run_id: self._tasks.pop(_id, None) if self._tasks.get(_id) is _t else None
+        )
+
+    def resume(self, run: PlaybookRun) -> asyncio.Task:
+        """Phase 07: spawn the continuation of a run `ParkService._resume`
+        just flipped back to `running`. Waits for a still-live previous task
+        of the same run (the segment that parked it is unwinding) so two
+        tasks never drive one journal."""
+        prior = self._tasks.get(run.id)
+
+        async def _go() -> None:
+            if prior is not None and prior is not asyncio.current_task() and not prior.done():
+                with contextlib.suppress(BaseException):
+                    await prior
+            await self._resume_run(run, from_park=True)
+
+        task = asyncio.create_task(_go(), name=f"playbook-run-{run.id}")
+        self._track(run.id, task)
+        return task
 
     async def wait_for_run(self, run_id: Any, timeout: float) -> PlaybookRun | None:
         """Wait up to `timeout` seconds for a background run, then return the
@@ -494,19 +529,21 @@ class PlaybookRunner:
             task = asyncio.create_task(
                 self._resume_run(run), name=f"playbook-run-{run.id}",
             )
-            self._tasks[run.id] = task
-            task.add_done_callback(lambda _t, _id=run.id: self._tasks.pop(_id, None))
+            self._track(run.id, task)
             resumed += 1
         if resumed:
             log.info("playbook.runs.resumed count=%d", resumed)
         return resumed
 
-    async def _resume_run(self, run: PlaybookRun) -> None:
+    async def _resume_run(self, run: PlaybookRun, *, from_park: bool = False) -> None:
         """Drive a resumed v2 run to its terminal status on the EXACT version
         row it started on (`playbook_runs.playbook_version`), with the
         `_drive_run` scaffolding around `SegmentLoop.resume`. Inputs come from
         journal entry 0 (what the shim replays). No `PlaybookDef`, no
-        `_RunContext`: a v2 definition is the checker summary."""
+        `_RunContext`: a v2 definition is the checker summary.
+
+        `from_park` (phase 07): the continuation after a park — the run may
+        park again, in which case the row is left `parked` (no completion)."""
         async with self._sf() as session:
             playbook = await session.get(Playbook, run.playbook_id)
             row = (
@@ -556,7 +593,11 @@ class PlaybookRunner:
         )
         try:
             with _playbook_origin_scope(shim):
-                await self._v2.resume(run, shim)
+                res = await self._v2.resume(run, shim, from_park=from_park)
+            if res.parked:
+                # phase 07: the row is `parked`; ParkService owns it now
+                run.status = "parked"
+                return
             await self._complete_run(run.id, "done")
             run.status = "done"
         except V2RunError as e:
@@ -714,7 +755,11 @@ class PlaybookRunner:
                 # plans/032 phase 02: a v2 playbook runs on the segment loop
                 # under the SAME billing scope as v1's step machinery.
                 with _playbook_origin_scope(playbook):
-                    await self._v2.drive(run, playbook, inputs)
+                    res = await self._v2.drive(run, playbook, inputs)
+                if res.parked:
+                    # phase 07: the row is `parked`; ParkService owns it now
+                    run.status = "parked"
+                    return
                 await self._complete_run(run.id, "done")
                 run.status = "done"
                 return
@@ -863,7 +908,22 @@ class PlaybookRunner:
         cancelled and `_drive_run`'s CancelledError handler marks the run
         (previously this only flipped the DB flag while every remaining step
         kept executing). The DB fallback below covers runs with no live task.
+
+        Phase 07: a `parked` run has no task — `ParkService.release` rejects
+        the card / drops the subscription and fails the parking entry, then
+        the run completes `cancelled` (`playbook.run.completed` fires).
         """
+        async with self._sf() as session:
+            run = await session.get(PlaybookRun, run_id)
+            status = run.status if run is not None else None
+        if status == "parked":
+            released = await self.park.release(
+                run_id, reason=f"playbook run {run_id} cancelled",
+                error_type="RunCancelled", message="run cancelled",
+            )
+            if released is not None:
+                await self._complete_run(run_id, "cancelled")
+                return
         task = self._tasks.get(run_id)
         if task is not None and not task.done():
             task.cancel()

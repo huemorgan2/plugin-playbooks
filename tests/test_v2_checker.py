@@ -17,6 +17,7 @@ from plugin_playbooks.v2 import (
     AVAILABLE_EFFECTS,
     CTX_EXCEPTIONS,
     CTX_UNCATCHABLE,
+    DEFAULT_FEATURES,
     MAX_EFFECTS,
     UNAVAILABLE_EFFECTS,
 )
@@ -319,17 +320,21 @@ def test_rule_v2_use_ctx_now_forms():
 def test_rule_v2_effect_unavailable_message_and_feature_flag():
     for src in (
         _pb("await ctx.sleep(1)\nreturn 1"),
-        _pb('return await ctx.wait_event("x", timeout=5)'),
         "import asyncio\nasync def run(ctx, inputs):\n    await asyncio.sleep(1)\n    return 1\n",
         "import time\nasync def run(ctx, inputs):\n    time.sleep(1)\n    return 1\n",
     ):
         i = _one(check(src, name="t", version=1), "v2-effect-unavailable")
         assert "not available in this version" in i.message, src
-    # behind the feature flag: wait_event is admitted and `timeout=` is required
+    # phase 07: wait_event is available by default (DEFAULT_FEATURES carries the flag)
     src = _pb('return await ctx.wait_event("x", timeout=5)')
-    r = check(src, name="t", version=1, features={"wait_event"})
+    r = check(src, name="t", version=1)
     assert r.issues == []
     assert r.summary["call_sites"][0]["kind"] == "wait_event"
+    # ... and R10 keeps its feature gate: an empty feature set still rejects it
+    i = _one(check(src, name="t", version=1, features=frozenset()), "v2-effect-unavailable")
+    assert "not available in this version" in i.message
+    r = check(src, name="t", version=1, features={"wait_event"})
+    assert r.issues == []
     r = check(_pb('return await ctx.wait_event("x")'), name="t", version=1, features={"wait_event"})
     assert "v2-effect-unavailable" not in _codes(r)
     i = _one(r, "v2-unknown-kwarg")
@@ -337,6 +342,15 @@ def test_rule_v2_effect_unavailable_message_and_feature_flag():
     # ctx.sleep stays rejected even with every feature on
     r = check(_pb("await ctx.sleep(1)\nreturn 1"), name="t", version=1, features={"wait_event"})
     assert "v2-effect-unavailable" in _codes(r)
+
+
+def test_wait_event_timeout_required_by_default():
+    # phase 07: R15 fires on `ctx.wait_event("x")` with the default features
+    r = check(_pb('return await ctx.wait_event("x")'), name="t", version=1)
+    assert "v2-effect-unavailable" not in _codes(r)
+    i = _one(r, "v2-unknown-kwarg")
+    assert "timeout" in i.message
+    assert "timeout" in (i.expected or "")
 
 
 def test_rule_v2_unknown_ctx_attr_did_you_mean():
@@ -639,7 +653,8 @@ def test_summary_call_sites():
 
 
 def test_constants_are_consistent():
-    assert set(UNAVAILABLE_EFFECTS) == {"wait_event", "sleep"}
+    assert set(UNAVAILABLE_EFFECTS) == {"sleep"}
+    assert "wait_event" in AVAILABLE_EFFECTS and "wait_event" in DEFAULT_FEATURES
     assert not (AVAILABLE_EFFECTS & set(UNAVAILABLE_EFFECTS))
     assert "approval_id" not in APPROVE_RESULT_KEYS
 

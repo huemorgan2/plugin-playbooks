@@ -410,8 +410,8 @@ class _Checker:
         self.tool_names = set(tool_names) if tool_names is not None else None
         self.features = frozenset(features or ())
         self.available = set(AVAILABLE_EFFECTS)
-        if "wait_event" in self.features:
-            self.available.add("wait_event")
+        if "wait_event" not in self.features:  # R10 keeps its feature gate (phase 07)
+            self.available.discard("wait_event")
         self.issues: list[CheckIssue] = []
         self.imports: list[str] = []
         self.import_names: set[str] = set()  # bound module names / aliases

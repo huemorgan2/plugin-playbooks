@@ -69,6 +69,12 @@ class JournalStore(Protocol):
         as given (the caller's type)."""
         ...
 
+    async def park(self, run_id: str, seq: int, parked_on: dict[str, Any]) -> None:
+        """Phase 07: status `parked` + `parked_on` on the parking effect's row
+        (docs/v2.md §6). Never returned by `in_flight()`; the resume completes
+        or fails the same row through `complete`/`fail`."""
+        ...
+
 
 def make_entry0(
     *, hash_seed: int, inputs: dict[str, Any], playbook: str, version: int,
@@ -192,3 +198,8 @@ class MemoryJournalStore:
 
     async def journaled(self, run_ids: list[Any]) -> set[Any]:
         return {rid for rid in run_ids if str(rid) in self._runs}
+
+    async def park(self, run_id: str, seq: int, parked_on: dict[str, Any]) -> None:
+        row = self._row(run_id, seq)
+        row["status"] = "parked"
+        row["parked_on"] = copy.deepcopy(dict(parked_on))

@@ -249,3 +249,37 @@ async def test_tool_dispatch_by_format(tmp_path):
         assert "steps_ran" not in pb and "unreached_call_sites" not in pb
     finally:
         await e.dispose()
+
+
+# ------------------------------------------------------------------ phase 07: wait_event
+WAIT = '''async def run(ctx, inputs):
+    try:
+        m = await ctx.wait_event("email.received", timeout=5, _id="mail")
+    except ctx.EventTimeout:
+        return "timed out"
+    return m if isinstance(m, dict) else str(m)
+'''
+
+
+@real_jail
+@requires_jail()
+async def test_dry_wait_event_stub_and_timeout(db, tmp_path):  # noqa: F811
+    """plans/032 phase 07: a dry `wait_event` never subscribes or parks — a
+    stub is the event payload, `{"_event_timeout": True}` raises
+    `ctx.EventTimeout` inside the code, unstubbed is a `DryStub`."""
+    runner, _bus = _runner(db, _real_tools(tmp_path))
+    loop = runner._v2
+    r1 = await loop.dry_run(_pb("w", WAIT), {}, {"mail#1": {"subject": "hi"}}, version=1)
+    assert r1["status"] == "simulated" and r1["error"] is None, r1["error"]
+    assert r1["result"] == {"subject": "hi"}
+    assert r1["steps_ran"]["mail#1"]["stubbed"] is True
+    r2 = await loop.dry_run(_pb("w", WAIT), {}, {"mail#1": {"_event_timeout": True}}, version=1)
+    assert r2["status"] == "simulated" and r2["error"] is None, r2["error"]
+    assert r2["result"] == "timed out"
+    r3 = await loop.dry_run(_pb("w", WAIT), {}, {}, version=1)
+    assert r3["status"] == "simulated" and r3["error"] is None, r3["error"]
+    assert r3["result"] == "<dry:mail#1>"
+    async with db() as s:
+        runs = (await s.execute(select(func.count()).select_from(PlaybookRun))).scalar_one()
+    assert runs == 0 and await _journal_rows(db) == 0
+    assert runner.park.subscriptions() == 0 and runner.park._timers == {}

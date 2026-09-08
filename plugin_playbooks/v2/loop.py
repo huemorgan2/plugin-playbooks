@@ -53,6 +53,9 @@ class LoopResult:
     segments: int = 0
     # (host_ms, jail_ms) per segment — master §5 "jail spawn latency" baseline
     segment_latency_ms: list[tuple[int, int]] = field(default_factory=list)
+    # phase 07: the run parked on `ctx.approve` / `ctx.wait_event` — no value,
+    # the row is `parked`, `ParkService` resumes it later
+    parked: bool = False
 
 
 class V2RunError(Exception):
@@ -101,7 +104,24 @@ class _SubtaskFailed(_EffectFailure):
     error_type = "SubtaskFailed"
 
 
+class _EventTimeout(_EffectFailure):
+    error_type = "EventTimeout"
+
+
+class _Parked(Exception):
+    """Phase 07 signal (not a failure): the effect parked the run. Carries
+    the `parked_on` the service wrote; the loop stops driving segments."""
+
+    def __init__(self, parked_on: dict[str, Any]) -> None:
+        super().__init__(parked_on.get("kind", "parked"))
+        self.parked_on = parked_on
+
+
 _RETRYABLE = (_ToolError, _EffectTimeout)
+
+# Phase 07: the kinds that may park the run. In a gather they run after the
+# other members, sequentially, so the first park leaves the rest untouched.
+_PARK_KINDS = frozenset({"approve", "wait_event"})
 
 # Phase 06 (docs/v2.md §6): the kinds a resume re-executes in place from the
 # journaled args — side-effect-free outside the journal. Every other kind found
@@ -197,11 +217,15 @@ class SegmentLoop:
         self, session_factory: Any, tools: Any, events: Any, ctx: Any,
         journal: JournalStore, *, segment_timeout: int = 60,
         max_effects: int = MAX_EFFECTS, agent: Any = None, start_run: Any = None,
-        mode: str = "live", stubs: dict[str, Any] | None = None,
+        mode: str = "live", stubs: dict[str, Any] | None = None, park: Any = None,
     ) -> None:
         if mode not in ("live", "dry"):
             raise ValueError(f"SegmentLoop mode must be 'live' or 'dry', got {mode!r}")
         self._sf = session_factory
+        # phase 07: the `ParkService` (`park_approval` / `park_event`); None
+        # means no parking — `ctx.approve` blocks in-process (phase 03 form)
+        # and `ctx.wait_event` fails.
+        self.park = park
         self._tools = tools
         self._events = events
         self._ctx = ctx
@@ -324,14 +348,21 @@ class SegmentLoop:
             await self.journal.drop(run_id)
 
     # ------------------------------------------------------------ resume
-    async def resume(self, run: Any, playbook: Any) -> LoopResult:
+    async def resume(self, run: Any, playbook: Any, *, from_park: bool = False) -> LoopResult:
         """Phase 06 (docs/v2.md §6): continue a `running` run from its durable
         journal after a process death. No seed, no entry 0 — `hash_seed`,
         `inputs` and `max_effects` come from the journal; the ancestor chain
         is rebuilt from `playbook_runs.parent_run_id`; the run's `in_flight`
-        rows are reconciled (tool/agent/subtask/approve → `timed_out_unknown`,
-        llm/now/random/log re-executed in place) and then the segment body
-        continues exactly as `drive()` would have — same journal prefix."""
+        rows are reconciled (tool/agent/subtask/approve/wait_event →
+        `timed_out_unknown`, llm/now/random/log re-executed in place) and then
+        the segment body continues exactly as `drive()` would have — same
+        journal prefix.
+
+        Phase 07 `from_park=True`: the same continuation after a park was
+        resolved (`ParkService._resume` completed/failed the parking entry).
+        The process did not die, so `in_flight` approve/wait_event rows are
+        gather members that were never started — they are re-executed (and
+        may park the run again) instead of going `timed_out_unknown`."""
         from .checker import check
 
         run_id = str(run.id)
@@ -352,7 +383,9 @@ class SegmentLoop:
         chain = await self._ancestor_chain(run)
         self._runs[run_id] = _RunState(name=name, version=version, chain=[*chain, name])
         try:
-            await self._reconcile(run)
+            if await self._reconcile(run, from_park=from_park):
+                result.parked = True
+                return result
             return await self._segments(
                 run, result, name=name, version=version, source=source, filename=filename,
                 call_sites=call_sites, hash_seed=hash_seed, max_effects=max_effects,
@@ -394,14 +427,34 @@ class SegmentLoop:
         chain.reverse()
         return chain
 
-    async def _reconcile(self, run: Any) -> None:
+    async def _reconcile(self, run: Any, *, from_park: bool = False) -> bool:
         """Reconciliation before the first resumed segment (docs/v2.md §6), in
-        seq order over the run's `in_flight` rows."""
+        seq order over the run's `in_flight` rows. Returns True when a
+        re-executed park-kind row parked the run again (phase 07)."""
         run_id = str(run.id)
         for row in await self.journal.in_flight(run_id):
             seq = int(row["seq"])
             kind = str(row.get("kind"))
             key = f"{row.get('id')}#{row.get('occurrence')}"
+            if from_park and kind in _PARK_KINDS:
+                # phase 07: a gather sibling of the resolved park that was
+                # never started (the loop parks on the first one). The
+                # journaled `options` are not stored, so a `_timeout` set on
+                # the call is lost here — the effect runs with its default.
+                eff = {
+                    "seq": seq, "id": key, "call_site_id": row.get("id"),
+                    "occurrence": row.get("occurrence"), "effect_kind": kind,
+                    "name": row.get("name"),
+                    "args": row.get("args") if isinstance(row.get("args"), dict) else {},
+                    "options": {},
+                }
+                step_run_id = await self._running_step(run.id, key)
+                if step_run_id is None:
+                    step_run_id = await self._create_step(run.id, key, kind)
+                log.info("playbook.v2.resume.park_sibling run_id=%s seq=%d effect=%s", run_id, seq, key)
+                if await self._execute_and_finish(run, eff, seq, step_run_id):
+                    return True
+                continue
             if kind in _REEXECUTE_ON_RESUME:
                 # side-effect-free: re-executed by the host from the journaled
                 # args into the SAME row — seq/idempotency_key unchanged, so a
@@ -431,6 +484,7 @@ class SegmentLoop:
                 "retry_count": 0,
             })
             log.info("playbook.v2.resume.unknown run_id=%s seq=%d effect=%s", run_id, seq, key)
+        return False
 
     async def _running_step(self, run_id: Any, step_id: str) -> Any:
         from sqlalchemy import select
@@ -490,10 +544,14 @@ class SegmentLoop:
             if kind == "error":
                 raise self._run_error(res, source, filename)
             if kind == "effect":
-                await self._effect(run, res)
+                if await self._effect(run, res):
+                    result.parked = True
+                    return result
                 continue
             if kind == "gather":
-                await self._gather(run, res)
+                if await self._gather(run, res):
+                    result.parked = True
+                    return result
                 continue
             raise V2RunError(
                 f"segment {n}: unknown result kind {kind!r}", "ShimFailure",
@@ -566,25 +624,36 @@ class SegmentLoop:
         )
 
     # ------------------------------------------------------------ effects
-    async def _gather(self, run: Any, res: dict[str, Any]) -> None:
+    async def _gather(self, run: Any, res: dict[str, Any]) -> bool:
         """Batching hook (phase 03 emits `gather`): every effect is journaled
         `in_flight` in argument order, then executed concurrently; every row
-        is completed/failed before the next segment."""
+        is completed/failed before the next segment.
+
+        Phase 07: park-kind members (`approve`, `wait_event`) run AFTER the
+        others, one at a time — the first that parks returns True and leaves
+        its later siblings `in_flight` for `resume(from_park=True)`."""
         effects = list(res.get("effects") or [])
         prepared = [await self._journal_and_start(run, eff) for eff in effects]
+        parking = self.park is not None and not self.dry
+        now = [p for p in prepared if not (parking and p[0].get("effect_kind") in _PARK_KINDS)]
+        later = [p for p in prepared if parking and p[0].get("effect_kind") in _PARK_KINDS]
         # phase 03: every element settles (each journals its own outcome);
         # the first host-side exception, in argument order, is raised after.
         settled = await asyncio.gather(
-            *(self._execute_and_finish(run, eff, seq, step_run_id) for eff, seq, step_run_id in prepared),
+            *(self._execute_and_finish(run, eff, seq, step_run_id) for eff, seq, step_run_id in now),
             return_exceptions=True,
         )
         for outcome in settled:
             if isinstance(outcome, BaseException):
                 raise outcome
+        for eff, seq, step_run_id in later:
+            if await self._execute_and_finish(run, eff, seq, step_run_id):
+                return True
+        return False
 
-    async def _effect(self, run: Any, eff: dict[str, Any]) -> None:
+    async def _effect(self, run: Any, eff: dict[str, Any]) -> bool:
         eff, seq, step_run_id = await self._journal_and_start(run, eff)
-        await self._execute_and_finish(run, eff, seq, step_run_id)
+        return await self._execute_and_finish(run, eff, seq, step_run_id)
 
     async def _journal_and_start(self, run: Any, eff: dict[str, Any]) -> tuple[dict[str, Any], int, Any]:
         run_id = str(run.id)
@@ -631,7 +700,10 @@ class SegmentLoop:
         except ValueError:
             return key, 1
 
-    async def _execute_and_finish(self, run: Any, eff: dict[str, Any], seq: int, step_run_id: Any) -> None:
+    async def _execute_and_finish(self, run: Any, eff: dict[str, Any], seq: int, step_run_id: Any) -> bool:
+        """Run one journaled effect to its row's final status. Returns True
+        when the effect PARKED the run (phase 07): the row is `parked`, the
+        step row stays `running`, `playbook.run.parked` was emitted."""
         from ..runner import _active_run_id
 
         run_id = str(run.id)
@@ -655,6 +727,9 @@ class SegmentLoop:
                         journal_result, outputs, fields = await self._perform(
                             run, seq, kind, key, eff.get("name"), args, options,
                         )
+                except _Parked as p:
+                    await self._emit_parked(run, seq, key, p.parked_on)
+                    return True
                 except _EffectFailure as e:
                     attempts.append({
                         "n": n, "error": f"{e.error_type}: {e}",
@@ -668,22 +743,26 @@ class SegmentLoop:
                             await asyncio.sleep(wait)
                         continue
                     await self.journal.fail(run_id, seq, e.error_type, str(e), attempts, extra=e.extra)
+                    if self.dry:
+                        # no step row, no step event (docs/v2.md §10)
+                        return False
                     await self._complete_step(step_run_id, "failed", error=f"{e.error_type}: {e}", inputs=args)
                     await self._events.emit("playbook.step.failed", {
                         "run_id": run_id, "step_id": key, "error": f"{e.error_type}: {e}",
                         "retry_count": n - 1,
                     })
-                    return
+                    return False
                 attempts.append({"n": n, "error": None, "ms": int((time.monotonic() - t_a) * 1000)})
                 break
             ms = int((time.monotonic() - t_row) * 1000)
             await self.journal.complete(run_id, seq, journal_result, attempts, ms, extra=fields)
             if self.dry:
-                return
+                return False
             await self._complete_step(step_run_id, "done", outputs=outputs, inputs=args)
             await self._events.emit("playbook.step.completed", {
                 "run_id": run_id, "step_id": key, "outputs": outputs,
             })
+            return False
         except asyncio.CancelledError:
             # cancel_run's task path (runner.cancel_run): the row that was in
             # flight fails RunCancelled; _drive_run marks the run cancelled.
@@ -702,12 +781,19 @@ class SegmentLoop:
     ) -> tuple[Any, Any, dict[str, Any]]:
         """Dry mode (docs/v2.md §10): the answer comes from `stubs` or is a
         placeholder the jail rebuilds; `extra` stamps the row with
-        `stubbed`/`stub_key`/`schema`/`effect`. Never raises `_EffectFailure`."""
+        `stubbed`/`stub_key`/`schema`/`effect`. Raises `_EffectFailure` only
+        for the phase 07 `wait_event` timeout stub."""
         site_id, occurrence = self._split_key(eff, str(eff.get("id")))
         result, extra = dry_answer(
             str(kind), site_id, occurrence, self._stubs, args=args,
             rng=self._dry_rng.get(run_id),
         )
+        if extra.pop("event_timeout", False):
+            # phase 07: a `{"_event_timeout": true}` stub answers wait_event
+            # with the timeout failure — the one dry answer that raises
+            raise _EventTimeout(
+                f"no '{args.get('name')}' event within {args.get('timeout')}s (dry stub)"
+            )
         return result, None, extra
 
     async def _perform(
@@ -727,6 +813,8 @@ class SegmentLoop:
             return await self._effect_subtask(run, key, str(name), args, options)
         if kind == "approve":
             return await self._effect_approve(run, seq, key, args, options)
+        if kind == "wait_event":
+            return await self._effect_wait_event(run, seq, key, args, options)
         if kind == "now":
             iso = _now().isoformat()
             return iso, {"now": iso}, None
@@ -983,8 +1071,14 @@ class SegmentLoop:
             "ttl_seconds": int(timeout) if timeout else None,
         }
         try:
-            decision = await approvals.request(**request_kw)
-        except asyncio.CancelledError:
+            if self.park is not None:
+                # phase 07 park form: `request_nowait`; `pending` parks the run
+                decision, parked_on = await self.park.park_approval(run, seq, key, request_kw)
+                if parked_on is not None:
+                    raise _Parked(parked_on)
+            else:
+                decision = await approvals.request(**request_kw)
+        except (asyncio.CancelledError, _Parked):
             raise
         except Exception as e:  # noqa: BLE001 — a failing engine fails the effect (closed)
             raise _EffectFailure(f"approval request failed: {type(e).__name__}: {e}") from e
@@ -1003,6 +1097,47 @@ class SegmentLoop:
         raise _Rejected(
             f"approval {rid or key} rejected" + (f": {reason}" if reason else "")
         )
+
+    async def _effect_wait_event(
+        self, run: Any, seq: int, key: str, args: dict[str, Any], options: dict[str, Any],
+    ) -> tuple[Any, Any, dict[str, Any] | None]:
+        """Phase 07 `ctx.wait_event(name, filter, timeout=)`: always parks —
+        the bus subscription lives in `ParkService`, not in this task."""
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise _EffectFailure(f"effect '{key}': ctx.wait_event needs an event name")
+        timeout = args.get("timeout")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise _EffectFailure(
+                f"effect '{key}': ctx.wait_event needs timeout= (seconds > 0), got {timeout!r}"
+            )
+        filt = args.get("filter")
+        if filt is not None and not isinstance(filt, dict):
+            raise _EffectFailure(f"effect '{key}': ctx.wait_event filter must be a dict")
+        if self.park is None:
+            raise _EffectFailure(
+                f"effect '{key}': ctx.wait_event needs the park service — none on this runner"
+            )
+        parked_on = await self.park.park_event(run, seq, key, name, filt, float(timeout))
+        raise _Parked(parked_on)
+
+    async def _emit_parked(self, run: Any, seq: int, key: str, parked_on: dict[str, Any]) -> None:
+        state = self._runs.get(str(run.id))
+        log.info("playbook.v2.parked run_id=%s seq=%d effect=%s on=%s", run.id, seq, key, parked_on.get("kind"))
+        if self._events is None:
+            return
+        await self._events.emit("playbook.run.parked", {
+            "run_id": str(run.id),
+            "playbook_id": str(getattr(run, "playbook_id", "") or ""),
+            "playbook_name": state.name if state else "",
+            "playbook_version": getattr(run, "playbook_version", None) or (state.version if state else None),
+            "is_test": bool(getattr(run, "is_test", False)),
+            "trigger": getattr(run, "trigger", None),
+            "conversation_id": str(run.conversation_id) if getattr(run, "conversation_id", None) else None,
+            "parent_run_id": str(run.parent_run_id) if getattr(run, "parent_run_id", None) else None,
+            "wake_on_complete": bool(getattr(run, "wake_on_complete", False)),
+            "seq": int(seq), "step_id": key, "parked_on": dict(parked_on),
+        })
 
     @staticmethod
     async def _approval_expired(approvals: Any, request_id: Any, reason: Any, decided_by: Any) -> bool:

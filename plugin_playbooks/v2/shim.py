@@ -92,7 +92,7 @@ _pb_source = str(inputs["source"])
 _pb_VAULT_RE = _pb_re.compile(r"vault:[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}")
 _pb_OPTIONS = ("_id", "_timeout", "_retry")
 _pb_EFFECT_KINDS = ("tool", "llm", "agent", "subtask", "gather", "approve", "now",
-                    "random", "log")
+                    "random", "log", "wait_event")
 
 
 def _pb_progress(seq, phase):
@@ -317,8 +317,16 @@ class _pb_Ctx:
             requests.append(h.request)
         return _pb_GatherAwaitable(requests)
 
-    def wait_event(self, *a, **kw):
-        return _pb_NotWired("ctx.wait_event is not available in this version")
+    def wait_event(self, name, filter=None, *, timeout, **options):
+        # phase 07: the park form — the host parks the run on a bus
+        # subscription; replay: done → payload, failed/EventTimeout → raise.
+        if not isinstance(name, str):
+            raise TypeError("ctx.wait_event: the event name must be a string literal")
+        if filter is not None and not isinstance(filter, dict):
+            raise TypeError("ctx.wait_event: filter must be a dict of payload keys")
+        args = {"name": name, "filter": dict(filter) if filter else None, "timeout": timeout}
+        args.update(options)
+        return self._effect("wait_event", _pb_sys._getframe(1), name, args)
 
 
 for _pb_cls in (EffectError, ToolError, EffectTimeout, OutcomeUnknown, Rejected,
@@ -335,7 +343,7 @@ _pb_handled = []
 
 def _pb_decode_result(kind, entry):
     result = entry.get("result")
-    if entry.get("dry") and kind in ("tool", "llm", "agent", "subtask"):
+    if entry.get("dry") and kind in ("tool", "llm", "agent", "subtask", "wait_event"):
         # phase 05: rebuild the placeholder (or wrap the provided stub) from
         # the dry journal row: {dry, stubbed, stub_key, schema, effect}
         effect = entry.get("effect") or f"{entry.get('id')}#{entry.get('occurrence')}"
@@ -435,7 +443,9 @@ def _pb_serve(request, cursor):
             err = entry.get("error") or {}
             cls = _pb_FAILED_CLASSES.get(err.get("type"), EffectError)
             return ("raise", cls(err.get("message") or err.get("type") or "effect failed"))
-        if status in ("in_flight", "timed_out_unknown"):
+        if status in ("in_flight", "timed_out_unknown", "parked"):
+            # `parked` (phase 07) is unreachable in practice — the host
+            # completes/fails the parking entry before the next segment.
             return ("raise", OutcomeUnknown(
                 f"the outcome of {key} is unknown (journal status {status})"))
         return ("raise", EffectError(f"journal entry {seq} has status {status!r}"))

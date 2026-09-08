@@ -494,16 +494,33 @@ APPROVE_SRC = (
 
 
 async def test_approve_blocks_until_decided(db, tmp_path, gated):
-    """v2 twin of test_repro_fixplaybooks_runtime::test_wait_for_approval_actually_gates."""
-    approvals = _GatedApprovals(_Dec("approved", reason="looks good", decided_by="owner"))
-    runner, _ = _runner(db, _tools(tmp_path, fast=gated.fast), context=_Ctx(approvals))
-    pb = await _save(db, _pb("approve", APPROVE_SRC))
+    """v2 twin of test_repro_fixplaybooks_runtime::test_wait_for_approval_actually_gates.
+
+    plans/032 phase 07: the park form — the card is raised with
+    `request_nowait`, the run row reads `parked` (no task, no poll), and the
+    engine's `approval.decided` resumes it. The default runner (durable
+    journal + `ParkService`) is used here, not the memory-journal `_runner`."""
+    from test_v2_parked import _Dec as _ParkDec, _NowaitApprovals, _ParkBus
+    from test_v2_resume import _save as _save_with_version  # resume pins a version row
+
+    bus = _ParkBus()
+    approvals = _NowaitApprovals(bus)
+    runner = PlaybookRunner(
+        session_factory=db, tool_registry=_tools(tmp_path, fast=gated.fast),
+        events=bus, context=_Ctx(approvals),
+    )
+    runner.park.start()
+    pb = await _save_with_version(db, _pb("approve", APPROVE_SRC))
     run = await runner.start_run_background(pb, inputs={})
-    await _until(lambda: len(approvals.requests) == 1)
+    await _until(lambda: bus.named("playbook.run.parked"))
     await asyncio.sleep(0.2)
     assert "fast" not in gated.calls
-    assert (await _row(db, run.id)).status == "running"
-    kw = approvals.requests[0]
+    row = await _row(db, run.id)
+    assert row.status != "done"
+    assert row.status == "parked"
+    assert row.parked_on["kind"] == "approval"
+    assert approvals.request_calls == []
+    kw = approvals.nowait_calls[0]
     assert kw["kind"] == "playbook_effect"
     assert kw["requested_by_plugin"] == "plugin-playbooks"
     assert kw["risk_level"] == "medium"
@@ -513,14 +530,15 @@ async def test_approve_blocks_until_decided(db, tmp_path, gated):
     assert kw["presentation"]["headline"]
     assert kw["conversation_id"] == run.report_to
     assert kw["ttl_seconds"] is None
-    approvals.gate.set()
+    aid = row.parked_on["approval_id"]
+    await approvals.decide(aid, _ParkDec("approved", reason="looks good", decided_by="owner"))
     row = await runner.wait_for_run(run.id, timeout=60)
     assert row.status == "done", (row.error, row.traceback)
     assert "fast" in gated.calls
-    entry = _journal(runner, row.id)[1]
+    entry = (await runner._v2.journal.read(str(run.id)))[1]
     assert entry["kind"] == "approve" and entry["status"] == "done"
     assert entry["result"]["approved"] is True
-    assert entry["result"]["request_id"] == str(approvals.decision.request_id)
+    assert entry["result"]["request_id"] == aid
     assert entry["result"]["reason"] == "looks good" and entry["result"]["decided_by"] == "owner"
     assert set(entry["result"]) == APPROVE_RESULT_KEYS
     assert _value(runner) == entry["result"]
