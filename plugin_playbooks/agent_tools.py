@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from luna_sdk import EventBus, ToolDef
 
 from .definition import AgentAutonomy, PlaybookDef
+from .delegation import writer_identity
 from .models import (
     Playbook,
     PlaybookEditTicket,
@@ -51,7 +52,14 @@ from .v2.checker import check as v2_check
 from .v2.checker import resolve_format, sniff_format
 from .v2.skill import PUBLISH_RULE
 from .validation import validate_definition
-from .versioning import ensure_live_row, live_version_of, mint_version
+from .versioning import (
+    author_label,
+    candidate_conflict,
+    conflict_message,
+    ensure_live_row,
+    live_version_of,
+    mint_version,
+)
 from .versioning import get_version_row as _tolerant_get_version_row_fn
 
 _log = logging.getLogger("luna.plugin.playbooks.agent_tools")
@@ -579,6 +587,19 @@ def build_tools(
             )).scalar_one_or_none()
             if existing and existing.status != "archived":
                 return json.dumps({"error": f"Playbook '{name}' already exists"})
+            # plans/032 phase 11: the archived row may still carry another
+            # author's unpublished candidate — the takeover must not replace
+            # it silently (same refusal as the edit path, minus the ticket).
+            author = writer_identity()
+            if existing:
+                conflict = await candidate_conflict(session, existing, author)
+                if conflict is not None:
+                    return json.dumps({
+                        "stage": "write",
+                        "saved": False,
+                        "error": conflict_message(name, conflict),
+                        "conflict": conflict,
+                    })
 
             if fmt == "python":
                 # the version the checker names is the one about to be minted
@@ -679,7 +700,8 @@ def build_tools(
                 session, playbook,
                 definition=defn, code=stored_code,
                 manifest=manifest or playbook.manifest or "",
-                author="agent", message="candidate",
+                # phase 11: `agent`, or `delegation:<id>` inside a delegation
+                author=author, message="candidate",
                 format=fmt,  # phase 08: the candidate row's own language
             )
             playbook.candidate_version = playbook.version
@@ -2651,9 +2673,13 @@ def build_tools(
         format: str | None = None,
         inputs_schema: str | dict | None = None,
         triggers: str | list | None = None,
+        replace_candidate: bool = False,
     ) -> str:
         snippet_mode = bool(old) or bool(new)
         modes = sum([bool(code), snippet_mode])
+        # plans/032 phase 11: who is writing — `agent`, or `delegation:<id>`
+        # inside a delegated turn; stamped on the row and used by the guard.
+        author = writer_identity()
 
         # READ stage: no payload at all → manifest + code + fresh ticket.
         # (definition_yaml alone is a stale caller — handled below.)
@@ -2691,6 +2717,8 @@ def build_tools(
                     "version": playbook.version,
                     "live_version": _live_version_of(playbook),
                     "candidate_version": playbook.candidate_version,
+                    # phase 11: who wrote the candidate being handed out
+                    "candidate_author": cand_row.author if cand_row else None,
                     "ticket": str(t.id),
                     "expires_in_seconds": _TICKET_TTL_SECONDS,
                     "instructions": (
@@ -2710,6 +2738,20 @@ def build_tools(
                         "playbook_publish."
                     ),
                 }
+                # phase 11: another author's unpublished candidate — warn
+                # before the write, which would refuse anyway.
+                conflict = await candidate_conflict(session, playbook, author)
+                if conflict is not None:
+                    header["conflict"] = conflict
+                    header["instructions"] = (
+                        "Another author's candidate exists — do not write; "
+                        f"ask the owner. Candidate v{conflict['candidate_version']} "
+                        f"was saved by {author_label(conflict['author'])} at "
+                        f"{conflict['saved_at']} and is unpublished; a write "
+                        "with this ticket is refused unless the owner says to "
+                        "replace it (then pass replace_candidate=true). "
+                        + header["instructions"]
+                    )
                 manifest_text = playbook.manifest
                 if not manifest_text:
                     header["manifest_note"] = (
@@ -2923,6 +2965,26 @@ def build_tools(
                              "Call playbook_edit(name) to re-read and get a "
                              "fresh ticket.",
                 })
+            # plans/032 phase 11: the candidate-conflict guard — BEFORE the
+            # ticket is consumed, so a refused write keeps it valid. A
+            # foreign candidate is only replaced on the owner's explicit
+            # instruction (replace_candidate=true), and the row says so.
+            conflict = await candidate_conflict(session, playbook, author)
+            if conflict is not None and not replace_candidate:
+                return json.dumps({
+                    "stage": "write",
+                    "saved": False,
+                    "error": conflict_message(name, conflict),
+                    "conflict": conflict,
+                    "ticket": ticket,
+                    "ticket_still_valid": True,
+                })
+            message = "candidate"
+            if conflict is not None:
+                message = (
+                    f"candidate (replaced {conflict['author']} "
+                    f"v{conflict['candidate_version']} on owner instruction)"
+                )
             refusal = await _check_ticket(session, playbook, ticket, consume=True)
             if refusal:
                 return json.dumps({"error": refusal})
@@ -2941,8 +3003,8 @@ def build_tools(
             await mint_version(
                 session, playbook,
                 definition=data, code=stored_code, manifest=playbook.manifest,
-                author="agent",
-                message="candidate",
+                author=author,  # phase 11: `agent` or `delegation:<id>`
+                message=message,
                 format=fmt,  # phase 08: the candidate row's own language
             )
             playbook.candidate_version = playbook.version
@@ -3011,11 +3073,13 @@ def build_tools(
         format: str | None = None,
         inputs_schema: str | dict | None = None,
         triggers: str | list | None = None,
+        replace_candidate: bool = False,
     ) -> str:
         return await _edit_impl(
             name=name, ticket=ticket, code=code, old=old, new=new,
             definition_yaml=definition_yaml, format=format,
             inputs_schema=inputs_schema, triggers=triggers,
+            replace_candidate=bool(replace_candidate),
         )
 
     _EDIT_PAYLOAD_PROPS = {
@@ -3033,6 +3097,18 @@ def build_tools(
         "format": _FORMAT_PARAM,
         "inputs_schema": _INPUTS_SCHEMA_PARAM,
         "triggers": _TRIGGERS_PARAM,
+        # plans/032 phase 11: a write over ANOTHER author's unpublished
+        # candidate is refused; this is the explicit, owner-authorised way
+        # through — the minted row's message names who was replaced.
+        "replace_candidate": {
+            "type": "boolean",
+            "description": (
+                "OWNER-authorised only — pass true only after the owner "
+                "said to replace another author's unpublished candidate "
+                "(the write refusal / read header name that author and "
+                "version). Default false."
+            ),
+        },
     }
 
     tools.append((
@@ -3091,7 +3167,7 @@ def build_tools(
             await mint_version(
                 session, playbook,
                 definition=playbook.definition, code=playbook.code,
-                manifest=manifest, author="agent",
+                manifest=manifest, author=writer_identity(),  # phase 11
                 message="manifest updated" + (f": {why}" if why else ""),
             )
             playbook.live_version = playbook.version

@@ -34,6 +34,7 @@ import logging
 import re
 import secrets
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,6 +44,24 @@ from luna_sdk import ToolDef
 
 from .definition import PlaybookDef, StepDef
 from .models import Playbook, PlaybookDelegation
+from .v2.skill import V2_SKILL_BODY
+
+# plans/032 phase 11: who is writing. `_drive_delegation` sets the delegation
+# id around `ctx.agent.run_turn(...)`; the tool handlers the delegate calls
+# run inside that call chain (luna awaits each handler in the turn's task,
+# and tasks spawned there inherit the context), so `writer_identity()` reaches
+# `_edit_impl` / `_propose` / `_manifest_set` without touching the toolset.
+# Owner paths (routes.py) never set it — they stamp "owner" themselves.
+_delegation_id: ContextVar[uuid.UUID | None] = ContextVar(
+    "playbooks_delegation_id", default=None,
+)
+
+
+def writer_identity() -> str:
+    """`delegation:<id>` inside a delegated turn, else `agent` — the value
+    stamped on every version row an agent-side write mints."""
+    did = _delegation_id.get()
+    return f"delegation:{did}" if did is not None else "agent"
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +158,13 @@ def _utcnow() -> datetime:
 
 
 def _referenced_tools(definition: dict) -> list[str]:
-    """Tool names used by the playbook's tool_call steps, tree-deep."""
+    """Tool names used by the playbook's tool_call steps, tree-deep.
+
+    plans/032 phase 11: a python row's summary `definition` (phase 04) has
+    no steps — its tool list IS the `tools` key the checker wrote (the same
+    shape `probes.collect_tools` reads), so that is the allowlist source."""
+    if isinstance(definition, dict) and definition.get("format") == "python":
+        return sorted({str(t) for t in (definition.get("tools") or [])})
     try:
         d = PlaybookDef.model_validate(definition)
     except Exception:  # noqa: BLE001 — a broken definition just adds no tools
@@ -199,9 +224,34 @@ Remember:
 - dry_run output is simulated — never report it as real.
 - Your final text is the report the owner gets. Make it count."""
 
+# plans/032 phase 11: the v2 (python) variant's tail — same shape, the
+# ctx.* contract comes from the v2 rules pasted into section 5, not memory.
+_PROMPT_TAIL_V2 = """\
+Remember:
+- Done = published, or a named blocker, or a named failure — nothing vaguer.
+- dry_run output is simulated — never report it as real.
+- Your final text is the report the owner gets. Make it count.
+- The v2 rules above, not memory, are the source of the ctx.* contract."""
 
-def _delegate_prompt(task: str, pb: Playbook | None) -> str:
+# The marker the python variant carries in its brief (section 2); tests and
+# the parity check key on it.
+V2_PROMPT_MARKER = "Format: python (v2)"
+
+
+def _prompt_format(pb: Playbook | None, format: str | None) -> str:
+    """explicit > the target's stored column > python (plugin/04's propose
+    default: a new playbook is python)."""
+    return format or getattr(pb, "format", None) or "python"
+
+
+def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = None) -> str:
+    fmt = _prompt_format(pb, format)
+    python = fmt == "python"
+
     brief = ["## 2. Your brief", "", task.strip()]
+    if python:
+        brief += ["", V2_PROMPT_MARKER + " — one python file with exactly one "
+                  "`async def run(ctx, inputs)`; the rules are in section 5."]
     if pb is not None:
         brief += ["", f"Target playbook: `{pb.name}` — edit it IN PLACE by "
                   "name; never create a '-v2' copy."]
@@ -211,6 +261,202 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
                       "is context, not law. If your change makes it "
                       "outdated, update it (playbook_manifest_set):", "",
                       pb.manifest]
+
+    if python:
+        work_loop = [
+            "1. ORIENT (≤5 calls). For an edit/fix job read the target: "
+            "playbook_edit(name) — the READ stage — returns the manifest, "
+            "the current code and an edit ticket; playbook_status(run_id) "
+            "gives a failing run's per-step data. There is no language "
+            "reference tool for python — section 5 is the contract.",
+            "2. WRITE. Create with playbook_propose(name, format='python', "
+            "code=..., inputs_schema=..., triggers=...); change through "
+            "the two-step ticket flow (playbook_edit read, then write with "
+            "the ticket and code= or old=/new=, copying old= snippets "
+            "verbatim from the code frame). Both check the code in the "
+            "same call: a green write returns `validated: true` — do not "
+            "call playbook_validate after it; a red write returns the "
+            "checker issues with the ticket still valid — fix and re-save "
+            "with the same ticket, do not re-read. Cap: after 3 failed "
+            "writes in a row, stop patching blind — re-read section 5 for "
+            "the failing construct and re-derive the code from it.",
+            "3. DRY-RUN — playbook_dry_run(name, inputs, stubs) executes "
+            "the candidate on the real loop with every effect stubbed: "
+            "expect `status: simulated`; read `steps_ran` and "
+            "`unreached_call_sites` (empty, or explain each in your "
+            "report); a DryStubError names the stubs key to add. After a "
+            "failed real run, playbook_dry_run(..., "
+            "stubs_from_run='<run_id>') replays its recorded effects so "
+            "the fix is checked against real shapes before a second real "
+            "run. Its outputs are simulated.",
+            "4. PREFLIGHT — playbook_preflight probes every tool the "
+            "playbook calls. A `failed` probe (dead credential, missing "
+            "tool) blocks publish — report it; `unprobeable` is common "
+            "and fine.",
+            "5. PROOF RUN — playbook_run_candidate(name, inputs): the REAL "
+            "supervised run of this exact candidate, real side effects, "
+            "owner-approved. On `running`, poll playbook_status(run_id) "
+            "until done/failed; a done run reports `result` (its run() "
+            "return) beside step_results. `status: parked` with an "
+            "approval_id means an owner card is pending: report it and END "
+            "your turn — never re-run, never poll it, never call "
+            "playbook_set_autonomy to get past it (that change is "
+            "permanent).",
+            "6. PUBLISH — run the checklist in section 9, then ship. A "
+            "refusal naming a parked candidate run means the owner has a "
+            "card: wait for their decision, never start a second "
+            "candidate run.",
+        ]
+        quality_bar = [
+            "The checker's issues are the floor, not the target. The v2 "
+            "rules — the whole contract of what a python playbook may do "
+            "and how the loop proves it — follow verbatim:",
+            "",
+            V2_SKILL_BODY.rstrip(),
+        ]
+        weights = [
+            "- FREE: reads, dry_run, preflight — use freely within budget. "
+            "(playbook_validate is not part of the python loop: the write "
+            "already validated.)",
+        ]
+        worked = [
+            "The first example in section 5 (fetch a list → one judgment "
+            "per item → ctx.approve → send) is the shape of a real python "
+            "playbook: plain Python around awaited ctx.* effects, one "
+            "`async def run(ctx, inputs)`, tool names as string literals, "
+            "`_id=` on every effect.",
+            "",
+            "BAD → GOOD: calling playbook_validate after a write that "
+            "returned `validated: true`, or reporting a dry run's output "
+            "as a real result, is the loop done wrong — the write already "
+            "checked the code, and simulated values prove nothing. GOOD is "
+            "the loop in order: a green write, playbook_dry_run "
+            "(`simulated`), playbook_run_candidate (real, green), "
+            "playbook_publish.",
+            "",
+            "A good final report:",
+            "\"PUBLISHED v3 of digest-open-prs. Added the per-PR judgment "
+            "loop and a typed digest step. The write validated clean, the "
+            "dry run traced the loop over stubbed PRs (simulated), "
+            "preflight ok, the candidate run was green. Nothing needs "
+            "you.\"",
+        ]
+        checklist = [
+            "1. The last write returned validated: true (no edits since).",
+            "2. A dry run of THIS candidate traced the changed path "
+            "(status simulated; unreached_call_sites empty or explained).",
+            "3. A green real run of THIS exact candidate exists since its "
+            "last edit (playbook_run_candidate).",
+            "4. preflight shows no `failed` tools (external-service "
+            "playbooks).",
+            "5. The manifest still tells the true bigger picture (update it "
+            "with playbook_manifest_set if your change made it stale).",
+        ]
+        tail = _PROMPT_TAIL_V2
+    else:
+        work_loop = [
+            "1. ORIENT (≤5 calls). Call playbook_language_reference FIRST and "
+            "read it — exact signatures, loop kwargs, state ops, and filters "
+            "live there, never in your memory; never guess syntax. For an "
+            "edit/fix job also read the target: playbook_edit(name) for the "
+            "ticket + manifest + code frames, playbook_status for the failing "
+            "run's per-step data.",
+            "2. OUTLINE, then author. Write the decomposition first, one line "
+            "per step: `id -> kind -> the SINGLE operation`. Self-check: a "
+            "quantifier (each/all/every) means a loop; one llm/agent step is "
+            "ONE judgment on ONE thing; mechanical work goes in tool()/code(); "
+            "pure transforms default to llm() with output= (typed fields, not "
+            "prose); loops gather with collect=. Create with playbook_propose "
+            "(pass manifest=); edit through the two-step ticket flow, copying "
+            "old= snippets verbatim from the code frame.",
+            "3. VALIDATE — playbook_validate reports ALL errors at once. Cap: "
+            "after 3 failed validates in a row, stop patching blind — "
+            "re-fetch the reference for the failing construct and re-derive "
+            "the code from it.",
+            "4. DRY-RUN — playbook_dry_run proves loops iterate, branches "
+            "branch, templates resolve, against STUBBED tools. Copy your "
+            "steps.<id>... paths from its `references` block — that block is "
+            "the API; the trace's per-step `output` label is not a path. Its "
+            "outputs are simulated.",
+            "5. STUBS FROM REALITY — after any real run (even a failed one) "
+            "copy the recorded step outputs from playbook_status into "
+            "playbook_dry_run's `stubs` (keyed by step id) so the simulation "
+            "sees real shapes. Cap: 3 failed dry runs in a row means the data "
+            "path is wrong — re-derive it from dry_run's references instead "
+            "of bending the stubs.",
+            "6. PREFLIGHT — playbook_preflight probes every tool the playbook "
+            "touches. A `failed` probe (dead credential, missing tool) blocks "
+            "publish — report it; `unprobeable` is common and fine.",
+            "7. PROOF RUN — the publish gate wants a green test run of this "
+            "exact candidate since its last edit: playbook_run_candidate "
+            "(owner-approved, real side effects).",
+            "8. PUBLISH — run the checklist in section 9, then ship.",
+        ]
+        quality_bar = [
+            "The validator's lints are the floor, not the target:",
+            "- monolithic-playbook (ERROR): one delegated step hiding the "
+            "whole process — decompose it.",
+            "- compound-leaf / agent-does-work (warnings): treat as redesign "
+            "signals, not noise.",
+            "- Context economy: to process N items, loop and judge ONE per "
+            "iteration — never interpolate a whole collection into one "
+            "prompt.",
+            "- Reference shapes: tool() → steps.<id>.result.<field>; "
+            "schemaless llm()/agent() → steps.<id>._raw (there is no "
+            ".output); loop() → steps.<id>.collected; code() → "
+            "steps.<id>.result.",
+            "- Discoverable collections (crawl/scan/traverse) are discovered "
+            "at RUN TIME with a state() frontier loop — never hardcoded "
+            "sibling calls; a while_ loop always sets max_iterations.",
+        ]
+        weights = [
+            "- FREE: reads, validate, dry_run, preflight — use "
+            "freely within budget.",
+        ]
+        worked = [
+            "A minimal real playbook (loop + one judgment per item + typed "
+            "collect):",
+            "",
+            "```python",
+            "playbook(name='digest-open-prs', description='Digest PRs needing "
+            "review',",
+            "    when_to_use='Owner asks what PRs are waiting on them')",
+            "",
+            "fetch = tool('github_list_prs', state='open')",
+            "scan = loop(over='{{ steps.fetch.result.items }}', "
+            "item_name='pr', concurrency=4,",
+            "    body=[(judge := llm('Does THIS ONE PR need the owner? "
+            "{{ pr }}',",
+            "        output={'needs_review': 'bool', 'title': 'str'}))],",
+            "    collect='{{ steps.judge }}')",
+            "digest = llm(\"Short digest of: {{ steps.scan.collected | "
+            "selectattr('needs_review') | list }}\",",
+            "    output={'digest': 'str'})",
+            "```",
+            "",
+            "BAD → GOOD: `agent('Check all open PRs, decide which need "
+            "review, and write a digest')` is the whole task hiding in one "
+            "step — monolithic-playbook, invisible loop, nothing inspectable. "
+            "The shape above is the same job decomposed: each step visible, "
+            "typed data between them.",
+            "",
+            "A good final report:",
+            "\"PUBLISHED v3 of digest-open-prs. Added the per-PR judgment "
+            "loop and a typed digest step. validate clean, "
+            "dry-run traces the loop over stubbed PRs (simulated), preflight "
+            "ok, test run green. Nothing needs you.\"",
+        ]
+        checklist = [
+            "1. playbook_validate is clean on the candidate.",
+            "2. A dry run with stubs from a real run traces the changed path.",
+            "3. A green test run of THIS exact candidate exists since its "
+            "last edit (playbook_run_candidate).",
+            "4. preflight shows no `failed` tools (external-service "
+            "playbooks).",
+            "5. The manifest still tells the true bigger picture (update it "
+            "with playbook_manifest_set if your change made it stale).",
+        ]
+        tail = _PROMPT_TAIL
 
     sections = [
         "# Playbook delegate",
@@ -247,60 +493,11 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "Work the phases in order. The retry caps stop thrash, not effort.",
         "",
-        "1. ORIENT (≤5 calls). Call playbook_language_reference FIRST and "
-        "read it — exact signatures, loop kwargs, state ops, and filters "
-        "live there, never in your memory; never guess syntax. For an "
-        "edit/fix job also read the target: playbook_edit(name) for the "
-        "ticket + manifest + code frames, playbook_status for the failing "
-        "run's per-step data.",
-        "2. OUTLINE, then author. Write the decomposition first, one line "
-        "per step: `id -> kind -> the SINGLE operation`. Self-check: a "
-        "quantifier (each/all/every) means a loop; one llm/agent step is "
-        "ONE judgment on ONE thing; mechanical work goes in tool()/code(); "
-        "pure transforms default to llm() with output= (typed fields, not "
-        "prose); loops gather with collect=. Create with playbook_propose "
-        "(pass manifest=); edit through the two-step ticket flow, copying "
-        "old= snippets verbatim from the code frame.",
-        "3. VALIDATE — playbook_validate reports ALL errors at once. Cap: "
-        "after 3 failed validates in a row, stop patching blind — "
-        "re-fetch the reference for the failing construct and re-derive "
-        "the code from it.",
-        "4. DRY-RUN — playbook_dry_run proves loops iterate, branches "
-        "branch, templates resolve, against STUBBED tools. Copy your "
-        "steps.<id>... paths from its `references` block — that block is "
-        "the API; the trace's per-step `output` label is not a path. Its "
-        "outputs are simulated.",
-        "5. STUBS FROM REALITY — after any real run (even a failed one) "
-        "copy the recorded step outputs from playbook_status into "
-        "playbook_dry_run's `stubs` (keyed by step id) so the simulation "
-        "sees real shapes. Cap: 3 failed dry runs in a row means the data "
-        "path is wrong — re-derive it from dry_run's references instead "
-        "of bending the stubs.",
-        "6. PREFLIGHT — playbook_preflight probes every tool the playbook "
-        "touches. A `failed` probe (dead credential, missing tool) blocks "
-        "publish — report it; `unprobeable` is common and fine.",
-        "7. PROOF RUN — the publish gate wants a green test run of this "
-        "exact candidate since its last edit: playbook_run_candidate "
-        "(owner-approved, real side effects).",
-        "8. PUBLISH — run the checklist in section 9, then ship.",
+        *work_loop,
         "",
         "## 5. The quality bar",
         "",
-        "The validator's lints are the floor, not the target:",
-        "- monolithic-playbook (ERROR): one delegated step hiding the "
-        "whole process — decompose it.",
-        "- compound-leaf / agent-does-work (warnings): treat as redesign "
-        "signals, not noise.",
-        "- Context economy: to process N items, loop and judge ONE per "
-        "iteration — never interpolate a whole collection into one "
-        "prompt.",
-        "- Reference shapes: tool() → steps.<id>.result.<field>; "
-        "schemaless llm()/agent() → steps.<id>._raw (there is no "
-        ".output); loop() → steps.<id>.collected; code() → "
-        "steps.<id>.result.",
-        "- Discoverable collections (crawl/scan/traverse) are discovered "
-        "at RUN TIME with a state() frontier loop — never hardcoded "
-        "sibling calls; a while_ loop always sets max_iterations.",
+        *quality_bar,
         "",
         "## 6. Budgets and stop rules",
         "",
@@ -317,8 +514,7 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "## 7. Actions and their weight",
         "",
-        "- FREE: reads, validate, dry_run, preflight — use "
-        "freely within budget.",
+        *weights,
         "- SIDE-EFFECTING: playbook_run and playbook_run_candidate touch "
         "the real world — only when the job needs real proof.",
         "- OWNER-DECISION: publish, rollback, run_candidate, "
@@ -329,49 +525,12 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "## 8. Worked shapes",
         "",
-        "A minimal real playbook (loop + one judgment per item + typed "
-        "collect):",
-        "",
-        "```python",
-        "playbook(name='digest-open-prs', description='Digest PRs needing "
-        "review',",
-        "    when_to_use='Owner asks what PRs are waiting on them')",
-        "",
-        "fetch = tool('github_list_prs', state='open')",
-        "scan = loop(over='{{ steps.fetch.result.items }}', "
-        "item_name='pr', concurrency=4,",
-        "    body=[(judge := llm('Does THIS ONE PR need the owner? "
-        "{{ pr }}',",
-        "        output={'needs_review': 'bool', 'title': 'str'}))],",
-        "    collect='{{ steps.judge }}')",
-        "digest = llm(\"Short digest of: {{ steps.scan.collected | "
-        "selectattr('needs_review') | list }}\",",
-        "    output={'digest': 'str'})",
-        "```",
-        "",
-        "BAD → GOOD: `agent('Check all open PRs, decide which need "
-        "review, and write a digest')` is the whole task hiding in one "
-        "step — monolithic-playbook, invisible loop, nothing inspectable. "
-        "The shape above is the same job decomposed: each step visible, "
-        "typed data between them.",
-        "",
-        "A good final report:",
-        "\"PUBLISHED v3 of digest-open-prs. Added the per-PR judgment "
-        "loop and a typed digest step. validate clean, "
-        "dry-run traces the loop over stubbed PRs (simulated), preflight "
-        "ok, test run green. Nothing needs you.\"",
+        *worked,
         "",
         "## 9. Pre-publish checklist",
         "",
         "Immediately before publishing, confirm every line:",
-        "1. playbook_validate is clean on the candidate.",
-        "2. A dry run with stubs from a real run traces the changed path.",
-        "3. A green test run of THIS exact candidate exists since its "
-        "last edit (playbook_run_candidate).",
-        "4. preflight shows no `failed` tools (external-service "
-        "playbooks).",
-        "5. The manifest still tells the true bigger picture (update it "
-        "with playbook_manifest_set if your change made it stale).",
+        *checklist,
         "Then playbook_publish(name, explanation=...) — the explanation "
         "in owner words, not tool words.",
         "",
@@ -384,7 +543,7 @@ def _delegate_prompt(task: str, pb: Playbook | None) -> str:
         "",
         "## 11. Before you finish",
         "",
-        _PROMPT_TAIL,
+        tail,
     ]
     return "\n".join(sections)
 
@@ -592,6 +751,9 @@ async def _drive_delegation(
     # Expose the live feed for the card route — DB flushes are throttled,
     # but a poll may read the in-memory feed for freshness.
     _LIVE_FEEDS[delegation_id] = feed
+    # phase 11: every version row minted by this turn's tool calls is
+    # stamped `delegation:<id>` (see writer_identity).
+    identity_token = _delegation_id.set(delegation_id)
     try:
         # plans/020: luna 098 collapsed conversation states to
         # planning/building. The delegate always runs as "building" — its
@@ -644,6 +806,7 @@ async def _drive_delegation(
         except Exception:  # noqa: BLE001
             log.exception("delegation %s: could not record crash", delegation_id)
     finally:
+        _delegation_id.reset(identity_token)
         _LIVE_FEEDS.pop(delegation_id, None)
 
 
@@ -811,9 +974,11 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                 description=(
                     "Delegate a playbook authoring job (create, fix, edit) "
                     "to a focused background agent. It works "
-                    "through the full loop (read, edit, validate, dry-run, "
-                    "test run, publish) in its own context; a live "
-                    "progress card appears in the chat. Returns within "
+                    "through the full loop (read, write — validated on "
+                    "save, dry-run, real candidate run, publish) in its "
+                    "own context; a live progress card appears in the "
+                    "chat. New playbooks are written as python (v2); an "
+                    "edit follows the target's format. Returns within "
                     "wait_seconds (default 25): either the finished report "
                     "or status 'running' — then tell the owner the card "
                     "tracks the work and END your turn; never poll."
@@ -827,7 +992,7 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                                 "The job, phrased with goal + acceptance, "
                                 "e.g. 'Fix the phone format in "
                                 "candidate-intake: normalize to E.164; "
-                                "publish when the test run is green.'"
+                                "publish when the candidate run is green.'"
                             ),
                         },
                         "playbook": {

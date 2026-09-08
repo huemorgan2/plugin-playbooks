@@ -107,6 +107,51 @@ async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion
     return row
 
 
+def author_label(author: str | None) -> str:
+    """plans/032 phase 11: the owner-facing name of a version row's author —
+    `agent` → "the agent", `owner` → "the owner", `delegation:<id>` →
+    "delegation <8 hex> (delegation:<id>)"; anything else verbatim."""
+    a = author or ""
+    if a == "agent":
+        return "the agent"
+    if a == "owner":
+        return "the owner"
+    if a.startswith("delegation:"):
+        return f"delegation {a[len('delegation:'):][:8]} ({a})"
+    return a or "an unknown author"
+
+
+async def candidate_conflict(
+    session: AsyncSession, p: Playbook, author: str,
+) -> dict | None:
+    """plans/032 phase 11: the candidate-conflict guard. None when the
+    playbook has no unpublished candidate or its candidate row was written
+    by `author` (the same author iterates on its own candidate; the pointer
+    moves as before). Otherwise a foreign candidate exists and the caller
+    must refuse: `{candidate_version, author, saved_at}` — never replaced
+    silently."""
+    n = p.candidate_version
+    if not n:
+        return None
+    row = await get_version_row(session, p, n)
+    if row is None or row.author == author:
+        return None
+    saved_at = row.created_at.isoformat() if row.created_at is not None else None
+    return {"candidate_version": n, "author": row.author, "saved_at": saved_at}
+
+
+def conflict_message(name: str, conflict: dict) -> str:
+    """The refusal sentence every guarded writer returns (edit and propose)."""
+    return (
+        f"Playbook '{name}' already has an unpublished candidate "
+        f"v{conflict['candidate_version']} saved by "
+        f"{author_label(conflict['author'])} at {conflict['saved_at']}. "
+        "Nothing was saved — a candidate written by someone else is never "
+        "replaced silently. Ask the owner whether to publish it or replace "
+        "it; then re-read and retry."
+    )
+
+
 async def mint_version(
     session: AsyncSession,
     p: Playbook,

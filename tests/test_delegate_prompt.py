@@ -13,6 +13,13 @@ from plugin_playbooks.delegation import _PROMPT_TAIL, _delegate_prompt
 from plugin_playbooks.models import Playbook
 
 
+def _p(task: str, pb: Playbook | None = None) -> str:
+    """plans/032 phase 11: `_delegate_prompt(task, None)` now yields the
+    python (v2) variant (a new playbook is python); these pins are the
+    pblang variant's, so the format is explicit. Assertions untouched."""
+    return _delegate_prompt(task, pb, format="pblang")
+
+
 def _pb() -> Playbook:
     return Playbook(
         name="candidate-intake",
@@ -24,23 +31,23 @@ def _pb() -> Playbook:
 
 
 def test_eleven_sections_in_order():
-    p = _delegate_prompt("fix the phones", _pb())
+    p = _p("fix the phones", _pb())
     headers = re.findall(r"^## (\d+)\.", p, re.M)
     assert headers == [str(i) for i in range(1, 12)]
 
 
 def test_brief_carries_task_and_manifest():
-    p = _delegate_prompt("fix the phones", _pb())
+    p = _p("fix the phones", _pb())
     assert "fix the phones" in p
     assert "INTENT: intake candidates" in p
     assert "candidate-intake" in p
     # From-scratch jobs get no target block.
-    p2 = _delegate_prompt("build a digest", None)
+    p2 = _p("build a digest", None)
     assert "Target playbook" not in p2
 
 
 def test_reference_fetched_just_in_time_never_pasted():
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     assert "playbook_language_reference" in p
     assert "FIRST" in p
     # The old prompt pasted the whole authoring skill — the point of the
@@ -51,7 +58,7 @@ def test_reference_fetched_just_in_time_never_pasted():
 
 
 def test_honesty_rules_present():
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     low = p.lower()
     assert "simulated" in low
     assert "never report it as real" in low
@@ -63,7 +70,7 @@ def test_honesty_rules_present():
 def test_checklist_wired_before_publish():
     # 021: the plans feature is gone — the checklist + approval card are
     # the whole pre-publish story, and the manifest is context, not law.
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     assert "playbook_plan_write" not in p
     assert "plan_id" not in p
     assert "playbook_manifest_set" in p
@@ -73,7 +80,7 @@ def test_checklist_wired_before_publish():
 
 
 def test_budgets_named_with_rationale_and_losing_exits():
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     assert "40" in p and "15 min" in p
     assert "why:" in p  # the numeric limit carries its rationale
     assert "3 failed validates" in p
@@ -81,14 +88,14 @@ def test_budgets_named_with_rationale_and_losing_exits():
 
 
 def test_tail_is_verbatim_and_short():
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     assert p.rstrip().endswith(_PROMPT_TAIL)
     assert 3 <= len(_PROMPT_TAIL.strip().splitlines()) <= 5
 
 
 def test_emphasis_stays_scarce():
     # ≤5 shouty lines: emphasis only works when it is rare.
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     shouty = [
         ln for ln in p.splitlines()
         if len(ln) > 8 and ln == ln.upper() and any(c.isalpha() for c in ln)
@@ -97,7 +104,7 @@ def test_emphasis_stays_scarce():
 
 
 def test_worked_example_is_valid_shape():
-    p = _delegate_prompt("task", None)
+    p = _p("task", None)
     assert "playbook(name='digest-open-prs'" in p
     assert "collect=" in p
     assert "BAD" in p and "GOOD" in p

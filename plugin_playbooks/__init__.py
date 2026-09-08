@@ -668,8 +668,9 @@ _DELEGATION_SKILL_BODY = '''\
 
 `playbook_agent(task, playbook="", wait_seconds=25)` hands a playbook
 authoring job (create, fix, edit) to a focused background agent.
-It runs the full loop — read, edit, validate, dry-run, test run, publish —
-in its own context; your chat keeps one call and one short result.
+It runs the full loop — read, write (validated on save), dry-run, real
+candidate run, publish — in its own context; your chat keeps one call and
+one short result.
 
 ## When to delegate vs. do it yourself
 
@@ -697,7 +698,7 @@ Write the task like a work order: goal + constraints + acceptance. Name the
 playbook for edit/fix jobs. Include what the owner told you (desired
 behavior, examples, the failing run's symptom). Good:
 "Fix the phone format in candidate-intake: numbers must normalize to
-E.164; publish when the test run is green."
+E.164; publish when the candidate run is green."
 Spell collection jobs as loops — "for each unread email ..." — so the
 delegate builds a loop.
 
