@@ -8,15 +8,17 @@ import { memo, useEffect, useState } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import {
   Bot, Wrench, GitBranch, Layers, Clock, Mail,
-  RotateCcw, CircleDot, Zap, ExternalLink, Info, Sparkles, Database, Ban, Code2,
+  RotateCcw, CircleDot, Zap, ExternalLink, Info, Sparkles, Database, Ban, Code2, ShieldAlert,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
-import { type StepKind, type RunStatus, type StepDef, STEP_COLORS, STATUS_COLORS } from '../types'
+import { type NodeLook, type RunStatus, type StepDef, STEP_COLORS, STATUS_COLORS } from '../types'
 import { IntegrationIcon, toolIconUrl, useIconRef } from '../icons'
 
 interface StepNodeData {
   stepId: string
-  kind: StepKind
+  // plans/032 phase 10: a python node wears a pblang look (`compute` and
+  // `error_boundary` are the python-only ones).
+  kind: NodeLook
   label: string
   sublabel?: string
   explanation?: string
@@ -28,10 +30,12 @@ interface StepNodeData {
   // replayed" — play the flash-and-fade shimmer (separate from glowSeq so
   // build-glow and run-shimmer never fight).
   fireSeq?: number
+  // plans/032 phase 10: a python tool node names its tool here (no stepDef).
+  tool?: string
   [key: string]: unknown
 }
 
-const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> = {
+const KIND_ICONS: Record<NodeLook, React.ComponentType<{ className?: string }>> = {
   agent_step: Bot,
   llm_step: Sparkles,
   tool_call: Wrench,
@@ -44,6 +48,8 @@ const KIND_ICONS: Record<StepKind, React.ComponentType<{ className?: string }>> 
   state: Database,
   halt: Ban,
   code: Code2,
+  compute: Code2,
+  error_boundary: ShieldAlert,
 }
 
 function StepNodeComponent({ data, selected }: NodeProps) {
@@ -56,7 +62,7 @@ function StepNodeComponent({ data, selected }: NodeProps) {
   // plans/011: a tool step wears the icon of the integration behind the tool.
   const iconRef = useIconRef()
   const toolUrl = kind === 'tool_call'
-    ? toolIconUrl(iconRef, (d.stepDef as StepDef | undefined)?.tool)
+    ? toolIconUrl(iconRef, d.tool ?? (d.stepDef as StepDef | undefined)?.tool)
     : null
   const statusClass = d.runStatus ? STATUS_COLORS[d.runStatus] : ''
 
@@ -91,6 +97,7 @@ function StepNodeComponent({ data, selected }: NodeProps) {
           'px-4 py-2.5 border backdrop-blur-sm shadow-lg transition-all min-w-[160px] max-w-[240px] cursor-pointer',
           colors.bg, colors.border,
           isCondition ? 'rotate-0 rounded-lg' : 'rounded-xl',
+          kind === 'error_boundary' && 'border-dashed',
           selected && 'ring-2 ring-luna-400/50 ring-offset-1 ring-offset-ink-950',
           d.runStatus === 'running' && 'animate-pulse',
           glowing && 'node-arriving',
@@ -107,7 +114,8 @@ function StepNodeComponent({ data, selected }: NodeProps) {
             kind === 'loop' ? 'bg-purple-800/60' :
             kind === 'state' ? 'bg-emerald-800/60' :
             kind === 'code' ? 'bg-cyan-800/60' :
-            kind === 'halt' ? 'bg-rose-800/60' :
+            kind === 'halt' || kind === 'error_boundary' ? 'bg-rose-800/60' :
+            kind === 'compute' ? 'bg-slate-800/60' :
             'bg-ink-800/60'
           )}>
             <IntegrationIcon

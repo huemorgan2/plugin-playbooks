@@ -81,7 +81,8 @@ A **Playbooks** sidebar section (full-pane iframe, prebuilt
 `plugin_playbooks/ui/`, source in `ui-src/` — Vite + React + react-flow). List
 shows per-playbook trust rows (tools · intent) and pending-candidate
 chips; the editor has five tabs: Canvas (live/candidate graph, past-run
-projection), Code (read-only pblang), Manifest, Connections (tool probes),
+projection; python playbooks: graph derived from the code, run trace from the
+journal), Code (read-only pblang), Manifest, Connections (tool probes),
 Runs (stats + per-step execution rows). Live agent edits stream in over
 Luna's E12 `ui.plugin.event` bridge; run/step activity rides `activity.*` SSE.
 

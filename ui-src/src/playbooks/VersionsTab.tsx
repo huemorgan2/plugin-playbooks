@@ -17,7 +17,10 @@ import { playbooksApi } from './api'
 import { applyPlaybookPatch, type PlaybookPatchEvt } from './livePatch'
 import { findStepById } from './explain/dataflow'
 import { VersionCanvas, CodeView, sourceFor } from './VersionCanvas'
-import { V2View } from './V2View'
+import { V2Canvas } from './v2/V2Canvas'
+import { V2NodePanel } from './v2/V2NodePanel'
+import { diffGlow } from './v2/graphLayout'
+import type { V2Graph, V2Item } from './v2/types'
 import { StepDetailPanel, execRowsForStep } from './StepDetailPanel'
 import { ManifestTab } from './ManifestTab'
 import { ConnectionsTab } from './ConnectionsTab'
@@ -223,7 +226,8 @@ export function VersionsTab({
   agentName: string
   liveVersion: number
   candidateVersion: number | null
-  /** plans/032 phase 04: python → the interim V2View replaces the canvas. */
+  /** plans/032 phase 10: python → the canvas is the server-derived graph
+   *  (V2Canvas); the version detail's own `format` wins when present. */
   format?: 'pblang' | 'python'
   /** Bumped by the editor after a reload (agent save, promote) → re-list + re-fetch. */
   refreshKey?: number
@@ -250,6 +254,13 @@ export function VersionsTab({
   const [patchedDef, setPatchedDef] = useState<PlaybookDef | null>(null)
   const [glow, setGlow] = useState<Map<string, number>>(new Map())
   const glowSeqRef = useRef(0)
+  // plans/032 phase 10: the python graph of the selected version + the
+  // selected node of that graph (the pblang path keeps `selectedStep`).
+  const [graph, setGraph] = useState<V2Graph | null>(null)
+  const [selectedNode, setSelectedNode] = useState<V2Item | null>(null)
+  const graphRef = useRef<V2Graph | null>(null)
+  useEffect(() => { graphRef.current = graph }, [graph])
+  const isPython = (detail?.format ?? format) === 'python'
 
   const reList = useCallback(() => {
     return playbooksApi.listVersions(name)
@@ -294,10 +305,48 @@ export function VersionsTab({
         setPatchedDef(null)
         setGlow(new Map())
         setSelectedStep(null)
+        setSelectedNode(null)
       })
       .catch((e) => { if (!cancelled) setDetailError(e.message) })
     return () => { cancelled = true }
   }, [name, selected, refreshKey])
+
+  // plans/032 phase 10: a python version's graph comes from the server. A
+  // re-fetch of the same version (editor reload after an agent save) glows
+  // the nodes that are new or changed; a different version starts clean.
+  const fetchGraph = useCallback(async (version: number, glowDiff: boolean) => {
+    const g = await playbooksApi.getGraph(name, version)
+    const prev = graphRef.current
+    if (glowDiff && prev && prev.version === g.version) {
+      const changed = diffGlow(prev, g)
+      if (changed.length) {
+        glowSeqRef.current += 1
+        const seq = glowSeqRef.current
+        setGlow((cur) => {
+          const next = new Map(cur)
+          for (const id of changed) next.set(id, seq)
+          return next
+        })
+      }
+    }
+    setGraph(g)
+    return g
+  }, [name])
+
+  useEffect(() => {
+    if (!detail) return
+    const python = (detail.format ?? format) === 'python'
+    if (!python) { setGraph(null); return }
+    let cancelled = false
+    fetchGraph(detail.version, true)
+      .then((g) => {
+        if (cancelled) return
+        setSelectedNode((cur) => cur && g.node_ids.includes(cur.node)
+          ? (g.node_ids.length ? cur : null) : null)
+      })
+      .catch((e) => { if (!cancelled) setDetailError(e.message) })
+    return () => { cancelled = true }
+  }, [detail, format, fetchGraph])
 
   // Live agent patches follow the version the agent is writing: the candidate,
   // or live when there is no candidate yet.
@@ -305,6 +354,13 @@ export function VersionsTab({
     if (!patch || !detail) return
     const follows = detail.candidate || (candidateVersion == null && detail.live)
     if (!follows) return
+    if (isPython) {
+      // plans/032 phase 10: a python patch is the whole source — the graph
+      // is re-derived on the server; changed nodes glow.
+      setRunDetail(null)
+      void fetchGraph(detail.version, true).catch(() => {})
+      return
+    }
     const base = patchedDef ?? detail.definition
     const { def, glowNodeId } = applyPlaybookPatch(base, patch.evt)
     setPatchedDef(def)
@@ -320,6 +376,7 @@ export function VersionsTab({
     if (n === selected) return
     setSelected(n)
     setRunDetail(null)
+    setSelectedNode(null)
     setPromoteError(null)
     setConfirmOpen(false)
   }, [selected])
@@ -517,14 +574,17 @@ export function VersionsTab({
               <div className="h-full flex items-center justify-center text-ink-400">
                 <Loader2 className="w-5 h-5 animate-spin" />
               </div>
-            ) : view === 'canvas' && format === 'python' ? (
-              // plans/032 phase 04: a python definition is the checker
-              // summary — no steps to lay out, so no VersionCanvas/buildGraph.
-              <V2View
-                code={detail.code}
-                runDetail={runDetail}
+            ) : view === 'canvas' && isPython ? (
+              // plans/032 phase 10: the server-derived graph of the python
+              // version, with the run's journal trace projected onto it.
+              <V2Canvas
+                graph={graph}
+                name={name}
                 agentName={agentName}
+                runDetail={runDetail}
                 onClearRun={() => setRunDetail(null)}
+                onSelectNode={setSelectedNode}
+                glow={glow}
               />
             ) : view === 'canvas' ? (
               <VersionCanvas
@@ -570,7 +630,16 @@ export function VersionsTab({
             )}
           </div>
 
-          {selectedStep && view === 'canvas' && detail && (
+          {selectedNode && view === 'canvas' && detail && isPython && (
+            <V2NodePanel
+              item={selectedNode}
+              code={detail.code}
+              run={runDetail}
+              onClose={() => setSelectedNode(null)}
+            />
+          )}
+
+          {selectedStep && view === 'canvas' && detail && !isPython && (
             <StepDetailPanel
               step={selectedStep}
               execRows={execRowsForStep(runDetail, selectedStep.id)}

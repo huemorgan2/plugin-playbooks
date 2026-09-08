@@ -15,6 +15,11 @@ export type StepKind =
 export type RunStatus =
   | 'pending' | 'running' | 'completed' | 'done' | 'failed' | 'waiting' | 'cancelled'
 
+// plans/032 phase 10: the looks a canvas node can wear — every pblang kind
+// plus the two python-only shapes (code between effects, `try` boundary).
+// StepKind itself stays the pblang step vocabulary.
+export type NodeLook = StepKind | 'compute' | 'error_boundary'
+
 // 007.009.01: one op a `state` step applies to a run-scoped variable.
 export interface StateOp {
   op:
@@ -117,7 +122,7 @@ export interface PlaybookSummary {
   version: number
   live_version?: number
   candidate_version?: number | null
-  // plans/032 phase 04: the UI picks its version view by it (python → V2View).
+  // plans/032 phase 04/10: the UI picks its version view by it (python → V2Canvas).
   format?: 'pblang' | 'python'
   trust?: TrustSummary
   // plans/001: run history, computed server-side over the last 30 days.
@@ -139,6 +144,8 @@ export interface VersionDetail {
   live: boolean
   candidate: boolean
   runs: number
+  // plans/032 phase 10: the language of this version's code.
+  format?: 'pblang' | 'python'
 }
 
 export interface PlaybookRunSummary {
@@ -176,15 +183,41 @@ export interface StepRunDetail {
   completed_at: string | null
 }
 
+// plans/032 phase 10: one journal row projected onto the graph
+// (`node` = `step-<call_site_id>`, `occurrence` 1-based; docs/v2.md §6).
+export interface TraceRow {
+  seq: number
+  node: string
+  call_site_id: string
+  occurrence: number
+  kind: string
+  journal_status: string
+  status: RunStatus
+  error: { type: string; message: string } | null
+  dry: boolean
+  started_at: string | null
+  ended_at: string | null
+  ms: number | null
+  args?: any
+  result?: any
+  parked_on?: Record<string, any>
+}
+
 export interface PlaybookRunDetail extends PlaybookRunSummary {
   inputs: Record<string, any>
   steps: StepRunDetail[]
+  // plans/032 phase 10: present only for journaled (python) runs.
+  trace?: TraceRow[]
+  failed_line?: number | null
+  error?: string | null
+  error_type?: string | null
+  traceback?: string | null
 }
 
 // 006.709: `glow` is the RGB triplet of the kind's 400-level color — the
 // node-arrive animation reads it via the --glow-rgb CSS variable so each
 // node glows in its own color family.
-export const STEP_COLORS: Record<StepKind, { bg: string; border: string; text: string; glow: string }> = {
+export const STEP_COLORS: Record<NodeLook, { bg: string; border: string; text: string; glow: string }> = {
   agent_step:        { bg: 'bg-indigo-950/60',  border: 'border-indigo-500/40', text: 'text-indigo-200', glow: '129 140 248' },
   llm_step:          { bg: 'bg-fuchsia-950/60', border: 'border-fuchsia-500/40', text: 'text-fuchsia-200', glow: '232 121 249' },
   tool_call:         { bg: 'bg-teal-950/60',    border: 'border-teal-500/40',   text: 'text-teal-200',   glow: '45 212 191' },
@@ -197,6 +230,9 @@ export const STEP_COLORS: Record<StepKind, { bg: string; border: string; text: s
   state:             { bg: 'bg-emerald-950/60', border: 'border-emerald-500/40', text: 'text-emerald-200', glow: '52 211 153' },
   halt:              { bg: 'bg-rose-950/60',    border: 'border-rose-500/40',   text: 'text-rose-200',   glow: '251 113 133' },
   code:              { bg: 'bg-cyan-950/60',    border: 'border-cyan-500/40',   text: 'text-cyan-200',   glow: '34 211 238' },
+  // plans/032 phase 10: python-only looks
+  compute:           { bg: 'bg-slate-950/60',   border: 'border-slate-500/40',  text: 'text-slate-200',  glow: '148 163 184' },
+  error_boundary:    { bg: 'bg-rose-950/40',    border: 'border-rose-500/40',   text: 'text-rose-200',   glow: '251 113 133' },
 }
 
 export const STATUS_COLORS: Record<RunStatus, string> = {

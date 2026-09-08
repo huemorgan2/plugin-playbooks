@@ -2,6 +2,7 @@ import type {
   PlaybookSummary, PlaybookRunSummary, PlaybookRunDetail,
   ProbeEntry, VersionDetail,
 } from './types'
+import type { V2Graph } from './v2/types'
 import { getToken, getTokenAsync, invalidateToken } from '../lib/auth'
 
 async function doFetch(path: string, tok: string, opts?: RequestInit): Promise<Response> {
@@ -126,6 +127,13 @@ export const playbooksApi = {
 
   getVersion: (name: string, n: number) =>
     apiFetch<VersionDetail>(`${BASE}/playbooks/${name}/versions/${n}`),
+
+  // plans/032 phase 10: the server-derived block tree of a python version
+  // (`version` defaults to live, else candidate; a pblang version → 409).
+  getGraph: (name: string, version?: number) =>
+    apiFetch<V2Graph>(
+      `${BASE}/playbooks/${name}/graph${version != null ? `?version=${version}` : ''}`,
+    ),
 
   // 021: the owner's click is the consent — the server never blocks a
   // promote on test-run evidence (static validation and broken tools

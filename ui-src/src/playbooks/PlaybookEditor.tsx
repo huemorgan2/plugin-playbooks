@@ -49,7 +49,7 @@ export function PlaybookEditor(props: Props) {
     status: string
     version: number
     candidateVersion: number | null
-    // plans/032 phase 04: python playbooks get the interim V2View.
+    // plans/032 phase 04/10: python playbooks get the server-derived graph canvas.
     format?: 'pblang' | 'python'
     isDraft: boolean
     draftId?: string

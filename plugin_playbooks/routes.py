@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -946,7 +946,7 @@ async def get_run(run_id: str):
             .order_by(PlaybookStepRun.started_at)
         )).scalars().all()
 
-        return {
+        payload: dict[str, Any] = {
             "id": str(run.id),
             "status": run.status,
             "trigger": run.trigger,
@@ -968,6 +968,23 @@ async def get_run(run_id: str):
                 "completed_at": s.completed_at.isoformat() if s.completed_at else None,
             } for s in steps],
         }
+    # plans/032 phase 10 (docs/v2.md §6): a journaled run carries its trace —
+    # one row per effect occurrence keyed on the graph's `step-<call_site_id>`
+    # — plus the run-level error triple and the failed line. A run without
+    # journal rows (every pblang run) keeps the pre-phase-10 payload exactly.
+    from .v2.graph import parse_failed_line, trace_rows
+    from .v2.journal_db import DbJournalStore
+
+    try:
+        entries = await DbJournalStore(_sf()).read(str(run.id))
+    except KeyError:
+        return payload
+    payload["trace"] = trace_rows(entries)
+    payload["error"] = getattr(run, "error", None)
+    payload["error_type"] = getattr(run, "error_type", None)
+    payload["traceback"] = getattr(run, "traceback", None)
+    payload["failed_line"] = parse_failed_line(payload["error"])
+    return payload
 
 
 @router.post("/playbooks/runs/{run_id}/cancel")
@@ -1081,6 +1098,8 @@ async def get_version(name: str, n: int):
                 "live": True,
                 "candidate": False,
                 "runs": runs,
+                # plans/032 phase 10: the language of this version's code
+                "format": getattr(p, "format", None) or "pblang",
             }
         return {
             "version": row.version,
@@ -1094,7 +1113,50 @@ async def get_version(name: str, n: int):
             "live": row.version == live_n,
             "candidate": row.version == p.candidate_version,
             "runs": runs,
+            "format": getattr(row, "format", None) or "pblang",
         }
+
+
+@router.get("/playbooks/{name}/graph")
+async def get_graph(name: str, version: Optional[int] = None):
+    """plans/032 phase 10 (master §2 Canvas): the block tree of a python
+    version's `async def run`, derived from the code on the server — node ids
+    are the checker's call-site ids (`step-<id>`), so the Versions tab can
+    project a run's journal onto them. `version` defaults to the live version,
+    else the candidate. A pblang version answers 409: the canvas builds pblang
+    graphs client-side from the definition, as before."""
+    from .v2.checker import check
+    from .v2.graph import build_graph
+
+    async with _sf()() as session:
+        p = (await session.execute(
+            select(Playbook).where(Playbook.name == name)
+        )).scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, f"Playbook '{name}' not found")
+        live_n = _live_version_of(p)
+        n = version if version is not None else (live_n or p.candidate_version)
+        if n is None:
+            raise HTTPException(404, f"Playbook '{name}' has no version")
+        row = await _get_version_row(session, p, n)
+        if row is None and (live_n is None or n != live_n):
+            raise HTTPException(404, f"Version {n} of '{name}' not found")
+        fmt = (getattr(row, "format", None) if row is not None else None) or p.format or "pblang"
+        definition = (row.definition if row is not None else p.definition) or {}
+        code = (row.code if row is not None else p.code) or ""
+    if fmt != "python":
+        return JSONResponse(
+            status_code=409,
+            content={"error": f"version {n} of '{name}' is {fmt} — the canvas builds "
+                              f"{fmt} graphs client-side"},
+        )
+    call_sites = definition.get("call_sites") if isinstance(definition, dict) else None
+    if call_sites is None:
+        call_sites = check(code, name=name, version=n).summary.get("call_sites") or []
+    return build_graph(
+        code, name=name, version=n, triggers=definition.get("triggers") or [],
+        call_sites=call_sites,
+    )
 
 
 class PromoteBody(BaseModel):
