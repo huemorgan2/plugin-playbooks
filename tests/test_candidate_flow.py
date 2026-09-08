@@ -420,6 +420,10 @@ async def test_live_run_notes_pending_candidate(env):
 
 @pytest.mark.asyncio
 async def test_manifest_set_with_pending_candidate_keeps_versions_unique(env):
+    """plans/033 (operator decision P4-5): with a pending candidate v2 by
+    the same author, manifest_set mints v3 = v2's code + the new manifest
+    and moves the candidate pointer; live v1 is untouched. (Before 0.57.0
+    this test pinned the side door: v3 went LIVE over the candidate.)"""
     sf, tools, _, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     await _publish_v1(sf, tools)
@@ -428,12 +432,16 @@ async def test_manifest_set_with_pending_candidate_keeps_versions_unique(env):
         name="greeter", manifest="## Purpose\nGreets.\n",
     ))
     assert out["version"] == 3                  # bumped PAST the candidate
+    assert out["status"] == "manifest_candidate_saved"
     pb = await _get(sf)
-    assert pb.live_version == 3
-    assert pb.candidate_version == 2            # candidate survives
+    assert pb.live_version == 1                 # live never moves here
+    assert pb.candidate_version == 3            # ONE merged candidate
+    assert pb.manifest == ""                    # live manifest untouched
     rows = await _rows(sf)
     assert set(rows) == {1, 2, 3}               # no duplicate version numbers
     assert rows[3].manifest == "## Purpose\nGreets.\n"
+    assert rows[3].code == NEW_CODE             # the candidate's code came along
+    assert rows[2].manifest == ""               # history untouched
 
 
 # --- policies ---

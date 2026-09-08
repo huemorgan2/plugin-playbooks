@@ -46,14 +46,13 @@ WHITELIST: frozenset[tuple[str, str]] = frozenset({
 })
 
 # Direct writers the master's whitelist OMITS and a P0 plan owns: the scan
-# stays green while the repro pin
-# (tests/test_repro_fixplaybooks_lifecycle.py::test_manifest_set_does_not_flip_live)
-# stays red. When that plan lands, this set empties (the test below insists
-# every entry here is still present, so a landed fix is noticed).
-KNOWN_SIDE_DOORS: dict[tuple[str, str], str] = {
-    # luna-fixer plans/2026-09-06-manifest-set-live-bypass (Risks 2)
-    ("agent_tools.py", "_manifest_set"): "2026-09-06-manifest-set-live-bypass",
-}
+# stays green while the matching repro pin stays red. When that plan lands,
+# its entry is dropped (the test below insists every entry here is still
+# present, so a landed fix is noticed). Empty since plans/033 (0.57.0):
+# `_manifest_set` saves a candidate and no longer writes live_version
+# (tests/test_repro_fixplaybooks_lifecycle.py::test_manifest_set_does_not_flip_live
+# is green).
+KNOWN_SIDE_DOORS: dict[tuple[str, str], str] = {}
 
 # the column definition (models.py `Playbook.live_version`) is a class-level
 # AnnAssign on a bare Name — not an attribute store — so the scanner never

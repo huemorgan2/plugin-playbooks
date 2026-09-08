@@ -259,7 +259,8 @@ def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = Non
             brief += ["", "Its manifest — the bigger picture of what this "
                       "playbook is for. Read it before changing things; it "
                       "is context, not law. If your change makes it "
-                      "outdated, update it (playbook_manifest_set):", "",
+                      "outdated, update it (playbook_manifest_set — saves "
+                      "onto the candidate; publish puts it live):", "",
                       pb.manifest]
 
     if python:
@@ -350,7 +351,8 @@ def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = Non
             "4. preflight shows no `failed` tools (external-service "
             "playbooks).",
             "5. The manifest still tells the true bigger picture (update it "
-            "with playbook_manifest_set if your change made it stale).",
+            "with playbook_manifest_set if your change made it stale — it "
+            "saves onto the candidate, so do it BEFORE publish).",
         ]
         tail = _PROMPT_TAIL_V2
     else:
@@ -454,7 +456,8 @@ def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = Non
             "4. preflight shows no `failed` tools (external-service "
             "playbooks).",
             "5. The manifest still tells the true bigger picture (update it "
-            "with playbook_manifest_set if your change made it stale).",
+            "with playbook_manifest_set if your change made it stale — it "
+            "saves onto the candidate, so do it BEFORE publish).",
         ]
         tail = _PROMPT_TAIL
 

@@ -24,6 +24,7 @@ from plugin_playbooks.models import (
     PlaybookEditTicket,
     PlaybookVersion,
 )
+from plugin_playbooks.versioning import live_version_of
 
 
 class _Bus:
@@ -238,22 +239,31 @@ def test_edit_force_tool_is_gone(env):
 
 @pytest.mark.asyncio
 async def test_manifest_set_snapshots_and_bumps(env):
+    """plans/033: manifest_set saves a CANDIDATE. On a never-published
+    playbook (propose = candidate v1) it merges onto that candidate: v2
+    carries v1's code plus the manifest, the pointer moves, nothing is live
+    (before 0.57.0 this test pinned the live flip: `live_version == 2`)."""
     sf, tools, _ = env
     await tools["playbook_propose"](name="greeter", code=CODE)
     out = json.loads(await tools["playbook_manifest_set"](
         name="greeter", manifest=MANIFEST,
     ))
-    assert out["status"] == "manifest_set"
+    assert out["status"] == "manifest_candidate_saved"
     assert out["version"] == 2
+    assert out["candidate_version"] == 2
+    assert out["live_version"] is None
+    assert "publish to go live" in out["note"]
     pb = await _get(sf, "greeter")
-    assert pb.manifest == MANIFEST
-    assert pb.live_version == 2  # the manifest is live content
+    assert pb.manifest == MANIFEST      # never published: the row mirrors it
+    assert pb.candidate_version == 2
+    assert live_version_of(pb) is None  # nothing went live
     async with sf() as s:
         vers = {v.version: v for v in (await s.execute(select(PlaybookVersion))).scalars().all()}
     assert set(vers) == {1, 2}
-    assert vers[1].manifest == ""          # pre-change live recorded
-    assert vers[2].manifest == MANIFEST    # new live version carries it
-    assert vers[2].message == "manifest updated"
+    assert vers[1].manifest == ""          # the earlier candidate row
+    assert vers[2].manifest == MANIFEST    # the merged candidate carries it
+    assert vers[2].code == CODE            # ...and the candidate's code
+    assert vers[2].message == "manifest updated on candidate"
 
 
 @pytest.mark.asyncio

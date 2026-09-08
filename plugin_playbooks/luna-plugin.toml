@@ -1,5 +1,5 @@
 name = "plugin-playbooks"
-version = "0.56.0"
+version = "0.57.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
@@ -157,7 +157,7 @@ risk_level = "low"
 
 [[tools]]
 name = "playbook_manifest_set"
-description = "Set or replace a playbook's manifest — context, not law; update it when it goes stale."
+description = "Set or replace a playbook's manifest — context, not law; update it when it goes stale. Saves a candidate; live changes only through playbook_publish."
 policy = "auto_approve"
 risk_level = "low"
 

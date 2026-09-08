@@ -444,8 +444,9 @@ concurrent loop. THAT is a crawl.
 Every playbook can carry a MANIFEST: the bigger picture in plain markdown —
 Purpose, Side effects, Never (invariants), Acceptance. It is context, not
 law: read it before changing things; nothing enforces it, and if a change
-makes it stale, update it with `playbook_manifest_set`. Editing is TWO
-steps:
+makes it stale, update it with `playbook_manifest_set` — that saves the
+manifest onto the CANDIDATE (nothing goes live until `playbook_publish`), so
+do it before you publish. Editing is TWO steps:
 1. READ: `playbook_edit(name)` alone → a JSON header (versions, ticket)
 plus the manifest and current code as plain-text frames; copy `old=`
 snippets verbatim from the code frame.
@@ -725,7 +726,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.56.0",
+        version="0.57.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

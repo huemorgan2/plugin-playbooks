@@ -1272,9 +1272,10 @@ async def promote_version(name: str, body: PromoteBody):
 
         old_live = _live_version_of(p)
         await _ensure_live_row(session, p)
-        # candidate promote keeps the live manifest (manifest is live-owned);
-        # an owner restore of an old version brings its manifest back too.
-        _apply_row_to_live(p, row, restore_manifest=not candidate)
+        # plans/033: a candidate row carries its own manifest
+        # (playbook_manifest_set saves a candidate) — promote applies it, as
+        # a restore does. A row with no manifest keeps live's.
+        _apply_row_to_live(p, row, restore_manifest=True)
         row.promoted_from = old_live  # rollback lineage
         if p.candidate_version == target_n:
             p.candidate_version = None
@@ -1433,8 +1434,8 @@ async def get_manifest(name: str):
 @router.put("/playbooks/{name}/manifest")
 async def put_manifest(name: str, body: ManifestBody):
     """Owner sets the manifest directly — no approval gate on the REST path
-    (the UI IS the owner); the agent path goes through playbook_manifest_set,
-    which raises an approval card."""
+    (the UI IS the owner); the agent path (playbook_manifest_set) saves a
+    candidate that goes live through the gated publish (plans/033)."""
     async with _sf()() as session:
         p = (await session.execute(
             select(Playbook).where(Playbook.name == name)
@@ -1447,6 +1448,13 @@ async def put_manifest(name: str, body: ManifestBody):
         await _ensure_live_row(session, p)
         old_live = _live_version_of(p)
         p.manifest = body.manifest
+        # plans/033: a pending candidate row carries the manifest it will
+        # put live — stamp the owner's new text on it too, so publishing
+        # that candidate later cannot revert this edit.
+        if p.candidate_version:
+            cand = await _get_version_row(session, p, p.candidate_version)
+            if cand is not None:
+                cand.manifest = body.manifest
         await mint_version(
             session, p,
             definition=p.definition, code=p.code, manifest=p.manifest,

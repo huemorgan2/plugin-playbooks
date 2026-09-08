@@ -2819,7 +2819,8 @@ def build_tools(
                         "Below: the manifest and current code as plain text. "
                         "The manifest is the bigger picture — read it before "
                         "changing things; it is not enforced, and if it is "
-                        "outdated, update it (playbook_manifest_set). "
+                        "outdated, update it (playbook_manifest_set — saves "
+                        "onto the candidate; live only after publish). "
                         "Copy exact lines from the code block into old= for a "
                         "targeted edit. Then call playbook_edit again with "
                         "this ticket and exactly one of: code= (full source) "
@@ -3245,32 +3246,97 @@ def build_tools(
 
     # --- playbook_manifest_set ---
     async def _manifest_set(*, name: str, manifest: str, why: str = "") -> str:
+        # plans/033 (luna-fixer 2026-09-06-manifest-set-live-bypass): the
+        # manifest is content, and content reaches live ONLY through
+        # playbook_publish (gates + the owner card). Until 0.56.0 this tool
+        # minted a version and flipped `live_version` itself — the side door
+        # that put v60 live over a v59 candidate awaiting approval
+        # (2026-09-05). Now it saves a CANDIDATE through the same path as
+        # playbook_edit and never touches live.
+        author = writer_identity()  # phase 11: `agent` or `delegation:<id>`
         async with session_factory() as session:
             playbook = (await session.execute(
                 select(Playbook).where(Playbook.name == name).with_for_update()
             )).scalar_one_or_none()
             if not playbook:
                 return json.dumps({"error": f"Playbook '{name}' not found"})
-            # 0.10.0: the manifest is LIVE content. Record the old live
-            # version, then create a new live version row carrying the new
-            # manifest. (Never snapshot at the counter — a pending candidate
-            # already owns that number, and version numbers must stay unique.)
-            await _ensure_live_row(session, playbook)
-            old_live = _live_version_of(playbook)
-            playbook.manifest = manifest
+            # phase 11 guard, as in playbook_edit: another author's
+            # unpublished candidate is never replaced silently.
+            conflict = await candidate_conflict(session, playbook, author)
+            if conflict is not None:
+                return json.dumps({
+                    "saved": False,
+                    "error": conflict_message(name, conflict),
+                    "conflict": conflict,
+                })
+            # Operator decision P4-5 (plan 033): a pending candidate by the
+            # same author is MERGED — the new manifest is applied on top of
+            # that candidate's definition/code/format and becomes the single
+            # candidate (the previous candidate row stays in history), so a
+            # code change and a manifest change publish together. No pending
+            # candidate → the candidate is the live content + new manifest.
+            base_row = None
+            if playbook.candidate_version:
+                base_row = await _get_version_row(
+                    session, playbook, playbook.candidate_version,
+                )
+            had_live = await _ensure_live_row(session, playbook) is not None
+            if base_row is not None:
+                definition, code, fmt = (
+                    base_row.definition, base_row.code, _row_format(base_row),
+                )
+                message = "manifest updated on candidate"
+            else:
+                definition, code, fmt = (
+                    playbook.definition, playbook.code,
+                    getattr(playbook, "format", "pblang") or "pblang",
+                )
+                message = "manifest updated"
             await mint_version(
                 session, playbook,
-                definition=playbook.definition, code=playbook.code,
-                manifest=manifest, author=writer_identity(),  # phase 11
-                message="manifest updated" + (f": {why}" if why else ""),
+                definition=definition, code=code,
+                manifest=manifest, author=author,
+                message=message + (f": {why}" if why else ""),
+                format=fmt,
             )
-            playbook.live_version = playbook.version
+            playbook.candidate_version = playbook.version
+            if not had_live:
+                # never published: the row mirrors the candidate so reads
+                # (GET /playbooks/{name}, the edit read stage) show it —
+                # the same mirror playbook_edit keeps for code.
+                playbook.manifest = manifest
             await session.commit()
             new_version = playbook.version
-        await events.emit("playbook.saved", {"name": name})
+            live_version = _live_version_of(playbook)
+        await events.emit("playbook.candidate.saved", {
+            "name": name, "candidate_version": new_version,
+        })
+        if live_version is None:
+            next_text = (
+                "No live version yet — test the candidate with "
+                "playbook_run_candidate, then playbook_publish(name) makes "
+                "it live."
+            )
+        else:
+            next_text = (
+                "The LIVE playbook is unchanged — triggers and playbook_run "
+                f"still execute version {live_version} with its current "
+                "manifest. Test the candidate with playbook_run_candidate "
+                "(the publish gate wants a green run of this exact version), "
+                "then call playbook_publish(name) to make it live."
+            )
         return json.dumps({
-            "playbook": name, "version": new_version, "status": "manifest_set",
+            "playbook": name,
+            "version": new_version,
+            "candidate_version": new_version,
+            "live_version": live_version,
+            "status": "manifest_candidate_saved",
             "manifest_chars": len(manifest),
+            "note": (
+                f"manifest saved as candidate v{new_version} — publish to "
+                "go live"
+            ),
+            "next": f"{next_text} {_overview_hint(name)}",
         })
 
     tools.append((
@@ -3283,7 +3349,10 @@ def build_tools(
                 "(invariants), Acceptance. It is context, not law: nothing "
                 "enforces it, but it helps anyone editing see the whole "
                 "before changing a part. Keep it short and true — update it "
-                "whenever the playbook's intent drifts from what it says."
+                "whenever the playbook's intent drifts from what it says. "
+                "Saves a CANDIDATE (merged onto the pending candidate if you "
+                "have one) — the live playbook is unchanged until "
+                "playbook_publish; nothing goes live from this call."
             ),
             parameters={
                 "type": "object",
@@ -3627,9 +3696,11 @@ def build_tools(
             except Exception:  # noqa: BLE001
                 after_code = row.code or ""
             manifest_before = playbook.manifest or ""
-            manifest_after = (
-                manifest_before if is_candidate else (row.manifest or "")
-            )
+            # plans/033: a candidate row carries its own manifest (a
+            # manifest change is a candidate now) — the card shows the
+            # diff, and the flip below applies it. A row without one keeps
+            # the live manifest (_apply_version_to_live never NULLs it).
+            manifest_after = (row.manifest or "") or manifest_before
             await session.commit()
 
         refusal = await _request_publish_decision(
@@ -3674,11 +3745,10 @@ def build_tools(
                 })
             old_live = _live_version_of(playbook)
             await _ensure_live_row(session, playbook)
-            # candidate publish keeps the live manifest (drift was checked at
-            # save); a restore brings the old manifest back with the content.
-            _apply_version_to_live(
-                playbook, row, restore_manifest=not is_candidate,
-            )
+            # plans/033: the version row's manifest goes live with its
+            # content — for a candidate (playbook_manifest_set saves one)
+            # and for a restore alike. A row with no manifest keeps live's.
+            _apply_version_to_live(playbook, row, restore_manifest=True)
             if is_candidate:
                 row.promoted_from = old_live  # rollback lineage
                 playbook.candidate_version = None
