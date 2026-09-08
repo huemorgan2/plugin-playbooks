@@ -89,3 +89,43 @@ def test_registered_next_to_v1():
 def test_publish_rule_in_tool_description():
     tds = {td.name: td for td, _ in build_tools(None, _Bus(), _StubRunner())}
     assert PUBLISH_RULE in tds["playbook_publish"].description
+
+
+# plans/032 phase 05b — the explicit failure-path rule (dojoP run 0060 finding).
+FAILURE_PATH_RULE = (
+    "FAILURE PATH: when the owner wants the run to stop on a failed effect, write it "
+    "explicitly — `try:` around the effect(s), `except ctx.ToolError as e: raise "
+    'ValueError(f"<what> failed: {e}")` naming the item — and say so in the reply. An '
+    "uncaught error also fails the run, but without a message naming what failed; the "
+    "explicit raise is what was asked for."
+)
+
+
+def test_failure_path_rule():
+    assert V2_SKILL_BODY.count("FAILURE PATH") == 1
+    for token in ("FAILURE PATH", "`try:`", "except ctx.ToolError", "raise", "naming"):
+        assert token in V2_SKILL_BODY, token
+    rule = _norm(FAILURE_PATH_RULE)
+    assert rule in _norm(V2_SKILL_BODY)
+    doc = _DOC.read_text(encoding="utf-8")
+    assert doc.count("FAILURE PATH") == 1
+    assert rule in _norm(doc)
+    assert len(V2_SKILL_BODY.encode("utf-8")) <= V2_SKILL_MAX_BYTES
+
+
+def test_failure_path_rule_is_checkable():
+    code = '''\
+async def run(ctx, inputs):
+    entries = inputs["entries"]
+    try:
+        await ctx.gather(*[
+            ctx.tool("file_write", path=e["path"], content=e["text"], _id="write")
+            for e in entries
+        ])
+    except ctx.ToolError as e:
+        raise ValueError(f"file_write failed: {e}")
+    return {"written": len(entries)}
+'''
+    r = check(code, name="failure-path", version=1)
+    assert r.ok, [i.to_dict() for i in r.issues]
+    assert not [i for i in r.issues if i.severity == "error"], [i.to_dict() for i in r.issues]

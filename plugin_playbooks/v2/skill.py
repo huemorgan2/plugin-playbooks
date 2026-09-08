@@ -43,6 +43,12 @@ failures as `ctx.ToolError` etc.; `RunCancelled`, `JournalDivergence`,
 `MaxEffectsExceeded` cannot be caught. Imports: whitelisted stdlib only; no
 classes, no I/O, no `print` — `await ctx.log(msg)` is the only stdout.
 
+FAILURE PATH: when the owner wants the run to stop on a failed effect,
+write it explicitly — `try:` around the effect(s), `except ctx.ToolError
+as e: raise ValueError(f"<what> failed: {e}")` naming the item — and say
+so in the reply. An uncaught error also fails the run, but without a
+message naming what failed; the explicit raise is what was asked for.
+
 ### THE LOOP v2
 Never run blind:
 1. WRITE: `playbook_propose(name, code=...)` creates; `playbook_edit` (read,
