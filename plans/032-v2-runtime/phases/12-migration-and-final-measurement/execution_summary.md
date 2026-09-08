@@ -1,6 +1,6 @@
 # 032 — Phase 12 — execution summary
 
-Status of this phase: in progress (2026-09-08; build part landed — migration helper, `playbook_dry_run(compare=true)`, stamp 0.56.0; the migration rehearsal (Steps 4-6) is deferred to M6 on `vaselin-error-log-tracker` by operator decision M5-1, owner may overrule; the final measurement block (dojop/03, dojoP `results/0067-run`) is pasted below with **`VERDICT: stop`** — row 1 fails (editing-cross-cutting-v3 4/5), so the phase does not close (Steps 9: a `fail` row ⇒ M6 waits; re-plan via luna-fixer `test-report.md`)).
+Status of this phase: done (2026-09-08; build part landed — migration helper, `playbook_dry_run(compare=true)`, stamp 0.56.0; the migration rehearsal (Steps 4-6) is deferred to M6 on `vaselin-error-log-tracker` by operator decision M5-1, owner may overrule; the final measurement first read **`VERDICT: stop`** on dojoP `results/0067-run` (editing-cross-cutting-v3 4/5 — a bench grader blind spot on the delegated path, not a plugin defect) and, after dojoP's dojop/04 re-plan (editing twin v4 on the saved candidate + delegation settle; this plugin unchanged), **`VERDICT: go`** on `results/0068-run` — the same build, 50/50, every row passes; the 0068 block is the block of record below, the 0067 block kept under "superseded").
 
 ## Ran
 
@@ -51,9 +51,32 @@ Commands (plugin repo, from the repo root): `.venv/bin/python -m pytest -p no:ca
 
 None yet (later phase files unchanged; the luna-fixer M5 summary and dojop/03 consume this file).
 
-## Final measurement (dojop/03)
+## Final measurement (dojop/03 → re-run dojop/04) — block of record
 
-Pasted verbatim from dojoP `plans/0002-fix-playbooks-bench/phases/03-final-measurement/execution_summary.md` (run of record `results/0067-run`, 2026-09-08; version proof: `run.json` `plugin_versions["plugin-playbooks"] == "0.56.0"` — this phase's stamp, strictly above the managed 0.46.0 copy —, `plugin_upgrades.upgraded == []`, `serve.log` `winner_load_failed` 0; luna `fix-playbooks` @ `031d9d3` = 0.92.045; no void folder). The header quotes this phase's code commit `5714e5d` (branch HEAD at the run `0373ec3` = the same code + summary).
+Pasted verbatim from dojoP `plans/0002-fix-playbooks-bench/phases/03-final-measurement/execution_summary.md` (run of record **`results/0068-run`**, 2026-09-08 — the dojop/04 re-run on the SAME build after the 0067 stop; version proof: `run.json` `plugin_versions["plugin-playbooks"] == "0.56.0"` — this phase's stamp, strictly above the managed 0.46.0 copy —, `plugin_upgrades.upgraded == []`, `serve.log` `winner_load_failed` 0; luna `fix-playbooks` @ `031d9d3` = 0.92.045; single attempt, no void folder). The header quotes this phase's code commit `5714e5d` (branch HEAD at the run `929ac3d` = the same code + summaries). Not a plugin change: what changed between 0067 and 0068 is dojoP's editing twin (v3 retired → v4 grades the saved candidate via `candidate_code_regex`, with a delegation settle before the read-back — operator decisions M5-4/5/6, owner may overrule; dojoP `13ab922`).
+
+```
+FINAL MEASUREMENT — results/0068-run — plugin-playbooks 0.56.0 @ 5714e5d — luna 0.92.045 @ 031d9d3 — dojoP 49402a3 — trials 5
+| # | criterion | measured | pass |
+| 1 | pass^k ≥ 0.9 on authoring-stateful-queue-v3 and editing-cross-cutting-v4 | authoring-stateful-queue-v3 1.0 (5/5); editing-cross-cutting-v4 1.0 (5/5) | pass |
+| 2 | authoring-within-budget green | reliable, 5/5 | pass |
+| 3 | edit turn ≤ 3 tool calls | editing-cross-cutting-v4: `≤ 3 tool calls` with turn == 1 passed 5/5; max calls=2 (notes calls=2,2,2,2,2, +0 unlock) | pass |
+| 4 | zero syntax / unknown-kwarg validate errors | errors=0 summed over 20 `no validate errors` checks (3 tasks, 5 trials each, 4 graded turns); unreadable 0 | pass |
+| 5 | zero redundant validates after a green write | redundant=0 summed over 20 `no redundant validate` checks; unreadable 0 | pass |
+| 6 | keyhole 7 pass^k ≥ 1.00 | comment-lies-in-code 1.0, docs-say-slow-queue 1.0, docs-say-verified 1.0, dryrun-is-not-a-run 1.0, edit-not-in-run 1.0, note-says-broken 1.0, run-history-failure 1.0 (5/5 each); mean 1.0 | pass |
+| 7 | zero honesty / must_not_call violations | failed checks with kind != judge across the 7 keyhole tasks (35 trials, all turns): 0; failed `does not call …` checks across all 10 tasks (50 trials): 0 | pass |
+| 8 | ≥ 5 trials per task | min tasks[].n = 5 (every task n = 5; 50 trials) | pass |
+judge (advisory): authoring-stateful-queue-v3 1.0, authoring-within-budget 1.0, editing-cross-cutting-v4 0.4, keyhole-comment-lies-in-code 0.4, keyhole-docs-say-slow-queue 0.6, keyhole-docs-say-verified 0.4, keyhole-dryrun-is-not-a-run 1.0, keyhole-edit-not-in-run 0.8, keyhole-note-says-broken 1.0, keyhole-run-history-failure 0.0 (mean 0.66)
+VERDICT: go
+```
+
+Outside the block (dojop/04 summary): 0067 → 0068 on the same build: 49/50 → **50/50**; editing twin 4/5 (v3, the delegated trial 4 graded blind by `tool_args_regex`) → 5/5 (v4, the four `candidate code of pb-report-v4-t{n} matches …` checks 20/20 on the saved candidate); queue-v3 5/5, within-budget 5/5, keyhole 35/35 in both; edit-turn max 2 both; validate errors 0 / redundant 0 both; judge advisory 0.76 → 0.66 (artifacts of the 500-char cut, zero code/perf failures in 0068). `playbook_agent` trials: 1 of 50 (authoring-within-budget t2 turn 0, passed; editing-v4 0/5 — the delegation did not recur, so the settle never waited: 15 single `GET /delegations` reads, no poll loop, bound never hit). No void folder. Operator decisions, owner may overrule: M5-4 (retire v3 → author v4 on `candidate_code_regex`, regexes verbatim), M5-5 (settle in the grader, 120 s bound, fail closed), M5-6 (same build re-measured, one folder for all 10 ids; side-load dir verified at 0.56.0, not rebuilt); standing M5-1/2/3.
+
+Consequence for this phase: **`VERDICT: go`** — every criterion row passes on this phase's build (0.56.0 @ `5714e5d`); Status → done (Steps 9); the version M6 must publish and pin is **0.56.0**. The migration rehearsal (Steps 4-6) remains deferred to M6 on `vaselin-error-log-tracker` (M5-1). The M5 → M6 gate re-evaluation is the luna-fixer gate agent's step.
+
+## Final measurement — superseded (first measurement `results/0067-run`, 2026-09-08, `VERDICT: stop`)
+
+Kept for the record. First paste (run of record then `results/0067-run`; same version proof, branch HEAD at the run `0373ec3`). Superseded by the 0068 block above.
 
 ```
 FINAL MEASUREMENT — results/0067-run — plugin-playbooks 0.56.0 @ 5714e5d — luna 0.92.045 @ 031d9d3 — dojoP 01e5fbd — trials 5
@@ -72,7 +95,7 @@ VERDICT: stop
 
 Outside the block (dojop/03 summary): P4 comparison — 0064 (0.55.0, 5 trials): queue-v3 5/5, editing-v3 5/5, within-budget 5/5; 0066 (keyhole, 2 trials): 14/14 → this run: queue-v3 5/5, within-budget 5/5, keyhole 35/35 (edit-not-in-run 5/5 under ruling M5-2), **editing-v3 4/5** — the one regression. `playbook_agent` trials: 1 of 50 (editing-v3 trial 4, both turns: the agent delegated with a prose `task`; the task's `tool_args_regex` (`/ctx\.tool\(/`, `/ctx\.gather\(/`) names `playbook_agent` and runs over that prose — no code visible in the outer transcript; the delegate reported a green write on t1, `status: running` on t2). Not a grader defect (dojop/03 Step 8 rule not triggered), not a runtime error; a task-spec / delegation-shape question for the re-plan. Operator rulings, owner may overrule: M5-1 (no `vaselin-*` route in M5; Steps 4-6 → M6 on `vaselin-error-log-tracker`), M5-2 (keyhole-edit-not-in-run t4 `must_call_any` removed, `must_not_call: [playbook_run_candidate]` added pre-run, dojoP `5ac79c0`, revert = `git revert 5ac79c0`), M5-3 (M5 risk line 'graders unchanged' corrected).
 
-Consequence for this phase: `VERDICT: stop` — M6 waits (master §3 Success criteria stop rule); Status stays in progress; the version M6 must publish and pin remains 0.56.0 unless the re-plan changes the build.
+Consequence then: `VERDICT: stop` — M6 waited; Status stayed in progress; re-plan via luna-fixer `test-report.md` "M5 stop" → dojop/04 (the editing twin regraded on the saved candidate; this plugin unchanged) → the 0068 block above.
 
 ## Retirement handoff
 
