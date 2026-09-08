@@ -201,3 +201,84 @@ async def test_old_core_without_nowait_uses_parked_request():
         assert (await _live(sf)).live_version == 2
     finally:
         await engine.dispose()
+
+
+# --- plans/034 (0.57.0): verified success + honest awaiting hint ---
+
+@pytest.mark.asyncio
+async def test_inline_approval_result_is_verified_read_back():
+    approvals = _NowaitApprovals(decision="approved")
+    engine, sf, tools = await _env(_Ctx(approvals))
+    try:
+        await _green_candidate(sf, tools)
+        out = json.loads(await tools["playbook_publish"](name="greeter"))
+
+        assert out["published"] is True and out["verified"] is True
+        assert out["live_version"] == 2 == (await _live(sf)).live_version
+        assert out["hint"] == (
+            "Report exactly live_version=2; do not claim any other version is live."
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_forced_read_back_mismatch_is_not_a_success(monkeypatch):
+    from plugin_playbooks import publish_guard
+
+    approvals = _NowaitApprovals(decision="approved")
+    engine, sf, tools = await _env(_Ctx(approvals))
+    try:
+        await _green_candidate(sf, tools)
+
+        async def _lying_store(session_factory, name):
+            return 60  # the 09-05 shape: the store reports another version
+
+        monkeypatch.setattr(publish_guard, "read_back_live_version", _lying_store)
+        out = json.loads(await tools["playbook_publish"](name="greeter"))
+
+        assert "status" not in out and "published" not in out
+        assert out["verified"] is False
+        assert "live_version reads 60" in out["error"]
+        assert "do not tell the owner it is live" in out["error"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_awaiting_hint_is_honest_about_the_reissue():
+    approvals = _NowaitApprovals(decision="pending")
+    engine, sf, tools = await _env(_Ctx(approvals))
+    try:
+        await _green_candidate(sf, tools)
+        out = json.loads(await tools["playbook_publish"](name="greeter"))
+
+        hint = out["hint"]
+        assert "WOKEN" in hint and "do NOT retry" in hint
+        assert "pre-approved and will execute" not in hint  # the old promise
+        assert "executes only if the owner's approval matched" in hint
+        assert "approval_flow_broken" in hint
+        assert "verified=true" in hint
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_approved_then_regated_reissue_fails_loud_without_a_card():
+    approvals = _NowaitApprovals(decision="pending")
+    engine, sf, tools = await _env(_Ctx(approvals))
+    try:
+        await _green_candidate(sf, tools)
+        first = json.loads(await tools["playbook_publish"](name="greeter"))
+        assert first["status"] == "awaiting_owner_approval"
+
+        # the owner approved; the woken re-issue would re-gate (grant hole)
+        second = json.loads(await tools["playbook_publish"](name="greeter"))
+
+        assert len(approvals.nowait_calls) == 1
+        assert second["status"] == "approval_flow_broken"
+        assert "the approval flow is broken; stop and tell the owner" in second["error"]
+        assert second["approval_id"] == first["approval_id"]
+        assert (await _live(sf)).live_version != 2
+    finally:
+        await engine.dispose()

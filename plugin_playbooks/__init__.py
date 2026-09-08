@@ -53,6 +53,14 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("playbook_versions", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
     ("playbook_runs", "format", "VARCHAR(16) NOT NULL DEFAULT 'pblang'"),
     ("playbook_runs", "result", "JSONB"),
+    # plans/034 (0.57.0): the loop guard's memory of the last approval card
+    # per playbook (see publish_guard.py). All nullable, no backfill.
+    ("playbooks", "last_card_action", "VARCHAR(16)"),
+    ("playbooks", "last_card_version", "INTEGER"),
+    ("playbooks", "last_card_approval_id", "VARCHAR(64)"),
+    ("playbooks", "last_card_raised_at", "TIMESTAMP"),
+    ("playbooks", "last_card_decision", "VARCHAR(16)"),
+    ("playbooks", "last_card_decided_at", "TIMESTAMP"),
 ]
 
 # plans/032 phase 08: SQL run ONCE, in the same transaction that adds the
@@ -438,15 +446,14 @@ Swap pop_front→pop_back for DFS. `visited` is the cycle guard;
 `max_iterations` bounds it (ALWAYS set it on a while_ loop, and mutate a
 `vars.*` each iteration or it runs to the cap). PREFER `concurrency=4` on a
 side-effect-free `over=` loop body — but never mutate shared state in a
-concurrent loop. THAT is a crawl.
+concurrent loop.
 
 ### MANIFEST + THE EDIT FLOW (read → ticket → write)
-Every playbook can carry a MANIFEST: the bigger picture in plain markdown —
+A playbook can carry a MANIFEST: the bigger picture in plain markdown —
 Purpose, Side effects, Never (invariants), Acceptance. It is context, not
-law: read it before changing things; nothing enforces it, and if a change
-makes it stale, update it with `playbook_manifest_set` — that saves the
-manifest onto the CANDIDATE (nothing goes live until `playbook_publish`), so
-do it before you publish. Editing is TWO steps:
+law: read it before changing things; nothing enforces it; if it goes stale,
+update it with `playbook_manifest_set` (saves a candidate; publish to go
+live). Editing is TWO steps:
 1. READ: `playbook_edit(name)` alone → a JSON header (versions, ticket)
 plus the manifest and current code as plain-text frames; copy `old=`
 snippets verbatim from the code frame.
@@ -834,6 +841,36 @@ class PlaybooksPlugin(LunaPlugin):
         self._run_wake = None
         self._fix_proposals = None
         self._ctx = None
+        self._unsub_publish_guard = None
+
+    def _start_publish_guard(self, ctx: PluginContext) -> None:
+        """plans/034: record the owner's decision on the last publish card
+        (`approval.decided` → publish_guard.note_decision). Idempotent;
+        loop-independent like park.start()."""
+        if self._unsub_publish_guard is not None:
+            return
+        subscribe = getattr(ctx.events, "subscribe", None)
+        if not callable(subscribe):
+            logger.warning(
+                "playbooks: event bus has no subscribe() — the publish loop "
+                "guard relies on the engine's card status only"
+            )
+            return
+        sf = ctx.db_session_factory
+
+        async def _on_decided(payload, *_a, **_kw) -> None:
+            if not isinstance(payload, dict) or not payload.get("id"):
+                return
+            from .publish_guard import note_decision
+            try:
+                await note_decision(
+                    sf, approval_id=str(payload["id"]),
+                    decision=str(payload.get("decision") or ""),
+                )
+            except Exception:  # noqa: BLE001 — never break the emitter
+                logger.exception("playbooks: publish guard could not record a decision")
+
+        self._unsub_publish_guard = subscribe("approval.decided", _on_decided)
 
     async def on_load(self, ctx: PluginContext) -> None:
         self._ctx = ctx
@@ -893,6 +930,10 @@ class PlaybooksPlugin(LunaPlugin):
         # (loop-independent); timers/subscriptions are rebuilt by
         # `park.reconcile()` in on_server_ready on the serving loop.
         self._runner.park.start()
+        # plans/034: the publish loop guard learns the owner's decision on
+        # the card it raised (publish_guard.note_decision) — same bus, same
+        # event, independent of the parked-run index.
+        self._start_publish_guard(ctx)
 
         # 0.5.1: rows still "running" from before this process existed
         # (restart/upgrade, or pre-0.5.0 cancelled-mid-run coroutines) would
@@ -1270,6 +1311,12 @@ class PlaybooksPlugin(LunaPlugin):
         runner = getattr(self, "_runner", None)
         if runner is not None:
             runner.park.stop()
+        if self._unsub_publish_guard is not None:
+            try:
+                self._unsub_publish_guard()
+            except Exception:  # noqa: BLE001
+                pass
+            self._unsub_publish_guard = None
         if self._trigger_service:
             await self._trigger_service.stop()
         if self._fix_proposals:

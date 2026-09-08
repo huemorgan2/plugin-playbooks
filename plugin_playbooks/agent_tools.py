@@ -40,6 +40,7 @@ from .provenance import envelope as _envelope
 from .provenance import overview_hint as _overview_hint
 from .provenance import row_envelope as _row_envelope
 from .provenance import with_envelope as _with_envelope
+from . import publish_guard as _publish_guard
 from .publish import (
     announce_publish,
     ops_conversation_id,
@@ -3486,6 +3487,54 @@ def build_tools(
         summary = (
             f"{verb} playbook '{name}' version {target_version}: {headline}"
         )
+
+        def _awaiting(approval_id: str) -> str:
+            # plans/030: nothing published yet — the owner has the card. Do
+            # NOT phrase this as a failure the agent should work around.
+            # plans/034: the hint is honest about the re-issue — it executes
+            # only when the pre-approval matched; a second "awaiting" or the
+            # loop-guard error is a platform fault, not a cue to retry.
+            return json.dumps({
+                "status": "awaiting_owner_approval",
+                "error": (
+                    f"Not published yet — the {action} of '{name}' version "
+                    f"{target_version} is awaiting the owner's approval."
+                ),
+                "approval_id": approval_id,
+                "hint": (
+                    "You will be WOKEN automatically when the owner decides "
+                    "— do NOT retry this call and do NOT poll for the "
+                    "decision. Finish anything else you were doing, tell "
+                    "the owner the change awaits their approval, and end "
+                    "your turn. If woken with an approval, re-issue this "
+                    "exact call ONCE — it executes only if the owner's "
+                    "approval matched it. If that re-issue answers "
+                    "'awaiting' again or 'approval_flow_broken', the "
+                    "platform is at fault: do not retry, tell the owner, "
+                    "and end your turn. Never say a version is live until "
+                    "a publish result says verified=true for it."
+                ),
+            })
+
+        # plans/034: loop guard — look at the card we already raised for this
+        # exact (playbook, action, version) BEFORE minting another one.
+        try:
+            verdict = await _publish_guard.check_reissue(
+                session_factory, approvals, name=name, action=action,
+                version=target_version, payload=payload,
+            )
+        except Exception:  # noqa: BLE001 — the guard never blocks a publish
+            _log.exception(
+                "publish loop guard failed playbook=%s action=%s", name, action,
+            )
+            verdict = None
+        if verdict is not None:
+            if verdict["kind"] == "awaiting":
+                return _awaiting(verdict["approval_id"])
+            return json.dumps(_publish_guard.broken_flow_result(
+                name=name, action=action, version=target_version,
+                approval_id=verdict["approval_id"],
+            ))
         # plans/030: wake-on-decision. On cores with request_nowait (luna
         # plans/103) the card is raised WITHOUT parking this handler under the
         # ToolDef timeout — the tool returns "awaiting the owner" and the
@@ -3530,24 +3579,18 @@ def build_tools(
         if getattr(decision, "decision", None) == "approved":
             return None
         if getattr(decision, "decision", None) == "pending":
-            # plans/030: nothing published yet — the owner has the card. Do
-            # NOT phrase this as a failure the agent should work around.
-            return json.dumps({
-                "status": "awaiting_owner_approval",
-                "error": (
-                    f"Not published yet — the {action} of '{name}' version "
-                    f"{target_version} is awaiting the owner's approval."
-                ),
-                "approval_id": str(getattr(decision, "request_id", "")),
-                "hint": (
-                    "You will be WOKEN automatically when the owner decides "
-                    "— do NOT retry this call and do NOT poll for the "
-                    "decision. Finish anything else you were doing, tell "
-                    "the owner the change awaits their approval, and end "
-                    "your turn. If woken with an approval, re-issue this "
-                    "exact call — it is pre-approved and will execute."
-                ),
-            })
+            approval_id = str(getattr(decision, "request_id", ""))
+            # plans/034: remember the card so a re-gated re-issue is caught.
+            try:
+                await _publish_guard.remember_card(
+                    session_factory, name=name, action=action,
+                    version=target_version, approval_id=approval_id,
+                )
+            except Exception:  # noqa: BLE001
+                _log.exception(
+                    "publish loop guard could not remember card %s", approval_id,
+                )
+            return _awaiting(approval_id)
         return json.dumps({
             "error": f"The owner did not approve this {action}.",
             "owner_reason": getattr(decision, "reason", None),
@@ -3756,6 +3799,38 @@ def build_tools(
             change_summary = (row.message or "") if is_candidate else ""
             await session.commit()
 
+        # plans/034: VERIFY before anything is announced — re-read the stored
+        # row in a fresh session; the result reports THAT number. The
+        # in-memory `new_live` is intent, the read-back is truth.
+        stored_live = await _publish_guard.read_back_live_version(
+            session_factory, name,
+        )
+        if stored_live != new_live:
+            _log.error(
+                "publish read-back mismatch playbook=%s intended=%s stored=%s",
+                name, new_live, stored_live,
+            )
+            return json.dumps({
+                "error": (
+                    f"publish reported success but live_version reads "
+                    f"{stored_live} (expected {new_live}) — do not tell the "
+                    "owner it is live"
+                ),
+                "playbook": name,
+                "intended_live_version": new_live,
+                "stored_live_version": stored_live,
+                "verified": False,
+                "hint": (
+                    "Stop. Tell the owner the publish could not be verified "
+                    "and which version the store reports; do not retry."
+                ),
+            })
+        # the guard's memory is spent: this change is live.
+        try:
+            await _publish_guard.clear_card(session_factory, name)
+        except Exception:  # noqa: BLE001
+            _log.exception("publish loop guard could not clear card for %s", name)
+
         # live content changed — resync triggers and refresh the canvas.
         await events.emit("playbook.saved", {"name": name})
         await events.emit("ui.plugin.event", {
@@ -3795,10 +3870,18 @@ def build_tools(
         return json.dumps({
             "playbook": name,
             "status": "rolled_back" if rolled_back else "published",
-            "live_version": new_live,
+            # plans/034: machine truth — `live_version` is the READ-BACK
+            # value, `verified` says the store agreed with the flip.
+            "published": True,
+            "live_version": stored_live,
+            "verified": True,
             "previous_live_version": old_live,
             "gates": gates,
             "evidence": evidence_block,
+            "hint": (
+                f"Report exactly live_version={stored_live}; do not claim "
+                "any other version is live."
+            ),
             "note": (
                 f"Version {new_live} is live again (manifest included). "
                 f"Version {old_live} stays in history — publish a new "
@@ -3841,7 +3924,10 @@ def build_tools(
                 "whole change: ✓/✗ check bullets and your `explanation` in "
                 "plain language up front, the technical diff collapsed "
                 "behind it. Every publish is announced in the ops chat "
-                "with its evidence. " + PUBLISH_RULE
+                "with its evidence. The success result carries the "
+                "live_version READ BACK from the store with verified=true "
+                "— report exactly that number and never call a version "
+                "live without it. " + PUBLISH_RULE
             ),
             parameters={
                 "type": "object",

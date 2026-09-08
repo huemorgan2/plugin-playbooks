@@ -86,6 +86,21 @@ class Playbook(Base):
     publish_require_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_by: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
+    # plans/034 (0.57.0): the last publish/rollback approval card this plugin
+    # raised for the playbook — (action, version, approval id, when) — and
+    # the owner's decision learned from `approval.decided`. The loop guard
+    # (`publish_guard.check_reissue`) reads these before minting a card so
+    # an approved-then-re-gated re-issue fails loud instead of looping.
+    last_card_action: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_card_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_card_approval_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_card_raised_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_card_decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_card_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     cost_estimate_cents: Mapped[float | None] = mapped_column(nullable=True)
     duration_estimate_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

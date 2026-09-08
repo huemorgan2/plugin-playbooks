@@ -34,7 +34,7 @@ the next turn):
 | `playbook_validate` | Static-check code or YAML without saving |
 | `playbook_dry_run` | Simulate a run (no tools/LLMs executed; scriptable via `stubs`), returns the trace |
 | `playbook_manifest_set` | Write the plain-text intent manifest (saves a candidate; goes live through `playbook_publish`) |
-| `playbook_publish` | Candidate → live, through validation/test-run/probes gates |
+| `playbook_publish` | Candidate → live, through validation/test-run/probes gates; the result carries the read-back `live_version` with `verified: true`, and a re-issue after an approval that re-gates fails loud instead of minting another card |
 | `playbook_rollback` | Point live back to an earlier version |
 | `playbook_run_candidate` | Live-run the candidate version once |
 | `playbook_set_autonomy` | Ask-first / autonomous execution modes |

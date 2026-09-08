@@ -233,10 +233,17 @@ async def test_agent_turn_proposes_dry_runs_runs_and_publishes(tmp_path):
         out = agent.publish  # type: ignore[attr-defined]
         assert out["status"] == "published", out
         assert out["live_version"] == 1 and out["previous_live_version"] is None, out
+        # plans/034: `published` / `verified` / `hint` — the live_version is
+        # the read-back value and the hint pins what the agent may claim.
         assert list(out) == [
-            "playbook", "status", "live_version", "previous_live_version",
-            "gates", "evidence", "note", "next",
+            "playbook", "status", "published", "live_version", "verified",
+            "previous_live_version", "gates", "evidence", "hint", "note",
+            "next",
         ], list(out)
+        assert out["published"] is True and out["verified"] is True
+        assert out["hint"] == (
+            "Report exactly live_version=1; do not claim any other version is live."
+        )
         # the evidence is THE candidate run of step 3 — the gate saw the row
         run_id = agent.calls[2][1]["run_id"]
         assert out["evidence"] == {"run_id": run_id, "status": "passed"}, out
