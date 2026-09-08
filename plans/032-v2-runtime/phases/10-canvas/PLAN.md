@@ -1,6 +1,6 @@
 # 032 — Phase 10: Canvas: server-side graph endpoint, compute/error_boundary nodes, run-trace overlay
 
-Status: pending
+Status: done
 
 Master: §2 Canvas; §1.13 (canvas node ids `step-<id>`, positional `trigger-<n>`); §2 Error contract (run columns `error`, `error_type`, `traceback`, `failed_at`; `playbook_line`); §2 Lifecycle (`definition` = checker summary for v2 rows; one step row per effect occurrence); §3 P4 (graph snapshot tests, owner visual check); master phase M4 (luna-fixer `phases/M4-truth-surface-canvas-delegation/PLAN.md`, steps 1-2, "Owner touchpoints")
 
