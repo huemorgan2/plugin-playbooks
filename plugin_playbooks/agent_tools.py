@@ -50,6 +50,11 @@ from .runner import InputTypeError
 from .runner import active_run_id as _active_playbook_run
 from .v2.checker import check as v2_check
 from .v2.checker import resolve_format, sniff_format
+from .v2.migrate import compare_effects as _compare_effects
+from .v2.migrate import require_green_live_run as _require_green_live_run
+from .v2.migrate import v1_effects as _v1_effects
+from .v2.migrate import v2_effects as _v2_effects
+from .v2.migrate import v2_groups as _v2_groups
 from .v2.skill import PUBLISH_RULE
 from .validation import validate_definition
 from .versioning import (
@@ -375,6 +380,14 @@ def _parked_message(parked_on: Any, wake_promised: bool) -> str:
 
 def _raise_stub(error_type: Any, message: Any) -> dict[str, Any]:
     return {"_raise": {"type": str(error_type or "EffectError"), "message": str(message or "")}}
+
+
+def _flag(value: Any) -> bool:
+    """A boolean tool parameter as the runtime may hand it over: a bool, or
+    the strings "true"/"false"/"1"/"0" (case-insensitive)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
 
 async def _stubs_from_recorded_run(
@@ -2475,11 +2488,22 @@ def build_tools(
     async def _dry_run(
         *, name: str, inputs: str = "{}", version: str = "auto",
         stubs: str | dict = "{}", stubs_from_run: str | None = None,
+        compare: bool = False,
     ) -> str:
         try:
             input_data = json.loads(inputs) if isinstance(inputs, str) else inputs
         except json.JSONDecodeError:
             return json.dumps({"error": "Invalid JSON inputs"})
+        # plans/032 phase 12: `compare=true` needs the recorded run to
+        # compare against — refused before anything is simulated.
+        compare = _flag(compare)
+        if compare and not stubs_from_run:
+            return json.dumps({
+                "error": "compare=true needs stubs_from_run=<run_id> — the "
+                         "playbook's last green live run (playbook_runs(name, "
+                         "version=<live>, status='done'), is_test false).",
+                "dry_run": True,
+            })
         try:
             stub_data = json.loads(stubs) if isinstance(stubs, str) else stubs
         except json.JSONDecodeError:
@@ -2519,6 +2543,48 @@ def build_tools(
                     return json.dumps({"error": got, "dry_run": True, "format": fmt})
                 derived, stubs_source = got
                 stub_data = {**derived, **stub_data}
+
+            # plans/032 phase 12: the compared run's effect sequence, loaded
+            # in the same session (its rows + the definition of the version
+            # it ran); refused (error string, no traceback) unless it is the
+            # last green live run and the target is python.
+            compared: list[Any] | None = None
+            compared_run: Any = None
+            if compare:
+                if fmt != "python":
+                    return json.dumps({
+                        "error": "compare=true needs a python target version "
+                                 "(the migrated candidate) — the target is pblang.",
+                        "dry_run": True, "format": fmt,
+                    })
+                compared_run = await session.get(PlaybookRun, uuid.UUID(str(stubs_from_run)))
+                try:
+                    _require_green_live_run(
+                        compared_run.status,
+                        bool(compared_run.is_test) or compared_run.trigger == "agent-candidate",
+                        compared_run.playbook_version, _live_version_of(playbook),
+                    )
+                except ValueError as e:
+                    return json.dumps({
+                        "error": str(e), "dry_run": True, "format": fmt,
+                        "compared_run_id": str(compared_run.id),
+                        "compared_run_version": compared_run.playbook_version,
+                    })
+                if (getattr(compared_run, "format", None) or "pblang") == "python":
+                    try:
+                        recorded = await runner._v2.journal.read(str(compared_run.id))
+                    except KeyError:
+                        recorded = []
+                    compared = _v2_effects(recorded)
+                else:
+                    rows = (await session.execute(
+                        select(PlaybookStepRun)
+                        .where(PlaybookStepRun.run_id == compared_run.id)
+                        .order_by(PlaybookStepRun.started_at, PlaybookStepRun.id)
+                    )).scalars().all()
+                    vrow = await _get_version_row(session, playbook, compared_run.playbook_version)
+                    definition = vrow.definition if vrow is not None else playbook.definition
+                    compared = _v1_effects(definition, list(rows))
 
         is_candidate = bool(
             playbook.candidate_version and tested == playbook.candidate_version
@@ -2575,6 +2641,19 @@ def build_tools(
                 stubs_source["occurrences_used"] = used
                 stubs_source["occurrences_unmatched"] = [k for k in derived if k not in used]
                 trace["stubs_source"] = stubs_source
+            if compared is not None and compared_run is not None:
+                # plans/032 phase 12: "reaches the same effects with the same
+                # args" — the recorded run's effects against this dry run's
+                # journal (gather members grouped from the target code).
+                trace["comparison"] = _compare_effects(
+                    compared,
+                    _v2_effects(
+                        trace.get("journal") or [],
+                        _v2_groups(getattr(target, "code", None) or ""),
+                    ),
+                )
+                trace["compared_run_id"] = str(compared_run.id)
+                trace["compared_run_version"] = compared_run.playbook_version
             # plans/032 phase 09 (master §2 Dry run): a simulation is never
             # `done` at the tool boundary — the v1 runner keeps its own
             # status word (its direct callers pin it); v2 already says
@@ -2638,6 +2717,21 @@ def build_tools(
                             "failure replays as the same error. Use it to "
                             "exercise a candidate fix against the exact run "
                             "that broke. Still a simulation."
+                        ),
+                    },
+                    "compare": {
+                        "type": "boolean",
+                        "description": (
+                            "Migration check (default false; needs "
+                            "stubs_from_run = the playbook's last green live "
+                            "run and a python target): the result gains "
+                            "`comparison` {match, v1_count, v2_count, "
+                            "mismatches[{class: order|missing|extra|kind|name|"
+                            "args, position, v1, v2, paths}]}, "
+                            "`compared_run_id`, `compared_run_version` — does "
+                            "the candidate reach the same effects with the "
+                            "same args as the recorded run. Refused for a "
+                            "failed, test or non-live-version run."
                         ),
                     },
                     "version": {
