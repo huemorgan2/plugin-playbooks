@@ -59,3 +59,13 @@ Code commit: `c8eaf3e` — `032/06: durable journal + resume on on_server_ready 
 - `phases/08-lifecycle-integration-and-parity/PLAN.md`: stamp note "0.50.0 expected after plugin/06" → 0.51.0 landed at `c8eaf3e`; `timed_out_unknown` is now a real run status (consumers keyed on `== "failed"` unchanged, as scoped); payload still 12 keys (resumed == uninterrupted, pinned by `test_resumed_completion_payload_matches_uninterrupted_run`).
 - `phases/10-canvas/PLAN.md`: `playbook_journal` column list gains `name`, `ms` (and `idempotency_key`, `attempts`, `transcript`, `cost_cents`, `child_run_id`); `occurrence` IS written by the loop (`_journal_and_start` → `make_effect_entry(occurrence=)`), never null for effect rows; stamp note → 0.51.0 landed.
 - luna-fixer `phases/M2-durability/`: this summary copied there (step 5 of M2).
+
+## Fix-up (M2 re-plan B) — 2026-09-08
+
+Scope: `tests/test_v2_resume.py::test_subtask_parent_child_rows_and_cycle_guard_across_restart` made deterministic; no runtime code touched, no assertion changed (luna-fixer `phases/M2-durability/stop-report.md` item B, accepted).
+
+- Before (at `d1a129c`): 3 red / 10 isolated runs, signature every time `KeyError: 'run <A>: no journal entry seq=2'` from `journal_db.py:101` (`_get`) via `journal.fail` (`loop.py:745`) → run A ends `failed`, `'failed' == 'done'` fails.
+- Change: new fixture `db_file(tmp_path)` — `create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/journal.db")`, default (per-session) pool, `Base.metadata.create_all` as in `db`. The test takes `db_file` and aliases it to `db` on its first line; every other line of the test is byte-identical. The shared in-memory `db` fixture is unchanged for all other tests.
+- After: 20/20 consecutive isolated runs green. `tests/test_loader_style_import.py`: 2 passed. Full suite: `7 failed, 617 passed, 5 warnings in 54.99s` (624 collected); red list = exactly the 7 intended pins in `tests/test_repro_fixplaybooks_{lifecycle,runtime}.py` (`test_publish_success_carries_verified_readback`, `test_approved_then_regated_same_payload_trips_loop_guard`, `test_manifest_set_does_not_flip_live`, `test_interrupted_run_survives_restart_instead_of_failing`, `test_wait_for_approval_actually_gates`, `test_wait_for_event_actually_waits`, `test_tool_step_timeout_is_enforced`), 0 flipped.
+- Commit: `809fd1b` (`tests/test_v2_resume.py` only; stamps stay 0.51.0).
+- Conclusion: the hazard was harness-only. With one connection per session (file-backed sqlite, PostgreSQL semantics) the two concurrent `_resume_run` tasks never lose an `append_in_flight` row; the "Learned" bullet on the in-memory StaticPool stands, and the rule is now: any test that drives more than one run task at once uses `db_file`.
