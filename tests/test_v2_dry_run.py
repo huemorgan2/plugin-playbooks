@@ -12,7 +12,7 @@ import json
 import pytest
 from sqlalchemy import func, select
 
-from plugin_playbooks.models import PlaybookRun, PlaybookStepRun
+from plugin_playbooks.models import PlaybookJournal, PlaybookRun, PlaybookStepRun
 from plugin_playbooks.v2 import MemoryJournalStore
 from plugin_playbooks.v2.loop import SegmentLoop
 from _jail import real_code_run, real_jail, requires_jail
@@ -170,8 +170,15 @@ async def test_dry_run_writes_no_run_rows(db, tmp_path):  # noqa: F811
     assert journal[0]["mode"] == "dry" and journal[0]["hash_seed"] == 0
     assert len(journal) == 3
     assert all(e["dry"] is True for e in journal[1:])
-    # the live loop's own journal is untouched by a dry run
+    # the live loop's own journal is untouched by a dry run — neither the
+    # test double (memory) nor the durable table (phase 06) holds a row
     assert runner._v2.journal._runs == {}
+    assert await _journal_rows(db) == 0
+
+
+async def _journal_rows(sf) -> int:
+    async with sf() as s:
+        return (await s.execute(select(func.count()).select_from(PlaybookJournal))).scalar_one()
 
 
 @real_jail
@@ -220,7 +227,8 @@ async def test_dry_intake_coerces_and_fails_loud(tmp_path, declared):
         assert bad["status"] == "rejected" and bad["dry_run"] is True
         assert bad["input"] == "count" and bad["expected"] == declared
         assert "count" in bad["error"]
-        assert "journal" not in bad and e.runner._v2.journal._runs == {}
+        # phase 06: the default store is durable — a dry run writes no row
+        assert "journal" not in bad and await _journal_rows(e.sf) == 0
     finally:
         await e.dispose()
 

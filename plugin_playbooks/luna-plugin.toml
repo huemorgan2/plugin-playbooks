@@ -1,11 +1,11 @@
 name = "plugin-playbooks"
-version = "0.50.0"
+version = "0.51.0"
 description = "Durable multi-step playbooks — Luna builds them, triggers fire them."
 entry = "plugin_playbooks"
 sdk_version = "0"
 license = "MIT"
 category = "system"
-db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations", "playbook_watches"]
+db_tables = ["playbooks", "playbook_versions", "playbook_edit_tickets", "playbook_runs", "playbook_step_runs", "playbook_probe_results", "playbook_drafts", "playbook_fix_proposals", "playbook_delegations", "playbook_watches", "playbook_journal"]
 tags = ["playbooks", "workflows", "automation", "triggers"]
 readme = """
 # plugin-playbooks
@@ -34,7 +34,7 @@ luna repo up to 0.29.006; source: https://github.com/huemorgan2/plugin-playbooks
 
 [requires]
 tools = 25
-tables = 10
+tables = 11
 
 # plans/018 phase 3: this list is generated from the ToolDefs in
 # agent_tools.build_tools + delegation.build_delegation_tools and pinned by

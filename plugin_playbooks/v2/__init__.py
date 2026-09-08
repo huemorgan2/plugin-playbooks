@@ -51,6 +51,7 @@ APPROVE_RESULT_KEYS = frozenset({"approved", "request_id", "reason", "decided_by
 
 # Runtime exports (phase 02) — after the constants, which these modules import.
 from .journal import JournalStore, MemoryJournalStore  # noqa: E402
+from .journal_db import DbJournalStore  # noqa: E402
 from .loop import SegmentLoop  # noqa: E402
 from .shim import SHIM_SOURCE  # noqa: E402
 
@@ -58,5 +59,5 @@ __all__ = [
     "MAX_EFFECTS", "FORMATS", "AVAILABLE_EFFECTS", "UNAVAILABLE_EFFECTS",
     "DEFAULT_FEATURES", "CTX_EXCEPTIONS", "CTX_UNCATCHABLE", "DEFAULT_TIMEOUTS",
     "APPROVE_RESULT_KEYS", "SegmentLoop", "JournalStore", "MemoryJournalStore",
-    "SHIM_SOURCE",
+    "DbJournalStore", "SHIM_SOURCE",
 ]

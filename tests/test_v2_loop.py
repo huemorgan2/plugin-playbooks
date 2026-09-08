@@ -950,40 +950,6 @@ async def test_active_run_id_and_nested_refusal_during_effect(db):
     assert active_run_id() is None
 
 
-async def test_v2_run_swept_on_restart_says_so(db):
-    gate = asyncio.Event()
-    started = asyncio.Event()
-
-    async def slow(**kw):
-        started.set()
-        await gate.wait()
-        return {"ok": True}
-
-    def script(env):
-        if len(env["journal"]) == 1:
-            return _effect(1, "slow", 1, "tool", "slow", {})
-        return {"kind": "return", "value": None}
-
-    fake = ScriptedCodeRun(script)
-    tools = _Tools(slow=_Tool(slow), code_run=_Tool(fake.handler))
-    runner1, bus = _runner(db, tools)
-    pb = await _save(db, _pb("swept", GATED_SRC))
-    run = await runner1.start_run_background(pb, inputs={})
-    await asyncio.wait_for(started.wait(), 5)
-
-    runner2 = PlaybookRunner(session_factory=db, tool_registry=tools, events=_Bus())
-    assert await runner2.sweep_orphaned_runs() == 1
-    row = await _row(db, run.id)
-    assert row.status == "failed"
-    assert row.error_type == "Interrupted"
-    assert "interrupted" in row.error
-    assert row.failed_at is not None
-    steps = await _steps(db, run.id)
-    assert steps[0].status == "failed" and "interrupted" in steps[0].error
-    gate.set()
-    await runner1.wait_for_run(run.id, timeout=5)
-
-
 async def test_run_error_columns_migrate():
     engine = create_async_engine("sqlite+aiosqlite://")
     four = {"error", "error_type", "traceback", "failed_at"}
@@ -1015,14 +981,25 @@ async def test_memory_journal_store_roundtrip():
     from plugin_playbooks.v2.journal import make_effect_entry, make_entry0
 
     store = MemoryJournalStore()
-    e0 = make_entry0(hash_seed=7, inputs={"n": 1}, playbook="pb", version=3, max_effects=200)
+    e0 = make_entry0(
+        hash_seed=7, inputs={"n": 1}, playbook="pb", version=3, max_effects=200,
+        code_sha256="ab" * 32,
+    )
     assert {k for k in e0} == {
         "seq", "kind", "hash_seed", "inputs", "playbook", "version", "format", "mode",
-        "max_effects", "started_at",
+        "max_effects", "started_at", "code_sha256",
     }
     assert e0["kind"] == "run" and e0["format"] == "python" and e0["mode"] == "real"
+    # phase 06: `code_sha256` is present only when the caller pins one
+    assert "code_sha256" not in make_entry0(
+        hash_seed=0, inputs={}, playbook="pb", version=1, max_effects=1,
+    )
+    assert await store.journaled(["r1"]) == set()
     await store.start("r1", e0)
     assert (await store.entry0("r1"))["hash_seed"] == 7
+    assert (await store.entry0("r1"))["code_sha256"] == "ab" * 32
+    assert await store.journaled(["r1", "nope"]) == {"r1"}
+    assert await store.in_flight("r1") == []
     seq = await store.append_in_flight("r1", make_effect_entry(
         run_id="r1", seq=0, kind="tool", id="rows", occurrence=1, name="fetch", args={"n": 1},
     ))
@@ -1034,16 +1011,36 @@ async def test_memory_journal_store_roundtrip():
         "seq", "kind", "id", "occurrence", "name", "args", "idempotency_key", "status",
         "result", "error", "attempts", "dry", "started_at", "ended_at", "ms",
     }
+    # phase 06: the write-ahead row is what a resume sees
+    assert [e["seq"] for e in await store.in_flight("r1")] == [1]
     await store.complete("r1", 1, {"v": 1}, [{"n": 1, "error": None, "ms": 3}], 3)
     done = (await store.read("r1"))[1]
     assert done["status"] == "done" and done["result"] == {"v": 1} and done["ms"] == 3
     assert done["ended_at"] is not None
+    assert await store.in_flight("r1") == []
+    # phase 06: an in-flight row whose outcome a restart lost
+    seq_u = await store.append_in_flight("r1", make_effect_entry(
+        run_id="r1", seq=0, kind="agent", id="ask", occurrence=1, name=None, args={"q": 1},
+    ))
+    await store.mark_unknown("r1", seq_u, "outcome unknown — the server restarted while effect ask#1 was in flight")
+    unknown = (await store.read("r1"))[seq_u]
+    assert unknown["status"] == "timed_out_unknown"
+    assert unknown["error"] == {
+        "type": "OutcomeUnknown",
+        "message": "outcome unknown — the server restarted while effect ask#1 was in flight",
+    }
+    assert unknown["ended_at"] is not None and unknown["attempts"] == []
+    # Risks 9: handling an OutcomeUnknown keeps the row's status (only
+    # `failed` becomes `failed_handled`)
+    await store.mark_handled("r1", [seq_u])
+    assert (await store.read("r1"))[seq_u]["status"] == "timed_out_unknown"
+    assert await store.in_flight("r1") == []
     seq2 = await store.append_in_flight("r1", make_effect_entry(
         run_id="r1", seq=0, kind="now", id="now", occurrence=1, name=None, args={},
     ))
-    assert seq2 == 2
-    await store.fail("r1", 2, "EffectTimeout", "timed out", [{"n": 1, "error": "EffectTimeout: timed out", "ms": 1000}])
-    failed = (await store.read("r1"))[2]
+    assert seq2 == 3
+    await store.fail("r1", 3, "EffectTimeout", "timed out", [{"n": 1, "error": "EffectTimeout: timed out", "ms": 1000}])
+    failed = (await store.read("r1"))[3]
     assert failed["status"] == "failed" and failed["error"] == {"type": "EffectTimeout", "message": "timed out"}
     # reads are copies: mutating one never touches the store
     snapshot = await store.read("r1")

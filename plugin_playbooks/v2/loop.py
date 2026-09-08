@@ -6,6 +6,10 @@ segmented replay: it writes entry 0, then repeatedly invokes the jail
 `kind` — `effect`: journal `in_flight` FIRST, execute with v1 parity, complete
 or fail the row, re-invoke; `gather`: the same for a batch (phase 03 emits
 it); `return`: done; `error`: the run fails with the four run columns.
+`SegmentLoop.resume(run, playbook)` (phase 06) continues a `running` run from
+its durable journal after a process death: in-flight rows are reconciled
+(`timed_out_unknown` or re-executed in place) and the same segment body runs
+on the untouched journal prefix.
 
 Runner internals (`_normalize_tool_result`, `_active_run_id`, vault
 resolution, the step-row shapes) are imported lazily inside functions —
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import secrets
@@ -97,6 +102,16 @@ class _SubtaskFailed(_EffectFailure):
 
 
 _RETRYABLE = (_ToolError, _EffectTimeout)
+
+# Phase 06 (docs/v2.md §6): the kinds a resume re-executes in place from the
+# journaled args — side-effect-free outside the journal. Every other kind found
+# `in_flight` after a restart becomes `timed_out_unknown` and is never re-run.
+_REEXECUTE_ON_RESUME = frozenset({"llm", "now", "random", "log"})
+
+
+def code_sha256(source: str) -> str:
+    """The entry-0 `code_sha256` pin (phase 06): the source a run started on."""
+    return hashlib.sha256((source or "").encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -286,6 +301,7 @@ class SegmentLoop:
         await self.journal.start(run_id, make_entry0(
             hash_seed=hash_seed, inputs=dict(inputs or {}), playbook=name, version=version,
             max_effects=self.max_effects, mode="dry" if self.dry else "real",
+            code_sha256=code_sha256(source),
         ))
         if self.dry:
             self._dry_rng[run_id] = Random(0)
@@ -294,50 +310,11 @@ class SegmentLoop:
         parent_chain = self._runs[str(parent_id)].chain if parent_id is not None and str(parent_id) in self._runs else []
         self._runs[run_id] = _RunState(name=name, version=version, chain=[*parent_chain, name])
         try:
-            rt = self._code_run_tool()
-            while True:
-                result.segments += 1
-                n = result.segments
-                journal = await self.journal.read(run_id)
-                envelope = {
-                    "playbook": name, "version": version, "source": source,
-                    "hash_seed": hash_seed, "max_effects": self.max_effects,
-                    "call_sites": call_sites, "journal": journal,
-                }
-                payload, host_ms = await self._segment(rt, envelope, name, n)
-                jail_ms = int(payload.get("duration_ms") or 0)
-                result.segment_latency_ms.append((host_ms, jail_ms))
-                log.info(
-                    "playbook.v2.segment run_id=%s n=%d host_ms=%d jail_ms=%d backend=%s",
-                    run_id, n, host_ms, jail_ms, payload.get("backend"),
-                )
-                self._check_payload(payload, journal, n)
-                res = payload.get("result")
-                if not isinstance(res, dict) or "kind" not in res:
-                    raise V2RunError(
-                        f"segment {n}: the shim returned no result kind", "ShimFailure",
-                    )
-                kind = res["kind"]
-                handled = res.get("handled")
-                if isinstance(handled, list) and handled:
-                    # phase 03: replayed failures the code caught and proceeded past
-                    await self.journal.mark_handled(run_id, [int(s) for s in handled])
-                if kind == "return":
-                    result.value = res.get("value")
-                    if parent_id is not None:
-                        self._values[run_id] = result.value
-                    return result
-                if kind == "error":
-                    raise self._run_error(res, source, filename)
-                if kind == "effect":
-                    await self._effect(run, res)
-                    continue
-                if kind == "gather":
-                    await self._gather(run, res)
-                    continue
-                raise V2RunError(
-                    f"segment {n}: unknown result kind {kind!r}", "ShimFailure",
-                )
+            return await self._segments(
+                run, result, name=name, version=version, source=source, filename=filename,
+                call_sites=call_sites, hash_seed=hash_seed, max_effects=self.max_effects,
+                parent_id=parent_id,
+            )
         finally:
             # the most recently FINISHED drive: a subtask's child finishes
             # before its parent, so the parent's result is what stays here
@@ -345,6 +322,182 @@ class SegmentLoop:
             self._runs.pop(run_id, None)
             self._dry_rng.pop(run_id, None)
             await self.journal.drop(run_id)
+
+    # ------------------------------------------------------------ resume
+    async def resume(self, run: Any, playbook: Any) -> LoopResult:
+        """Phase 06 (docs/v2.md §6): continue a `running` run from its durable
+        journal after a process death. No seed, no entry 0 — `hash_seed`,
+        `inputs` and `max_effects` come from the journal; the ancestor chain
+        is rebuilt from `playbook_runs.parent_run_id`; the run's `in_flight`
+        rows are reconciled (tool/agent/subtask/approve → `timed_out_unknown`,
+        llm/now/random/log re-executed in place) and then the segment body
+        continues exactly as `drive()` would have — same journal prefix."""
+        from .checker import check
+
+        run_id = str(run.id)
+        e0 = await self.journal.entry0(run_id)
+        if e0 is None:
+            raise V2RunError(
+                f"run {run_id} has no journal — it cannot be resumed", "JournalDivergence",
+            )
+        name = playbook.name
+        version = int(getattr(run, "playbook_version", None) or e0.get("version") or 1)
+        source = playbook.code or ""
+        filename = f"playbook:{name}@v{version}"
+        call_sites = check(source, name=name, version=version).summary.get("call_sites", [])
+        hash_seed = int(e0.get("hash_seed") or 0)
+        max_effects = int(e0.get("max_effects") or self.max_effects)
+        result = LoopResult()
+        parent_id = getattr(run, "parent_run_id", None)
+        chain = await self._ancestor_chain(run)
+        self._runs[run_id] = _RunState(name=name, version=version, chain=[*chain, name])
+        try:
+            await self._reconcile(run)
+            return await self._segments(
+                run, result, name=name, version=version, source=source, filename=filename,
+                call_sites=call_sites, hash_seed=hash_seed, max_effects=max_effects,
+                parent_id=parent_id,
+            )
+        finally:
+            self.last_result = result
+            self._runs.pop(run_id, None)
+            await self.journal.drop(run_id)
+
+    async def _ancestor_chain(self, run: Any) -> list[str]:
+        """The ancestor playbook-name chain (oldest first) walked up
+        `parent_run_id`: a live parent's in-memory state when present, the
+        run/playbook rows otherwise (phase 03 kept the chain in memory only)."""
+        from sqlalchemy import select
+
+        from ..models import Playbook, PlaybookRun
+
+        parent_id = getattr(run, "parent_run_id", None)
+        if parent_id is None:
+            return []
+        if str(parent_id) in self._runs:
+            return list(self._runs[str(parent_id)].chain)
+        chain: list[str] = []
+        seen: set[str] = set()
+        async with self._sf() as session:
+            cursor = parent_id
+            while cursor is not None and str(cursor) not in seen and len(chain) < 64:
+                seen.add(str(cursor))
+                parent = await session.get(PlaybookRun, cursor)
+                if parent is None:
+                    break
+                pname = (await session.execute(
+                    select(Playbook.name).where(Playbook.id == parent.playbook_id)
+                )).scalar_one_or_none()
+                if pname:
+                    chain.append(pname)
+                cursor = parent.parent_run_id
+        chain.reverse()
+        return chain
+
+    async def _reconcile(self, run: Any) -> None:
+        """Reconciliation before the first resumed segment (docs/v2.md §6), in
+        seq order over the run's `in_flight` rows."""
+        run_id = str(run.id)
+        for row in await self.journal.in_flight(run_id):
+            seq = int(row["seq"])
+            kind = str(row.get("kind"))
+            key = f"{row.get('id')}#{row.get('occurrence')}"
+            if kind in _REEXECUTE_ON_RESUME:
+                # side-effect-free: re-executed by the host from the journaled
+                # args into the SAME row — seq/idempotency_key unchanged, so a
+                # gather batch keeps its seq alignment (Risks 3, 15)
+                eff = {
+                    "seq": seq, "id": key, "call_site_id": row.get("id"),
+                    "occurrence": row.get("occurrence"), "effect_kind": kind,
+                    "name": row.get("name"),
+                    "args": row.get("args") if isinstance(row.get("args"), dict) else {},
+                    "options": {},
+                }
+                step_run_id = await self._running_step(run.id, key)
+                if step_run_id is None:
+                    step_run_id = await self._create_step(run.id, key, kind)
+                log.info("playbook.v2.resume.reexecute run_id=%s seq=%d effect=%s", run_id, seq, key)
+                await self._execute_and_finish(run, eff, seq, step_run_id)
+                continue
+            message = f"outcome unknown — the server restarted while effect {key} was in flight"
+            await self.journal.mark_unknown(run_id, seq, message)
+            step_run_id = await self._running_step(run.id, key)
+            if step_run_id is not None:
+                # Risks 12: the step row closes `failed` with the same message;
+                # the journal row keeps the precise status
+                await self._complete_step(step_run_id, "failed", error=f"OutcomeUnknown: {message}")
+            await self._events.emit("playbook.step.failed", {
+                "run_id": run_id, "step_id": key, "error": f"OutcomeUnknown: {message}",
+                "retry_count": 0,
+            })
+            log.info("playbook.v2.resume.unknown run_id=%s seq=%d effect=%s", run_id, seq, key)
+
+    async def _running_step(self, run_id: Any, step_id: str) -> Any:
+        from sqlalchemy import select
+
+        from ..models import PlaybookStepRun
+
+        async with self._sf() as session:
+            rows = (await session.execute(
+                select(PlaybookStepRun).where(
+                    PlaybookStepRun.run_id == run_id,
+                    PlaybookStepRun.step_id == step_id[:128],
+                    PlaybookStepRun.status == "running",
+                ).order_by(PlaybookStepRun.started_at.desc())
+            )).scalars().all()
+        return rows[0].id if rows else None
+
+    # ------------------------------------------------------------ segment body
+    async def _segments(
+        self, run: Any, result: LoopResult, *, name: str, version: int, source: str,
+        filename: str, call_sites: list[Any], hash_seed: int, max_effects: int,
+        parent_id: Any,
+    ) -> LoopResult:
+        run_id = str(run.id)
+        rt = self._code_run_tool()
+        while True:
+            result.segments += 1
+            n = result.segments
+            journal = await self.journal.read(run_id)
+            envelope = {
+                "playbook": name, "version": version, "source": source,
+                "hash_seed": hash_seed, "max_effects": max_effects,
+                "call_sites": call_sites, "journal": journal,
+            }
+            payload, host_ms = await self._segment(rt, envelope, name, n)
+            jail_ms = int(payload.get("duration_ms") or 0)
+            result.segment_latency_ms.append((host_ms, jail_ms))
+            log.info(
+                "playbook.v2.segment run_id=%s n=%d host_ms=%d jail_ms=%d backend=%s",
+                run_id, n, host_ms, jail_ms, payload.get("backend"),
+            )
+            self._check_payload(payload, journal, n)
+            res = payload.get("result")
+            if not isinstance(res, dict) or "kind" not in res:
+                raise V2RunError(
+                    f"segment {n}: the shim returned no result kind", "ShimFailure",
+                )
+            kind = res["kind"]
+            handled = res.get("handled")
+            if isinstance(handled, list) and handled:
+                # phase 03: replayed failures the code caught and proceeded past
+                await self.journal.mark_handled(run_id, [int(s) for s in handled])
+            if kind == "return":
+                result.value = res.get("value")
+                if parent_id is not None:
+                    self._values[run_id] = result.value
+                return result
+            if kind == "error":
+                raise self._run_error(res, source, filename)
+            if kind == "effect":
+                await self._effect(run, res)
+                continue
+            if kind == "gather":
+                await self._gather(run, res)
+                continue
+            raise V2RunError(
+                f"segment {n}: unknown result kind {kind!r}", "ShimFailure",
+            )
 
     # ------------------------------------------------------------ segments
     def _code_run_tool(self) -> Any:

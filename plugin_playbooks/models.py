@@ -345,3 +345,46 @@ class PlaybookWatch(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class PlaybookJournal(Base):
+    """0.51.0 (plans/032 phase 06; docs/v2.md §6): the durable v2 journal.
+    One row per effect occurrence of a run, keyed `(run_id, seq)`; row 0
+    (`kind="run"`) carries the entry-0 fields in `args` and is the v2 marker
+    the sweep and the resume scan key on. Rows are written `in_flight`
+    BEFORE the effect executes (write-ahead) and overwritten in place; the
+    store never deletes a row — rows cascade with the run row.
+    `args` holds raw `vault:` refs only, never a resolved secret."""
+    __tablename__ = "playbook_journal"
+    __table_args__ = (
+        Index("ux_playbook_journal_idem", "idempotency_key", unique=True),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), ForeignKey("playbook_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    call_site_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    occurrence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # the literal tool name (`tool`), the target playbook (`subtask`), else NULL
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    args: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # in_flight | done | failed | failed_handled | timed_out_unknown (phase 07 adds parked)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    attempts: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    transcript: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    child_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(), nullable=True)
+    dry: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # host wall time of the whole row (docs/v2.md §6 `ms`)
+    ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

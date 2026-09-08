@@ -58,6 +58,30 @@ async def get_version_row(
     return min(rows, key=_dup_keep_key)
 
 
+def shim_playbook(playbook: Playbook, row: PlaybookVersion) -> Playbook:
+    """Transient Playbook carrying a version row's content — NEVER added to a
+    session. plans/032 phase 06 (Risks 11): the shape `agent_tools` builds
+    for candidate runs, hoisted here so `runner._resume_run` can execute a
+    run on the exact version row it started on (the runner only reads
+    id/name/display_name/definition/code/format/live_version)."""
+    return Playbook(
+        id=playbook.id,
+        name=playbook.name,
+        display_name=playbook.display_name,
+        description=playbook.description,
+        when_to_use=playbook.when_to_use,
+        inputs_schema=dict(row.definition or {}).get("inputs"),
+        definition=row.definition,
+        code=row.code,
+        format=playbook.format,
+        manifest=row.manifest,
+        version=row.version,
+        live_version=row.version,
+        status=playbook.status,
+        agent_autonomy=playbook.agent_autonomy,
+    )
+
+
 async def ensure_live_row(session: AsyncSession, p: Playbook) -> PlaybookVersion | None:
     """Guarantee a version row exists for the current live content. Records
     an EXISTING number — no new number is minted. Returns None (and creates

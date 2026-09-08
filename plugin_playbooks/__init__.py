@@ -646,7 +646,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.50.0",
+        version="0.51.0",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -813,6 +813,8 @@ class PlaybooksPlugin(LunaPlugin):
         # 0.5.1: rows still "running" from before this process existed
         # (restart/upgrade, or pre-0.5.0 cancelled-mid-run coroutines) would
         # otherwise sit at "running" forever. Never block the load on it.
+        # 0.51.0 (plans/032 phase 06): v2 rows (journal row 0) are skipped
+        # here and resumed in on_server_ready.
         try:
             await self._runner.sweep_orphaned_runs()
         except Exception as e:  # noqa: BLE001
@@ -1158,6 +1160,14 @@ class PlaybooksPlugin(LunaPlugin):
             if failure_section := render_failure_section(digest):
                 sections.append(failure_section)
         return sections
+
+    async def on_server_ready(self) -> None:
+        """0.51.0 (plans/032 phase 06, docs/v2.md §6): continue the v2 runs a
+        restart interrupted. Core awaits this hook sequentially on the
+        serving loop, so the runner only SPAWNS the runs (never awaits them).
+        Not called for runtime installs, where nothing was interrupted."""
+        n = await self._runner.resume_interrupted_runs()
+        logger.info("playbooks: resumed %d interrupted v2 run(s)", n)
 
     async def on_unload(self) -> None:
         if self._trigger_service:

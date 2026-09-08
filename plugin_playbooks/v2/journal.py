@@ -1,10 +1,11 @@
 """v2 journal store (plans/032 phase 02; docs/v2.md §6).
 
 `JournalStore` is the interface the segment loop writes through and the shim
-replays from; `MemoryJournalStore` is this phase's in-memory implementation
-(phase 06 adds the durable one behind the same Protocol). Entry shapes are
-fixed by docs/v2.md §6 — entry 0 describes the run, every later entry is one
-effect occurrence, written `in_flight` BEFORE the effect executes.
+replays from; `MemoryJournalStore` is the in-memory implementation (dry runs
+and unit tests) and `journal_db.DbJournalStore` (phase 06) the durable one
+behind the same Protocol. Entry shapes are fixed by docs/v2.md §6 — entry 0
+describes the run, every later entry is one effect occurrence, written
+`in_flight` BEFORE the effect executes.
 """
 
 from __future__ import annotations
@@ -52,16 +53,39 @@ class JournalStore(Protocol):
         durable stores keep it and treat this as a no-op."""
         ...
 
+    async def in_flight(self, run_id: str) -> list[dict[str, Any]]:
+        """Phase 06: the run's `in_flight` rows in seq order — what a restart
+        finds and `SegmentLoop.resume` reconciles."""
+        ...
+
+    async def mark_unknown(self, run_id: str, seq: int, message: str) -> None:
+        """Phase 06: status `timed_out_unknown`, `error={"type": "OutcomeUnknown",
+        "message": message}`, `ended_at` — the row is never re-executed."""
+        ...
+
+    async def journaled(self, run_ids: list[Any]) -> set[Any]:
+        """Phase 06: the subset of `run_ids` that have a row 0 — the v2
+        marker the sweep skips and the resume scan selects. Ids are returned
+        as given (the caller's type)."""
+        ...
+
 
 def make_entry0(
     *, hash_seed: int, inputs: dict[str, Any], playbook: str, version: int,
     max_effects: int, mode: str = "real", fmt: str = "python",
+    code_sha256: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    """Entry 0 (docs/v2.md §6). `code_sha256` (phase 06) pins the source the
+    run started on so a resume detects "code edited under a run" before any
+    jail spawn."""
+    entry = {
         "seq": 0, "kind": "run", "hash_seed": hash_seed, "inputs": inputs,
         "playbook": playbook, "version": version, "format": fmt, "mode": mode,
         "max_effects": max_effects, "started_at": _now_iso(),
     }
+    if code_sha256 is not None:
+        entry["code_sha256"] = code_sha256
+    return entry
 
 
 def make_effect_entry(
@@ -155,3 +179,16 @@ class MemoryJournalStore:
     async def drop(self, run_id: str) -> None:
         if not self.keep_completed:
             self._runs.pop(run_id, None)
+
+    async def in_flight(self, run_id: str) -> list[dict[str, Any]]:
+        entries = self._runs.get(run_id) or []
+        return [copy.deepcopy(e) for e in entries[1:] if e.get("status") == "in_flight"]
+
+    async def mark_unknown(self, run_id: str, seq: int, message: str) -> None:
+        row = self._row(run_id, seq)
+        row["status"] = "timed_out_unknown"
+        row["error"] = {"type": "OutcomeUnknown", "message": message}
+        row["ended_at"] = _now_iso()
+
+    async def journaled(self, run_ids: list[Any]) -> set[Any]:
+        return {rid for rid in run_ids if str(rid) in self._runs}

@@ -30,9 +30,10 @@ from luna_sdk import EventBus, PluginContext, ToolRegistry, message_source
 from .definition import OnError, PlaybookDef, StepDef, StepKind
 from .models import Playbook, PlaybookRun, PlaybookStepRun
 from .publish import ops_conversation_id as _ops_conversation_id
-from .v2 import MemoryJournalStore, SegmentLoop
+from .v2 import DbJournalStore, JournalStore, SegmentLoop
 from .v2.checker import sniff_format
-from .v2.loop import V2RunError
+from .v2.loop import V2RunError, code_sha256
+from .versioning import get_version_row, shim_playbook
 
 log = logging.getLogger("luna.playbooks.runner")
 
@@ -320,6 +321,7 @@ class PlaybookRunner:
         events: EventBus,
         agent: Any = None,
         context: PluginContext | None = None,
+        journal: JournalStore | None = None,
     ) -> None:
         self._sf = session_factory
         self._tools = tool_registry
@@ -332,12 +334,15 @@ class PlaybookRunner:
         # keeps the task alive (create_task alone can be GC'd); entries pop
         # via done-callback. wait_for_run/cancel_run look tasks up here.
         self._tasks: dict[Any, asyncio.Task] = {}
-        # plans/032 phase 02: the v2 segment loop (docs/v2.md §11). The
-        # journal is in memory until phase 06 makes it durable.
+        # plans/032 phase 02: the v2 segment loop (docs/v2.md §11). Phase 06:
+        # the journal is durable (`playbook_journal`, write-ahead rows) so a
+        # run survives a restart; `journal=` overrides it (tests). Dry runs
+        # keep their own MemoryJournalStore inside SegmentLoop.dry_run.
         # phase 03: the same facade v1's llm/agent steps use, and the bound
         # blocking `start_run` for `ctx.subtask` (parent/child run rows).
         self._v2 = SegmentLoop(
-            session_factory, tool_registry, events, context, MemoryJournalStore(),
+            session_factory, tool_registry, events, context,
+            journal if journal is not None else DbJournalStore(session_factory),
             agent=agent, start_run=self.start_run,
         )
 
@@ -426,13 +431,18 @@ class PlaybookRunner:
             runs = (await session.execute(
                 select(PlaybookRun).where(PlaybookRun.status == "running")
             )).scalars().all()
+            # plans/032 phase 06: a v2 run (journal row 0 present) is never
+            # swept — `resume_interrupted_runs` continues it on
+            # `on_server_ready`. Computed before any row is touched.
+            journaled = await self._v2.journal.journaled(
+                [run.id for run in runs if run.id not in self._tasks]
+            )
             for run in runs:
-                if run.id in self._tasks:
+                if run.id in self._tasks or run.id in journaled:
                     continue
                 run.status = "failed"
                 run.completed_at = now
-                # plans/032 phase 02: the row says WHY (docs/v2.md §7). A v2
-                # run is swept exactly like a v1 run until phase 06 resumes it.
+                # plans/032 phase 02: the row says WHY (docs/v2.md §7).
                 run.error = note
                 run.error_type = "Interrupted"
                 run.failed_at = now
@@ -462,6 +472,128 @@ class PlaybookRunner:
         if swept:
             log.info("playbook.runs.swept_orphans count=%d", swept)
         return swept
+
+    async def resume_interrupted_runs(self) -> int:
+        """plans/032 phase 06 (docs/v2.md §6): continue every `running` v2 run
+        this process is not driving — what a restart left behind. Called from
+        `on_server_ready` (the serving loop; core awaits the hook, so the runs
+        are SPAWNED here, never awaited). Each run gets a task named like a
+        background run and registered in `self._tasks`, so `cancel_run`,
+        `wait_for_run` and the sweep's live check keep working. v1 rows have
+        no journal and are left to the sweep. Returns the count spawned."""
+        async with self._sf() as session:
+            runs = (await session.execute(
+                select(PlaybookRun).where(PlaybookRun.status == "running")
+            )).scalars().all()
+        candidates = [run for run in runs if run.id not in self._tasks]
+        journaled = await self._v2.journal.journaled([run.id for run in candidates])
+        resumed = 0
+        for run in candidates:
+            if run.id not in journaled:
+                continue
+            task = asyncio.create_task(
+                self._resume_run(run), name=f"playbook-run-{run.id}",
+            )
+            self._tasks[run.id] = task
+            task.add_done_callback(lambda _t, _id=run.id: self._tasks.pop(_id, None))
+            resumed += 1
+        if resumed:
+            log.info("playbook.runs.resumed count=%d", resumed)
+        return resumed
+
+    async def _resume_run(self, run: PlaybookRun) -> None:
+        """Drive a resumed v2 run to its terminal status on the EXACT version
+        row it started on (`playbook_runs.playbook_version`), with the
+        `_drive_run` scaffolding around `SegmentLoop.resume`. Inputs come from
+        journal entry 0 (what the shim replays). No `PlaybookDef`, no
+        `_RunContext`: a v2 definition is the checker summary."""
+        async with self._sf() as session:
+            playbook = await session.get(Playbook, run.playbook_id)
+            row = (
+                await get_version_row(session, playbook, int(run.playbook_version))
+                if playbook is not None else None
+            )
+        if playbook is None or row is None:
+            await self._complete_run(
+                run.id, "failed",
+                error=(
+                    f"cannot resume: version {run.playbook_version} of playbook "
+                    f"{getattr(playbook, 'name', run.playbook_id)!s} has no version row"
+                ),
+                error_type="VersionMissing",
+            )
+            return
+        e0 = await self._v2.journal.entry0(str(run.id)) or {}
+        pinned = e0.get("code_sha256")
+        if pinned and code_sha256(row.code or "") != pinned:
+            # code edited under a run: refuse BEFORE any jail spawn (Risks 8)
+            await self._complete_run(
+                run.id, "failed",
+                error=(
+                    f"journal divergence: the source of playbook '{playbook.name}' "
+                    f"v{row.version} no longer matches the code this run started on — "
+                    "candidate causes: set iteration, code edited under a run, "
+                    "non-journaled randomness"
+                ),
+                error_type="JournalDivergence",
+            )
+            return
+        shim = shim_playbook(playbook, row)
+
+        activity_id = str(run.id)
+        activity_label = shim.display_name or shim.name
+        activity_meta = {"playbook_name": shim.name}
+        await self._events.emit("activity.started", {
+            "activity_id": activity_id,
+            "kind": "playbook",
+            "label": activity_label,
+            "meta": activity_meta,
+        })
+        token = _active_run_id.set(str(run.id))
+        source_token = message_source.set("playbook")
+        heartbeat_task = asyncio.create_task(
+            self._activity_heartbeat(activity_id, activity_label, activity_meta)
+        )
+        try:
+            with _playbook_origin_scope(shim):
+                await self._v2.resume(run, shim)
+            await self._complete_run(run.id, "done")
+            run.status = "done"
+        except V2RunError as e:
+            # docs/v2.md §6/§7: an uncaught OutcomeUnknown ends the run
+            # `timed_out_unknown`; every other kind is `failed`
+            status = "timed_out_unknown" if e.error_type == "OutcomeUnknown" else "failed"
+            log.info("playbook.run.v2_failed run_id=%s type=%s status=%s", run.id, e.error_type, status)
+            await self._complete_run(
+                run.id, status, error=e.error, error_type=e.error_type,
+                traceback=e.traceback, failed_at=e.failed_at,
+            )
+            run.status = status
+        except asyncio.CancelledError:
+            log.info("playbook.run.cancelled run_id=%s", run.id)
+            await self._complete_run(run.id, "cancelled")
+            run.status = "cancelled"
+        except Exception as e:
+            log.exception("playbook.run.error run_id=%s", run.id)
+            await self._complete_run(run.id, "failed", error=str(e))
+            run.status = "failed"
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+            await self._events.emit("activity.completed", {
+                "activity_id": activity_id,
+                "kind": "playbook",
+                "label": activity_label,
+                "status": run.status,
+                "meta": activity_meta,
+            })
+            message_source.reset(source_token)
+            _active_run_id.reset(token)
 
     async def _create_run(
         self,
