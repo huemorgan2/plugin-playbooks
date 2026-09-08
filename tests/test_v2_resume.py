@@ -56,6 +56,23 @@ async def db():
     await engine.dispose()
 
 
+@pytest.fixture
+async def db_file(tmp_path):
+    """File-backed sqlite with the default (per-session) pool: every session
+    gets its own connection, as in PostgreSQL. `db` (in-memory) is a
+    StaticPool — one connection for all sessions — so two runs resumed
+    concurrently interleave one session's ROLLBACK with the other's
+    uncommitted `append_in_flight` insert (plugin/06 "Learned"). Use this for
+    any test that drives more than one run task at once."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/journal.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    yield sf
+    await asyncio.sleep(0.05)
+    await engine.dispose()
+
+
 async def _save(sf, pb: Playbook, *, versions: dict[int, str] | None = None) -> Playbook:
     """Persist a playbook AND the version row(s) a resume pins on
     (`_create_run` stamps `playbook_version = live_version or version`)."""
@@ -1013,7 +1030,8 @@ SUB_B = '''async def run(ctx, inputs):
 
 @real_jail
 @requires_jail()
-async def test_subtask_parent_child_rows_and_cycle_guard_across_restart(db, tmp_path):
+async def test_subtask_parent_child_rows_and_cycle_guard_across_restart(db_file, tmp_path):
+    db = db_file  # A and B resume concurrently: per-session connections (see `db_file`)
     bt = _Counter("bt", die_on=1)
     tools = _real_tools(tmp_path, bt=bt)
     runner_a, _ = _runner(db, tools)
