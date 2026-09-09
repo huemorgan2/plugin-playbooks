@@ -716,15 +716,16 @@ export function VersionsTab({
                     key={v.version}
                     onClick={() => selectVersion(v.version)}
                     className={cn(
-                      'w-full text-left rounded-lg px-3 py-2.5 transition',
+                      'w-full text-left rounded-lg px-3 py-2 transition',
                       active
                         ? 'bg-luna-600/20 text-luna-200'
                         : 'hover:bg-white/[.03] text-ink-300',
                     )}
                     data-testid={`version-row-${v.version}`}
                     aria-current={active ? 'true' : undefined}
+                    title={v.title || undefined}
                   >
-                    <div className="flex items-start gap-2">
+                    <div className="flex items-center gap-2">
                       <span className={cn('text-sm font-bold', active ? 'text-luna-100' : 'text-ink-100')}>
                         v{v.version}
                       </span>
@@ -732,21 +733,19 @@ export function VersionsTab({
                         {v.live ? <LiveBadge /> : v.candidate ? <CandidateBadge /> : null}
                       </span>
                     </div>
-                    {v.title && (
-                      <p className="text-xs text-ink-400 mt-1 truncate" title={v.title}>
-                        "{v.title}"
-                      </p>
-                    )}
-                    <div className="flex items-center gap-1.5 mt-1.5 text-[11px] text-ink-500">
+                    <div className="flex items-center gap-1 mt-0.5 text-[11px] text-ink-500 whitespace-nowrap overflow-hidden">
                       <span data-testid={`version-author-${v.version}`} title={v.author}>{authorLabel(v.author)}</span>
                       <span>·</span>
                       <span title={fmtAbsolute(v.created_at)}>{timeAgo(v.created_at)}</span>
                       <span>·</span>
                       <span>{v.runs} {v.runs === 1 ? 'run' : 'runs'}</span>
+                      {v.promoted_from != null && (
+                        <>
+                          <span>·</span>
+                          <span className="text-ink-600" title={`promoted from v${v.promoted_from}`}>← v{v.promoted_from}</span>
+                        </>
+                      )}
                     </div>
-                    {v.promoted_from != null && (
-                      <p className="text-[10px] text-ink-600 mt-1">← promoted from v{v.promoted_from}</p>
-                    )}
                   </button>
                 )
               })}
