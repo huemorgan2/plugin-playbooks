@@ -42,15 +42,31 @@ def _aware(dt: datetime) -> datetime:
     # sqlite returns naive datetimes; stored values are UTC
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-from .models import FAILED_RUN_STATUSES, PlaybookStepRun, PlaybookWatch
+from .models import FAILED_RUN_STATUSES, PlaybookRun, PlaybookStepRun, PlaybookWatch
 from .publish import ops_conversation_id
 
 log = logging.getLogger(__name__)
 
-# Containment for the wake turn — plugin-tasks' resume defaults.
-_WAKE_MAX_TURNS = 12
-_WAKE_TOKEN_BUDGET = 200_000
+# Containment for the wake turn — plugin-tasks' resume defaults (luna 0.92.049,
+# plans/035-fix18fails P1.5). The token budget is pydantic-ai's CUMULATIVE
+# input+output meter across the turn's requests: it caps the NUMBER of model
+# round-trips, not context size. The old 200k on a ~60k-token conversation
+# allowed three requests and cut the third — the wake turn that was reading a
+# 100k-char run result died as `aborted: token_budget` and its work vanished.
+# Per-request context is bounded by core; `timeout_s` is the real limiter.
+_WAKE_MAX_TURNS = 20
+_WAKE_TOKEN_BUDGET = 1_500_000
 _WAKE_TIMEOUT_S = 900.0
+# plans/035 P1.5: a failure moment carries the traceback up to this many chars.
+_TRACEBACK_CAP = 1500
+_STEP_INPUTS_CAP = 600
+# The instruction that closes every wake turn that reports a FAILED run: the
+# owner's original request is still the job — the old text ("Report the
+# failure … playbook_status shows the trace") ended the turn at the report.
+_CONTINUE_AFTER_FAILURE = (
+    "Then continue what the original request asked for — fix and rerun if the "
+    "request said so; report honestly what you did and what you did not."
+)
 # Step outputs are inlined into the moment body up to this cap; beyond it the
 # agent is steered to playbook_status for the full trace.
 _OUTPUTS_CAP = 4000
@@ -69,6 +85,43 @@ def _failure_lines(payload: dict[str, Any]) -> list[str]:
     lines = [f"Error: {payload.get('error') or 'not recorded'}"]
     if status == "timed_out_unknown":
         lines.append(_OUTCOME_UNKNOWN_LINE)
+    return lines
+
+
+def _fmt_failure_detail(
+    *,
+    error_type: str | None,
+    traceback: str | None,
+    step_id: str | None,
+    step_kind: str | None,
+    step_error: str | None,
+    step_inputs: Any,
+) -> list[str]:
+    """plans/035 P1.5: the failure detail an agent turn needs to ACT on a
+    failed run — the exception type, the traceback (capped), the failing step
+    and its inputs — instead of only "Error: <one line>" plus a pointer to
+    playbook_status that the turn rarely followed."""
+    lines: list[str] = []
+    if error_type:
+        lines.append(f"Error type: {error_type}")
+    if step_id:
+        head = f"Failing step: {step_id}"
+        if step_kind:
+            head += f" ({step_kind})"
+        lines.append(head)
+        if step_error and step_error.strip():
+            lines.append(f"Step error: {step_error.strip()[:_STEP_INPUTS_CAP]}")
+        if step_inputs:
+            text = json.dumps(step_inputs, indent=None, default=str)
+            if len(text) > _STEP_INPUTS_CAP:
+                text = text[:_STEP_INPUTS_CAP] + "... (truncated)"
+            lines.append(f"Step inputs: {text}")
+    if traceback and traceback.strip():
+        tb = traceback.strip()
+        if len(tb) > _TRACEBACK_CAP:
+            tb = tb[-_TRACEBACK_CAP:]
+            tb = "... (earlier frames cut)\n" + tb
+        lines.append(f"Traceback:\n{tb}")
     return lines
 
 
@@ -215,6 +268,58 @@ class RunCompletionWake:
             await session.commit()
             return bool(res.rowcount)
 
+    async def _failure_detail(self, run_id: Any) -> list[str]:
+        """Load the run's error contract and the failing step (plans/035 P1.5)."""
+        rid = run_id
+        if isinstance(rid, str):
+            try:
+                rid = uuid.UUID(rid)
+            except ValueError:
+                return []
+        try:
+            async with self._sf() as session:
+                run = await session.get(PlaybookRun, rid)
+                steps = (await session.execute(
+                    select(PlaybookStepRun).where(PlaybookStepRun.run_id == rid)
+                )).scalars().all()
+        except Exception:  # noqa: BLE001 — detail is best-effort, the moment still goes
+            log.exception("run_wake.failure_detail_failed run=%s", run_id)
+            return []
+        failing = None
+        for s in steps:
+            if s.status == "failed" or (s.error and s.status != "done"):
+                if failing is None or (s.started_at and failing.started_at
+                                       and _aware(s.started_at) > _aware(failing.started_at)):
+                    failing = s
+        return _fmt_failure_detail(
+            error_type=getattr(run, "error_type", None) if run else None,
+            traceback=getattr(run, "traceback", None) if run else None,
+            step_id=failing.step_id if failing else None,
+            step_kind=failing.step_kind if failing else None,
+            step_error=failing.error if failing else None,
+            step_inputs=failing.inputs if failing else None,
+        )
+
+    @staticmethod
+    def _log_send_result(kind: str, run_id: Any, result: Any) -> None:
+        """plans/035 P1.5: the moment's turn result was discarded, so a wake
+        turn cut at its budget (`aborted`) or dead (`error`) logged as
+        delivered. Name the real outcome."""
+        if isinstance(result, dict):
+            if result.get("aborted"):
+                log.warning(
+                    "run_wake.moment_aborted kind=%s run=%s reason=%s",
+                    kind, run_id, result.get("aborted"),
+                )
+                return
+            if result.get("error"):
+                log.warning(
+                    "run_wake.moment_failed kind=%s run=%s error=%s",
+                    kind, run_id, str(result.get("error"))[:200],
+                )
+                return
+        log.info("run_wake.%s run=%s", kind, run_id)
+
     async def _watch_moment(
         self, send: Any, payload: dict[str, Any], conv: Any, note: str | None,
     ) -> None:
@@ -231,10 +336,12 @@ class RunCompletionWake:
             lines.append(f"Your note when you set the watch: {note}")
         if status in FAILED_RUN_STATUSES:
             lines.extend(_failure_lines(payload))
+            lines.extend(await self._failure_detail(run_id))
             lines.append("")
             lines.append(
                 "Report the failure to the owner honestly — do NOT fabricate "
-                "results. playbook_status(run_id) shows the failing trace."
+                "results. playbook_status(run_id) shows the full trace. "
+                + _CONTINUE_AFTER_FAILURE
             )
         else:
             outputs = await self._collect_outputs(run_id)
@@ -248,7 +355,7 @@ class RunCompletionWake:
                 "too."
             )
         try:
-            await send(
+            result = await send(
                 f"Watched playbook finished: {name}",
                 "\n".join(lines),
                 channel="moment",
@@ -260,7 +367,7 @@ class RunCompletionWake:
                 token_budget=_WAKE_TOKEN_BUDGET,
                 timeout_s=_WAKE_TIMEOUT_S,
             )
-            log.info("run_wake.watch_moment run=%s conv=%s", run_id, conv)
+            self._log_send_result("watch_moment", run_id, result)
         except Exception:  # noqa: BLE001
             log.exception("run_wake.watch_moment_failed run=%s", run_id)
 
@@ -289,10 +396,12 @@ class RunCompletionWake:
         ]
         if status in FAILED_RUN_STATUSES:
             lines.extend(_failure_lines(payload))
+            lines.extend(await self._failure_detail(run_id))
             lines.append("")
             lines.append(
                 "Report the failure to the owner honestly — do NOT fabricate "
-                "results. playbook_status(run_id) shows the failing trace."
+                "results. playbook_status(run_id) shows the full trace. "
+                + _CONTINUE_AFTER_FAILURE
             )
         else:
             # plans/032 phase 08: a python run's return value leads (the
@@ -318,7 +427,7 @@ class RunCompletionWake:
                 "original request asked for."
             )
         try:
-            await send(
+            result = await send(
                 f"Playbook finished: {name}",
                 "\n".join(lines),
                 channel="moment",
@@ -330,7 +439,7 @@ class RunCompletionWake:
                 token_budget=_WAKE_TOKEN_BUDGET,
                 timeout_s=_WAKE_TIMEOUT_S,
             )
-            log.info("run_wake.moment run=%s status=%s", run_id, status)
+            self._log_send_result("moment", run_id, result)
         except Exception:  # noqa: BLE001
             log.exception("run_wake.moment_failed run=%s", run_id)
 
