@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from evidence import EXPLANATION, green_run
@@ -498,6 +499,7 @@ async def test_on_load_subscription_records_the_owner_decision():
         plugin._start_publish_guard(_LoadCtx(sf, bus))
         plugin._start_publish_guard(_LoadCtx(sf, bus))  # idempotent
         assert len(bus.handlers["approval.decided"]) == 1
+        assert len(bus.handlers["approval.orphan_decided"]) == 1
 
         async with sf() as s:
             s.add(Playbook(name="greeter", display_name="greeter",
@@ -516,7 +518,100 @@ async def test_on_load_subscription_records_the_owner_decision():
         assert pb.last_card_decided_at is not None
 
         await plugin.on_unload()
-        assert bus.unsubscribed == ["approval.decided"]
+        assert bus.unsubscribed == ["approval.decided", "approval.orphan_decided"]
         assert plugin._unsub_publish_guard is None
     finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_approved_orphan_commits_exact_candidate_and_reports_verified_store():
+    """The decision, rather than a model reissue, performs the gated effect."""
+    from plugin_playbooks import PlaybooksPlugin
+
+    payload = {"name": "greeter", "version": 2, "action": "publish"}
+    grants = _Grants(hits={json.dumps(payload, sort_keys=True): True})
+    approvals = _Approvals(["pending", "approved"], grants=grants)
+    engine, sf, tools, _ = await _env(approvals)
+    notices = []
+
+    async def send(title, content, **kwargs):
+        notices.append((title, content, kwargs))
+        return {"responded": True}
+
+    plugin = PlaybooksPlugin()
+    plugin._session_factory = sf
+    plugin._ctx = SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            get=lambda name: SimpleNamespace(handler=tools[name]),
+        ),
+        send_muted_message=send,
+    )
+    try:
+        await _seed_live_v1(sf, tools)
+        await _candidate(sf, tools)
+        first = await _publish(tools)
+        card = first["approval_id"]
+        approvals.statuses[card] = "approved"
+        await publish_guard.note_decision(sf, approval_id=card, decision="approved")
+        event = {
+            "id": card, "kind": "playbook_change", "payload": payload,
+            "decision": "approved", "conversation_id": str(OPS),
+        }
+
+        await plugin._on_publish_decision({**event, "id": "wrong-card"})
+        await plugin._on_publish_decision({**event, "payload": {**payload, "version": 3}})
+        assert (await _pb(sf)).live_version == 1
+        assert len(approvals.requests) == 1
+
+        await plugin._on_publish_decision(event)
+        await __import__("asyncio").gather(*plugin._publish_wakes)
+        pb = await _pb(sf)
+        assert pb.live_version == 2 and pb.candidate_version is None
+        assert len(approvals.requests) == 2
+        assert "read-back verified live_version=2" in notices[0][1]
+
+        await plugin._on_publish_decision(event)
+        assert len(approvals.requests) == 2  # duplicate is inert
+    finally:
+        await plugin.on_unload()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rejected_orphan_never_invokes_publish_tool():
+    from plugin_playbooks import PlaybooksPlugin
+
+    approvals = _Approvals(["pending"])
+    engine, sf, tools, _ = await _env(approvals)
+    notices = []
+
+    async def send(title, content, **kwargs):
+        notices.append(content)
+
+    plugin = PlaybooksPlugin()
+    plugin._session_factory = sf
+    plugin._ctx = SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            get=lambda name: (_ for _ in ()).throw(AssertionError("publish called")),
+        ),
+        send_muted_message=send,
+    )
+    try:
+        await _seed_live_v1(sf, tools)
+        await _candidate(sf, tools)
+        first = await _publish(tools)
+        await publish_guard.note_decision(
+            sf, approval_id=first["approval_id"], decision="rejected",
+        )
+        await plugin._on_publish_decision({
+            "id": first["approval_id"], "kind": "playbook_change",
+            "payload": {"name": "greeter", "version": 2, "action": "publish"},
+            "decision": "rejected", "conversation_id": str(OPS),
+        })
+        await __import__("asyncio").gather(*plugin._publish_wakes)
+        assert (await _pb(sf)).live_version == 1
+        assert "NOT verified live" in notices[0]
+    finally:
+        await plugin.on_unload()
         await engine.dispose()

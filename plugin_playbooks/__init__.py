@@ -6,6 +6,9 @@ on triggers or on demand.
 """
 
 import logging
+import asyncio
+import json
+import uuid
 from datetime import datetime, timezone
 
 from luna_sdk import LunaPlugin, PluginContext, PluginManifest, SidebarSection, SkillDef
@@ -734,7 +737,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.57.8",
+        version="0.57.9",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -843,6 +846,8 @@ class PlaybooksPlugin(LunaPlugin):
         self._fix_proposals = None
         self._ctx = None
         self._unsub_publish_guard = None
+        self._unsub_publish_decisions = None
+        self._publish_wakes: set[asyncio.Task] = set()
 
     def _start_publish_guard(self, ctx: PluginContext) -> None:
         """plans/034: record the owner's decision on the last publish card
@@ -872,6 +877,98 @@ class PlaybooksPlugin(LunaPlugin):
                 logger.exception("playbooks: publish guard could not record a decision")
 
         self._unsub_publish_guard = subscribe("approval.decided", _on_decided)
+        self._unsub_publish_decisions = subscribe(
+            "approval.orphan_decided", self._on_publish_decision,
+        )
+
+    async def _on_publish_decision(self, event: object, *_a, **_kw) -> None:
+        """Commit an approved publish with the ordinary gated tool handler.
+
+        The orphan event follows the engine's exact-payload pre-grant. A
+        candidate can become live only if the remembered card and candidate
+        still match; a model wake is never treated as the publish effect.
+        """
+        if not isinstance(event, dict) or event.get("kind") != "playbook_change":
+            return
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("action") != "publish":
+            return
+        name, version = payload.get("name"), payload.get("version")
+        approval_id = event.get("id")
+        if (not isinstance(name, str) or not name or type(version) is not int
+                or version < 1 or not isinstance(approval_id, str)):
+            return
+
+        from sqlalchemy import select
+        from .models import Playbook
+
+        async with self._session_factory() as session:
+            row = (await session.execute(
+                select(Playbook).where(Playbook.name == name)
+            )).scalar_one_or_none()
+            if row is None or (
+                row.last_card_approval_id != approval_id
+                or row.last_card_action != "publish"
+                or row.last_card_version != version
+                or row.last_card_decision != event.get("decision")
+                or row.candidate_version != version
+            ):
+                return
+
+        decision = event.get("decision")
+        if decision == "approved":
+            try:
+                registered = self._ctx.tool_registry.get("playbook_publish")
+                result = json.loads(await registered.handler(
+                    name=name,
+                    explanation=(
+                        "Owner approved the exact candidate publish card; "
+                        "commit it after all gates and verify the stored version."
+                    ),
+                ))
+            except Exception as exc:  # noqa: BLE001 — decision remains auditable
+                logger.exception("playbooks: approved publish commit failed")
+                result = {"error": f"Publish commit failed: {type(exc).__name__}"}
+        elif decision == "rejected":
+            result = {"error": "The owner rejected publication; candidate remains unpublished."}
+        else:
+            return
+
+        verified = (
+            result.get("published") is True
+            and result.get("verified") is True
+            and result.get("live_version") == version
+        )
+        if verified:
+            message = (
+                f"The owner approved '{name}' version {version}. The normal "
+                f"publish gate committed it and a fresh store read-back verified "
+                f"live_version={version}. Continue the mission from this "
+                "verified state; do not publish it again."
+            )
+        else:
+            message = (
+                f"The owner decision for '{name}' version {version} was "
+                f"'{decision}', but it is NOT verified live. "
+                f"Publish result: {json.dumps(result, default=str)}. "
+                "Report the actual stored state; do not claim publication."
+            )
+        send = getattr(self._ctx, "send_muted_message", None)
+        conv = event.get("conversation_id")
+        if not callable(send) or not conv:
+            return
+        try:
+            conv_id = uuid.UUID(str(conv))
+        except ValueError:
+            return
+        task = asyncio.create_task(send(
+            "Playbook publish decision", message,
+            channel="moment", respond=True, conversation_id=conv_id,
+            source="playbooks", tools="all", max_turns=12,
+            token_budget=200_000, timeout_s=900,
+        ), name="playbook-publish-decision-wake")
+        self._publish_wakes.add(task)
+        task.add_done_callback(self._publish_wakes.discard)
 
     async def on_load(self, ctx: PluginContext) -> None:
         self._ctx = ctx
@@ -1318,6 +1415,15 @@ class PlaybooksPlugin(LunaPlugin):
             except Exception:  # noqa: BLE001
                 pass
             self._unsub_publish_guard = None
+        if self._unsub_publish_decisions is not None:
+            try:
+                self._unsub_publish_decisions()
+            except Exception:  # noqa: BLE001
+                pass
+            self._unsub_publish_decisions = None
+        for task in self._publish_wakes:
+            task.cancel()
+        self._publish_wakes.clear()
         if self._trigger_service:
             await self._trigger_service.stop()
         if self._fix_proposals:

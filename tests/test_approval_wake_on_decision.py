@@ -3,7 +3,7 @@
 With `request_nowait` on the engine (luna plans/103), the publish handler
 raises the card WITHOUT parking: a pending decision returns an
 awaiting_owner_approval JSON telling the agent it will be WOKEN, and nothing
-flips live. Inline short-circuits (grant hit) and rejections behave exactly
+flips live until the plugin commits an approved decision. Inline short-circuits (grant hit) and rejections behave exactly
 as before, and engines without `request_nowait` (old cores) keep the parked
 `request()` contract.
 """
@@ -246,7 +246,7 @@ async def test_forced_read_back_mismatch_is_not_a_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_awaiting_hint_is_honest_about_the_reissue():
+async def test_awaiting_hint_is_honest_about_plugin_commit():
     approvals = _NowaitApprovals(decision="pending")
     engine, sf, tools = await _env(_Ctx(approvals))
     try:
@@ -254,10 +254,9 @@ async def test_awaiting_hint_is_honest_about_the_reissue():
         out = json.loads(await tools["playbook_publish"](name="greeter"))
 
         hint = out["hint"]
-        assert "WOKEN" in hint and "do NOT retry" in hint
-        assert "pre-approved and will execute" not in hint  # the old promise
-        assert "executes only if the owner's approval matched" in hint
-        assert "approval_flow_broken" in hint
+        assert "WOKEN" in hint and "Do NOT retry" in hint
+        assert "Playbooks service will commit" in hint
+        assert "approval alone" in hint
         assert "verified=true" in hint
     finally:
         await engine.dispose()

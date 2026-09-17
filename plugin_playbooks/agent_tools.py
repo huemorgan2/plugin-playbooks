@@ -3491,9 +3491,21 @@ def build_tools(
         def _awaiting(approval_id: str) -> str:
             # plans/030: nothing published yet — the owner has the card. Do
             # NOT phrase this as a failure the agent should work around.
-            # plans/034: the hint is honest about the re-issue — it executes
-            # only when the pre-approval matched; a second "awaiting" or the
-            # loop-guard error is a platform fault, not a cue to retry.
+            # plans/042: publish decisions are committed by the plugin from
+            # the exact owner card after the pre-grant is stored. Rollback
+            # retains the older generic continuation contract.
+            hint = (
+                "You will be WOKEN automatically after the owner decides. "
+                "The Playbooks service will commit an approved publish through "
+                "the normal gates and verify the stored live version. Do NOT "
+                "retry or claim it is live from the approval alone; wait for "
+                "the verified=true completion notice."
+                if action == "publish" else
+                "You will be WOKEN automatically when the owner decides — "
+                "do NOT retry this call or poll now. If woken with an "
+                "approval, re-issue this exact call ONCE; report only a "
+                "verified=true publish result."
+            )
             return json.dumps({
                 "status": "awaiting_owner_approval",
                 "error": (
@@ -3501,19 +3513,7 @@ def build_tools(
                     f"{target_version} is awaiting the owner's approval."
                 ),
                 "approval_id": approval_id,
-                "hint": (
-                    "You will be WOKEN automatically when the owner decides "
-                    "— do NOT retry this call and do NOT poll for the "
-                    "decision. Finish anything else you were doing, tell "
-                    "the owner the change awaits their approval, and end "
-                    "your turn. If woken with an approval, re-issue this "
-                    "exact call ONCE — it executes only if the owner's "
-                    "approval matched it. If that re-issue answers "
-                    "'awaiting' again or 'approval_flow_broken', the "
-                    "platform is at fault: do not retry, tell the owner, "
-                    "and end your turn. Never say a version is live until "
-                    "a publish result says verified=true for it."
-                ),
+                "hint": hint,
             })
 
         # plans/034: loop guard — look at the card we already raised for this
@@ -3538,10 +3538,10 @@ def build_tools(
         # plans/030: wake-on-decision. On cores with request_nowait (luna
         # plans/103) the card is raised WITHOUT parking this handler under the
         # ToolDef timeout — the tool returns "awaiting the owner" and the
-        # engine's orphan-resume wake continues the conversation when the
-        # owner decides (the re-issued publish auto-approves against the
-        # short-TTL pre-grant). The wake targets the conversation this turn
-        # runs in; ops is the headless fallback. Old cores keep the parked
+        # Playbooks' decision handler commits the publish against the exact
+        # short-TTL pre-grant, then wakes the conversation with verified
+        # state. The wake targets the conversation this turn runs in; ops is
+        # the headless fallback. Old cores keep the parked
         # request() contract (hence timeout_seconds=900 stays on the tools).
         wake_conv = (
             getattr(ctx, "current_conversation_id", None)
