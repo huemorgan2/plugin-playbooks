@@ -702,9 +702,10 @@ Two requests that are NOT authoring:
 
 ## Phrasing the task
 
-Write the task like a work order: goal + constraints + acceptance. Name the
-playbook for edit/fix jobs. Include what the owner told you (desired
-behavior, examples, the failing run's symptom). Good:
+Write the task like a work order: goal + exact paths + constraints +
+acceptance. Name the playbook for edit/fix jobs. Copy the owner's workspace
+and file paths, examples, and desired final action; never reduce paths to
+"input" or "output". Good:
 "Fix the phone format in candidate-intake: numbers must normalize to
 E.164; publish when the candidate run is green."
 Spell collection jobs as loops — "for each unread email ..." — so the
@@ -712,9 +713,9 @@ delegate builds a loop.
 
 ## After calling
 
-A live progress card appears in the chat. `running` means NOT done —
-nothing is created or published yet. Reply with ONE sentence naming the
-playbook and the change underway, then END YOUR TURN.
+A progress card appears. `running` means NOT done — nothing is created
+or published yet. Name the playbook and change in ONE sentence, then
+END YOUR TURN.
 BAD: "Playbook crm-import created and published — ready to use." (false —
 status was still running)
 GOOD: "The crm-import build is underway — the card tracks it; I'll
@@ -733,7 +734,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.57.1",
+        version="0.57.7",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,

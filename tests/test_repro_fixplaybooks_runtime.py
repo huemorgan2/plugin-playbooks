@@ -1,17 +1,14 @@
-"""RED reproduction — fix-playbooks stage 1, runtime durability holes
-(luna-fixer plans/2026-09-06-fix-playbooks §1).
+"""Legacy-v1 runtime safety regressions.
 
-Four v1 runner facts these tests pin as DEFECTS (assertions state the
-desired v2 behavior, so every test FAILS on current code):
+Four baseline defects from fix-playbooks stage 1 were pinned here. Plan 035
+bounded the tool-step timeout. Plan 036 makes the other three fail closed:
 
-1. No resume: a restart turns every in-flight run into "failed"
-   (sweep_orphaned_runs, runner.py:317-372).
-2. wait_for_approval AUTO-APPROVES (runner.py:1060-1069) — the gate the
-   language promises does not exist.
-3. wait_for_event returns a stub immediately (runner.py:1071-1083) — the
-   wait the language promises does not exist.
-4. step.timeout on tool_call steps is never enforced (runner.py:868-878
-   awaits the handler bare; only code steps pass a timeout down).
+1. A restarted in-flight legacy effect has an unknown outcome, not a
+   proven failure; it must never be replayed without reconciliation.
+2. A legacy approval wait must never auto-approve.
+3. A legacy event wait must never claim a missing event was received.
+4. step.timeout on tool_call steps was not enforced; plan 035 bounds it
+   without blindly replaying an uncertain effect.
 """
 
 from __future__ import annotations
@@ -95,11 +92,8 @@ async def _run_row(sf, run_id) -> PlaybookRun:
         return await s.get(PlaybookRun, run_id)
 
 
-async def test_interrupted_run_survives_restart_instead_of_failing(env):
-    """DESIRED (v2 segmented replay): a run in flight when the process dies
-    is resumed by the next process, not stamped failed. CURRENT: the new
-    process's sweep_orphaned_runs marks it failed ('interrupted — the server
-    restarted...') and the work is lost."""
+async def test_interrupted_legacy_effect_is_unknown_without_replay(env):
+    """An in-flight legacy tool has no journal; its outcome needs inspection."""
     sf, tools, runner1, calls, gate = env
     pb = await _save(sf, _playbook("long-job", [
         {"id": "s1", "kind": "tool_call", "tool": "slow", "args": {}},
@@ -115,60 +109,75 @@ async def test_interrupted_run_survives_restart_instead_of_failing(env):
     await runner2.sweep_orphaned_runs()
 
     row = await _run_row(sf, run.id)
-    assert row.status != "failed", (
-        "restart killed the run: sweep_orphaned_runs stamped it 'failed' "
-        "('interrupted — the server restarted...') — v1 has no resume; the "
-        "run must survive a restart and continue"
-    )
+    assert row.status == "timed_out_unknown"
+    assert row.error_type == "OutcomeUnknown"
+    assert "s1" in (row.error or "")
+    assert calls == ["slow-started"]  # no replay and no downstream step
 
 
-async def test_wait_for_approval_actually_gates(env):
-    """DESIRED: a wait_for_approval step parks the run until a real decision
-    arrives; downstream steps must not execute unapproved. CURRENT: the
-    runner auto-approves ({'approved': True, 'auto': True}) and sails on."""
+async def test_legacy_approval_wait_fails_closed_before_any_effect(env):
+    """Old definitions must migrate; a fake approval is never a success."""
     sf, tools, runner, calls, gate = env
     pb = await _save(sf, _playbook("gated", [
+        {"id": "before", "kind": "tool_call", "tool": "fast", "args": {}},
         {"id": "gate", "kind": "wait_for_approval", "show": ["summary"]},
         {"id": "after", "kind": "tool_call", "tool": "fast", "args": {}},
     ]))
     run = await runner.start_run_background(pb, inputs={})
     row = await runner.wait_for_run(run.id, timeout=2)
 
-    assert "fast" not in calls, (
-        "the step AFTER wait_for_approval executed with no approval decision "
-        "— the gate auto-approved"
-    )
-    assert row.status != "done", (
-        "run completed straight through a wait_for_approval with nobody "
-        "approving anything"
-    )
+    assert calls == []
+    assert row.status == "failed"
+    assert row.error_type == "LegacyWaitUnsupported"
+    assert "migrate" in (row.error or "").lower()
 
 
-async def test_wait_for_event_actually_waits(env):
-    """DESIRED: wait_for_event parks until a matching bus event (or its
-    timeout). CURRENT: it returns {'received': False, 'stub': True}
-    immediately — no event was ever emitted, yet the run completes."""
+async def test_legacy_event_wait_fails_closed_before_any_effect(env):
+    """Old definitions must migrate; a stub event is never a success."""
     sf, tools, runner, calls, gate = env
     pb = await _save(sf, _playbook("event-waiter", [
+        {"id": "before", "kind": "tool_call", "tool": "fast", "args": {}},
         {"id": "w", "kind": "wait_for_event", "event": "email.received"},
         {"id": "after", "kind": "tool_call", "tool": "fast", "args": {}},
     ]))
     run = await runner.start_run_background(pb, inputs={})
     row = await runner.wait_for_run(run.id, timeout=2)
 
-    assert "fast" not in calls, (
-        "the step AFTER wait_for_event executed though 'email.received' was "
-        "never emitted — the wait is a stub"
-    )
-    assert row.status != "done", (
-        "run completed without the event it claims to wait for"
-    )
+    assert calls == []
+    assert row.status == "failed"
+    assert row.error_type == "LegacyWaitUnsupported"
+    assert "migrate" in (row.error or "").lower()
+
+
+@pytest.mark.parametrize("nested", [
+    {"id": "branch", "kind": "condition", "when": "true", "then": [
+        {"id": "gate", "kind": "wait_for_approval"},
+    ]},
+    {"id": "batch", "kind": "parallel", "branches": [[
+        {"id": "event", "kind": "wait_for_event", "event": "order.paid"},
+    ]]},
+    {"id": "items", "kind": "loop", "over": [], "body": [
+        {"id": "event", "kind": "wait_for_event", "event": "order.paid"},
+    ]},
+])
+async def test_nested_legacy_wait_is_rejected_before_any_effect(env, nested):
+    sf, tools, runner, calls, gate = env
+    pb = await _save(sf, _playbook("nested-wait", [
+        {"id": "before", "kind": "tool_call", "tool": "fast", "args": {}},
+        nested,
+    ]))
+    run = await runner.start_run_background(pb, inputs={})
+    row = await runner.wait_for_run(run.id, timeout=2)
+
+    assert row.status == "failed"
+    assert row.error_type == "LegacyWaitUnsupported"
+    assert calls == []
 
 
 async def test_tool_step_timeout_is_enforced(env):
     """DESIRED: step.timeout bounds a tool_call step (fail loud at T).
-    CURRENT: the runner awaits the handler bare — timeout is honored only
-    for code steps, so a hung tool hangs the run forever."""
+    BASELINE: the runner awaited the handler bare. Plan 035 enforces the
+    bound and records the uncertain effect."""
     sf, tools, runner, calls, gate = env
     pb = await _save(sf, _playbook("bounded", [
         {"id": "s1", "kind": "tool_call", "tool": "slow", "args": {},
@@ -177,13 +186,95 @@ async def test_tool_step_timeout_is_enforced(env):
     run = await runner.start_run_background(pb, inputs={})
     row = await runner.wait_for_run(run.id, timeout=2.5)
 
-    assert row.status == "failed", (
+    assert row.status == "timed_out_unknown", (
         f"step declared timeout=1s but the run is still '{row.status}' after "
         "2.5s — tool_call timeouts are not enforced"
     )
+    assert row.error_type == "OutcomeUnknown"
     async with sf() as s:
         step = (await s.execute(
             select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
         )).scalars().first()
     assert "timeout" in (step.error or "").lower() or "timed out" in (
         step.error or "").lower()
+
+
+async def test_timed_out_tool_does_not_replay_an_uncertain_effect(env):
+    """A timed-out external write may have committed before cancellation."""
+    sf, tools, runner, calls, gate = env
+    pb = await _save(sf, _playbook("bounded-retry", [
+        {"id": "s1", "kind": "tool_call", "tool": "slow", "args": {},
+         "timeout": 1, "retry": {"max": 2, "backoff_seconds": 0}},
+    ]))
+    run = await runner.start_run_background(pb, inputs={})
+    row = await runner.wait_for_run(run.id, timeout=2.5)
+
+    assert row.status == "timed_out_unknown"
+    assert row.error_type == "OutcomeUnknown"
+    assert calls.count("slow-started") == 1
+    assert "effect may have committed" in (row.error or "").lower()
+
+
+async def test_timed_out_tool_ignores_continue_and_stops_downstream_effect(env):
+    """Unknown external outcome cannot be handled as a deterministic error."""
+    sf, tools, runner, calls, gate = env
+    pb = await _save(sf, _playbook("bounded-continue", [
+        {"id": "uncertain", "kind": "tool_call", "tool": "slow", "args": {},
+         "timeout": 1, "retry": {"max": 2, "backoff_seconds": 0},
+         "on_error": "continue"},
+        {"id": "after", "kind": "tool_call", "tool": "fast", "args": {}},
+    ]))
+    run = await runner.start_run_background(pb, inputs={})
+    row = await runner.wait_for_run(run.id, timeout=2.5)
+
+    assert row.status == "timed_out_unknown"
+    assert row.error_type == "OutcomeUnknown"
+    assert calls == ["slow-started"]
+    async with sf() as s:
+        steps = (await s.execute(
+            select(PlaybookStepRun).where(PlaybookStepRun.run_id == run.id)
+        )).scalars().all()
+    assert [(step.step_id, step.status) for step in steps] == [
+        ("uncertain", "timed_out_unknown")
+    ]
+
+
+@pytest.mark.parametrize("container", [
+    {"id": "branch", "kind": "condition", "when": "true", "on_error": "continue",
+     "then": [{"id": "uncertain", "kind": "tool_call", "tool": "slow",
+               "args": {}, "timeout": 1}]},
+    {"id": "parallel", "kind": "parallel", "on_error": "continue",
+     "branches": [[{"id": "uncertain", "kind": "tool_call", "tool": "slow",
+                    "args": {}, "timeout": 1}]]},
+])
+async def test_nested_timeout_stops_outer_flow(env, container):
+    sf, tools, runner, calls, gate = env
+    pb = await _save(sf, _playbook("nested-timeout", [
+        container,
+        {"id": "after", "kind": "tool_call", "tool": "fast", "args": {}},
+    ]))
+    run = await runner.start_run_background(pb, inputs={})
+    row = await runner.wait_for_run(run.id, timeout=2.5)
+
+    assert row.status == "timed_out_unknown"
+    assert row.error_type == "OutcomeUnknown"
+    assert calls == ["slow-started"]
+
+
+async def test_uncertain_subtask_stops_parent_before_next_effect(env):
+    sf, tools, runner, calls, gate = env
+    await _save(sf, _playbook("child-timeout", [
+        {"id": "uncertain", "kind": "tool_call", "tool": "slow", "args": {},
+         "timeout": 1},
+    ]))
+    parent = await _save(sf, _playbook("parent-after-timeout", [
+        {"id": "child", "kind": "subtask", "playbook": "child-timeout",
+         "on_error": "continue"},
+        {"id": "after", "kind": "tool_call", "tool": "fast", "args": {}},
+    ]))
+    run = await runner.start_run_background(parent, inputs={})
+    row = await runner.wait_for_run(run.id, timeout=2.5)
+
+    assert row.status == "timed_out_unknown"
+    assert row.error_type == "OutcomeUnknown"
+    assert calls == ["slow-started"]

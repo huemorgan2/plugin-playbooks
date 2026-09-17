@@ -123,8 +123,10 @@ class _Ctx(_LifecycleCtx):
 
 
 @pytest.fixture
-async def db():
-    engine = create_async_engine("sqlite+aiosqlite://")
+async def db(tmp_path):
+    # Park/restart tests deliberately replace connections. A file-backed DB
+    # keeps the schema visible if cancellation invalidates the first one.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'parked.sqlite'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     sf = async_sessionmaker(engine, expire_on_commit=False)

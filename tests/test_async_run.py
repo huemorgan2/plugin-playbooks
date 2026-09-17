@@ -199,7 +199,7 @@ async def test_wait_for_run_unknown_id_returns_none(env):
     assert await runner.wait_for_run(uuid.uuid4(), timeout=0.01) is None
 
 
-async def test_sweep_marks_orphaned_runs_failed_but_spares_live_ones(env):
+async def test_sweep_marks_inflight_orphan_unknown_but_spares_live_ones(env):
     sf, runner, calls, gate = env
     pb = await _save(sf, _playbook("swept-pb", [
         {"id": "s1", "kind": "tool_call", "tool": "slow", "args": {}},
@@ -225,14 +225,15 @@ async def test_sweep_marks_orphaned_runs_failed_but_spares_live_ones(env):
     assert await runner.sweep_orphaned_runs() == 1
 
     swept = await _run_row(sf, orphan.id)
-    assert swept.status == "failed"
+    assert swept.status == "timed_out_unknown"
+    assert swept.error_type == "OutcomeUnknown"
     assert swept.completed_at is not None
     async with sf() as s:
         step = (await s.execute(
             select(PlaybookStepRun).where(PlaybookStepRun.run_id == orphan.id)
         )).scalars().one()
-    assert step.status == "failed"
-    assert "interrupted" in step.error
+    assert step.status == "timed_out_unknown"
+    assert "Outcome unknown" in step.error
 
     assert (await _run_row(sf, live.id)).status == "running"
     gate.set()

@@ -256,6 +256,14 @@ class InputTypeError(ValueError):
         super().__init__(f"input {input!r} expects {expected}, got {got!r}")
 
 
+class ToolStepTimeout(RuntimeError):
+    """A tool may have committed an effect before its response timed out."""
+
+
+class LegacyWaitUnsupported(RuntimeError):
+    """Legacy pblang has no durable owner/event wait implementation."""
+
+
 def _coerce_inputs(playbook: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     """plans/022 P5b: coerce run inputs through the playbook's declared
     input schema BEFORE the run starts — stored inputs and runtime inputs
@@ -315,6 +323,20 @@ def _is_python_playbook(playbook: Any) -> bool:
     if fmt == "pblang" and (playbook.definition or {}).get("steps"):
         return False
     return sniff_format(getattr(playbook, "code", None) or "") == "python"
+
+
+def _legacy_wait_step(steps: list[StepDef]) -> StepDef | None:
+    """Find an unsafe legacy wait anywhere before executing any effect."""
+    for step in steps:
+        if step.kind in (StepKind.WAIT_FOR_APPROVAL, StepKind.WAIT_FOR_EVENT):
+            return step
+        for children in (step.then, step.else_, step.body):
+            if children and (found := _legacy_wait_step(children)):
+                return found
+        for branch in step.branches or []:
+            if found := _legacy_wait_step(branch):
+                return found
+    return None
 
 
 class PlaybookRunner:
@@ -565,7 +587,7 @@ class PlaybookRunner:
         )
         now = datetime.now(timezone.utc)
         swept = 0
-        owed_wakes: list[Any] = []
+        owed_wakes: list[tuple[Any, str, str, str]] = []
         async with self._sf() as session:
             runs = (await session.execute(
                 select(PlaybookRun).where(PlaybookRun.status == "running")
@@ -579,23 +601,34 @@ class PlaybookRunner:
             for run in runs:
                 if run.id in self._tasks or run.id in journaled:
                     continue
-                run.status = "failed"
-                run.completed_at = now
-                # plans/032 phase 02: the row says WHY (docs/v2.md §7).
-                run.error = note
-                run.error_type = "Interrupted"
-                run.failed_at = now
-                if getattr(run, "wake_on_complete", False):
-                    owed_wakes.append(run.id)
                 steps = (await session.execute(
                     select(PlaybookStepRun).where(
                         PlaybookStepRun.run_id == run.id,
                         PlaybookStepRun.status == "running",
                     )
                 )).scalars().all()
+                # An in-flight legacy step may already have caused an external
+                # effect. Its outcome cannot be reconstructed without the v2
+                # journal; never label it a definite failure or replay it.
+                unknown = bool(steps)
+                status = "timed_out_unknown" if unknown else "failed"
+                error_type = "OutcomeUnknown" if unknown else "Interrupted"
+                error = (
+                    "Outcome unknown — server restarted while legacy step(s) "
+                    + ", ".join(sorted({step.step_id for step in steps}))
+                    + " were in flight; inspect external state before retrying"
+                    if unknown else note
+                )
+                run.status = status
+                run.completed_at = now
+                run.error = error
+                run.error_type = error_type
+                run.failed_at = now
+                if getattr(run, "wake_on_complete", False):
+                    owed_wakes.append((run.id, status, error, error_type))
                 for step in steps:
-                    step.status = "failed"
-                    step.error = step.error or note
+                    step.status = status
+                    step.error = step.error or error
                     step.completed_at = step.completed_at or now
                 swept += 1
             if swept:
@@ -603,9 +636,12 @@ class PlaybookRunner:
         # plans/028: deliver the owed completion event (which the wake
         # service turns into a failure moment) via the normal path — it
         # re-stamps the same terminal status, so this is idempotent.
-        for run_id in owed_wakes:
+        for run_id, status, error, error_type in owed_wakes:
             try:
-                await self._complete_run(run_id, "failed", error=note)
+                await self._complete_run(
+                    run_id, status, error=error, error_type=error_type,
+                    failed_at=now,
+                )
             except Exception:  # noqa: BLE001 — sweep must never block load
                 log.exception("playbook.runs.sweep_wake_failed run=%s", run_id)
         if swept:
@@ -909,6 +945,12 @@ class PlaybookRunner:
                     f"Playbook '{playbook.name}' has no steps — nothing to execute. "
                     "Add steps before running."
                 )
+            if unsafe_wait := _legacy_wait_step(definition.steps):
+                raise LegacyWaitUnsupported(
+                    f"Legacy pblang step '{unsafe_wait.id}' uses "
+                    f"{unsafe_wait.kind.value}, which has no durable wait gate. "
+                    "Migrate this playbook to the Python runtime before running it."
+                )
             with _playbook_origin_scope(playbook):
                 await self._execute_steps(definition.steps, context)
             await self._complete_run(run.id, "done")
@@ -921,6 +963,17 @@ class PlaybookRunner:
                 traceback=e.traceback, failed_at=e.failed_at,
             )
             run.status = "failed"
+        except LegacyWaitUnsupported as e:
+            await self._complete_run(
+                run.id, "failed", error=str(e), error_type="LegacyWaitUnsupported",
+            )
+            run.status = "failed"
+        except ToolStepTimeout as e:
+            await self._complete_run(
+                run.id, "timed_out_unknown", error=str(e),
+                error_type="OutcomeUnknown", failed_at=datetime.now(timezone.utc),
+            )
+            run.status = "timed_out_unknown"
         except _PlaybookHalt as h:
             # 007.009.01: an explicit `halt` step ended the run early — success.
             log.info("playbook.run.halted run_id=%s reason=%s", run.id, h.reason)
@@ -1129,6 +1182,24 @@ class PlaybookRunner:
                 attempt += 1
                 await self._update_step_retry(step_run.id, attempt)
 
+                if isinstance(e, ToolStepTimeout):
+                    # A cancelled call may already have committed. Neither
+                    # retry nor on_error:continue may cross this boundary.
+                    await self._complete_step(
+                        step_run.id, "timed_out_unknown", error=str(e),
+                    )
+                    try:
+                        await self._events.emit("playbook.step.failed", {
+                            "run_id": str(ctx.run_id),
+                            "step_id": step.id,
+                            "error": str(e),
+                            "error_type": "OutcomeUnknown",
+                            "retry_count": attempt,
+                        })
+                    except Exception:  # noqa: BLE001 -- preserve unknown outcome
+                        log.exception("playbook.step.unknown_event_failed step=%s", step.id)
+                    raise
+
                 if attempt <= max_retries:
                     backoff = step.retry.backoff_seconds * (2 ** (attempt - 1))
                     log.info("playbook.step.retry step=%s attempt=%s backoff=%s", step.id, attempt, backoff)
@@ -1283,7 +1354,18 @@ class PlaybookRunner:
                 "that does not exist."
             ) from None
         call_args = await self._resolve_vault_refs(args, step_id=step.id)
-        result = await rt.handler(**call_args)
+        if step.timeout is None:
+            result = await rt.handler(**call_args)
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    rt.handler(**call_args), timeout=step.timeout,
+                )
+            except TimeoutError as exc:
+                raise ToolStepTimeout(
+                    f"Step '{step.id}' tool call timed out after {step.timeout}s; "
+                    "the effect may have committed. Inspect its state before retrying."
+                ) from exc
         return {"tool": step.tool, "result": _normalize_tool_result(result)}
 
     async def _run_code(self, step: StepDef, ctx: _RunContext) -> Any:
@@ -1461,35 +1543,30 @@ class PlaybookRunner:
 
         tasks = [_run_branch(b) for b in step.branches]
         branch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Ordinary branch errors retain the historical per-branch result.
+        # An uncertain external effect is a run-wide stop condition: it must
+        # not be converted into a harmless-looking parallel result.
+        for result in branch_results:
+            if isinstance(result, ToolStepTimeout):
+                raise result
         return {"branches": [
             r if not isinstance(r, Exception) else {"error": str(r)}
             for r in branch_results
         ]}
 
     async def _run_wait_for_approval(self, step: StepDef, ctx: _RunContext) -> Any:
-        """Pause and wait for owner approval."""
-        await self._events.emit("playbook.step.waiting", {
-            "run_id": str(ctx.run_id),
-            "step_id": step.id,
-            "reason": "approval",
-        })
-        # For v1: auto-approve after emitting the event.
-        # Full approval integration comes when plugin_approvals is wired.
-        return {"approved": True, "auto": True}
+        """Refuse a legacy approval wait if direct step dispatch bypassed preflight."""
+        raise LegacyWaitUnsupported(
+            f"Legacy pblang step '{step.id}' has no durable approval gate; "
+            "migrate this playbook to the Python runtime."
+        )
 
     async def _run_wait_for_event(self, step: StepDef, ctx: _RunContext) -> Any:
-        """Wait for a matching bus event."""
-        if not step.event:
-            raise ValueError(f"Step '{step.id}': wait_for_event requires 'event' field")
-
-        await self._events.emit("playbook.step.waiting", {
-            "run_id": str(ctx.run_id),
-            "step_id": step.id,
-            "reason": "event",
-        })
-        # For v1: return immediately with a stub.
-        # Full event waiting needs a future/queue pattern on the bus.
-        return {"event": step.event, "received": False, "stub": True}
+        """Refuse a legacy event wait if direct step dispatch bypassed preflight."""
+        raise LegacyWaitUnsupported(
+            f"Legacy pblang step '{step.id}' has no durable event wait; "
+            "migrate this playbook to the Python runtime."
+        )
 
     async def _run_subtask(self, step: StepDef, ctx: _RunContext) -> Any:
         """Invoke another playbook as a subtask."""
@@ -1526,6 +1603,11 @@ class PlaybookRunner:
             parent_run_id=ctx.run_id,
             is_test=ctx.is_test,
         )
+        if sub_run.status == "timed_out_unknown":
+            raise ToolStepTimeout(
+                f"Subtask '{step.playbook}' run {sub_run.id} has an unknown "
+                "external outcome; inspect its state before retrying the parent."
+            )
         out = {"subtask_run_id": str(sub_run.id), "status": sub_run.status}
         # 007.009.01: surface sub-workflow outputs to the parent so it can read
         # steps.<subtask_id>.<key>.

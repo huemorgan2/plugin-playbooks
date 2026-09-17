@@ -11,6 +11,7 @@ failed) lands on the row.
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -179,6 +180,37 @@ async def test_fast_path_returns_done_inline(env):
     assert row.card_token  # phase-2 capability token minted at creation
 
 
+async def test_delegate_receives_exact_owner_workspace_when_work_order_omits_it(env):
+    agent = FakeAgent(result="Candidate stopped: input location unresolved.")
+    ctx = FakeCtx(agent)
+
+    class Reader:
+        async def messages(self, conversation_ids, *, roles, order, limit):
+            assert conversation_ids == [ctx.current_conversation_id]
+            assert roles == ("user",)
+            assert order == "desc"
+            return [SimpleNamespace(content=(
+                "Own the reconciliation in dojo-long/example-42. Read input/batch-01.json, "
+                "write output/batch-01.json, and do not publish or contact anyone."
+            ))]
+
+    ctx.conversations = Reader()
+    _, run = _tools(ctx, env)["playbook_agent"]
+    out = json.loads(await run(
+        task="Build a reusable reconciliation playbook for the invoice batches.",
+        wait_seconds=10,
+    ))
+
+    assert out["status"] == "done"
+    prompt = agent.calls[0]["prompt"]
+    assert "dojo-long/example-42" in prompt
+    assert "input/batch-01.json" in prompt
+    assert "do not publish or contact anyone" in prompt
+    assert "A done run proves execution, not business correctness" in prompt
+    assert "compare its identifiers and field shape" in prompt
+    assert "dojo-long/example-42" not in json.dumps(out)
+
+
 async def test_slow_path_returns_running_then_status_polls_done(env):
     gate = asyncio.Event()
     agent = FakeAgent(result="done late", gate=gate)
@@ -268,6 +300,23 @@ async def test_toolset_includes_referenced_tools_of_target_playbook(env):
     assert out["status"] == "done"
     assert "INTENT: intake candidates" in agent.calls[0]["prompt"]
     assert "gmail_search" in agent.calls[0]["tools"]
+
+
+async def test_new_delegate_can_inspect_persisted_candidate_files(env):
+    # A newly proposed playbook does not exist when the delegate toolset is
+    # frozen. Its author must still be able to read outputs written by a
+    # candidate run; otherwise a valid file_read attempt loops through the
+    # model's tool retries and aborts the entire delegation.
+    tools = await delegate_toolset(env, "", AUTHORING)
+    assert "file_read" in tools
+    assert "file_list" in tools
+    assert "file_write" not in tools
+    assert "send_chat_message" not in tools
+    agent = FakeAgent()
+    _, run = _tools(FakeCtx(agent), env)["playbook_agent"]
+    out = json.loads(await run(task="build and verify a new playbook", wait_seconds=10))
+    assert out["status"] == "done"
+    assert "file_read" in agent.calls[0]["tools"]
 
 
 async def test_unknown_playbook_is_a_clean_error(env):

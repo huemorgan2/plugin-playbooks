@@ -1,0 +1,7 @@
+# Execution summary — legacy wait and orphan safety
+
+On 2026-09-16 the optional Playbooks candidate was raised to 0.57.3. Legacy pblang approval/event waits now fail before the first step, including when nested, with a typed migration message; they no longer auto-approve or return an event stub. An orphaned legacy run with an in-flight step now records `timed_out_unknown` / `OutcomeUnknown`, identifies the step, and does not replay it. Orphans without an in-flight step retain the failed/interrupted status. The v2 Python playbook wait path was left intact.
+
+The focused safety reproductions passed (9 tests). The complete Playbooks suite passed **765 tests**, five warnings, in 72.44 s: `research/agent harness check/evidence/fix-20260916/playbooks-followup-full-20260916.log`. The prior full candidate run had 764 passes and one stale expectation that an uncertain in-flight effect was a definite failure; that expectation was updated to assert the new truthful status. The final fixed candidate loaded 0.57.3 and dojoP's component contracts passed 44/44 offline and 13/13 on isolated PostgreSQL. These contracts do not exercise a live model or a real v1 wait migration.
+
+Stored legacy definitions that require approval or event parking must be migrated to the Python runtime before they can run. Automatic resume of arbitrary legacy effects remains unsupported because v1 has no durable step journal.

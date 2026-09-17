@@ -195,7 +195,7 @@ async def delegate_toolset(
     card is the owner-facing surface, not delegate chatter."""
     tools = (
         list(authoring_tools)
-        + ["playbook_list", "playbook_status"]
+        + ["playbook_list", "playbook_status", "file_list", "file_read"]
     )
     if playbook_name:
         async with session_factory() as session:
@@ -211,6 +211,35 @@ async def delegate_toolset(
             seen.add(t)
             out.append(t)
     return out
+
+
+async def _owner_request_context(ctx: Any, conversation_id: Any) -> str | None:
+    """Carry exact owner paths/constraints across the background handoff.
+
+    The parent agent writes a concise work order, but can accidentally omit
+    the namespace of files it just read. The sanctioned conversation reader
+    provides the original request without broadening the delegate's tools.
+    """
+    if conversation_id is None:
+        return None
+    try:
+        reader = getattr(ctx, "conversations", None)
+        if reader is None:
+            return None
+        messages = await reader.messages(
+            [conversation_id], roles=("user",), order="desc", limit=1,
+        )
+    except Exception:  # noqa: BLE001 — an optional context read must not block delegation
+        log.warning("delegation.owner_context_unavailable", exc_info=True)
+        return None
+    if not messages:
+        return None
+    content = str(getattr(messages[0], "content", "") or "").strip()
+    if not content:
+        return None
+    if len(content) > 6000:
+        content = content[:5000] + "\n… [middle omitted] …\n" + content[-900:]
+    return content
 
 
 # plans/020 phase 2: the delegate prompt is a first-class artifact — the
@@ -244,11 +273,20 @@ def _prompt_format(pb: Playbook | None, format: str | None) -> str:
     return format or getattr(pb, "format", None) or "python"
 
 
-def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = None) -> str:
+def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = None,
+                     owner_request: str | None = None) -> str:
     fmt = _prompt_format(pb, format)
     python = fmt == "python"
 
     brief = ["## 2. Your brief", "", task.strip()]
+    if owner_request:
+        brief += [
+            "", "### Original owner request (reference)",
+            "Keep the exact workspace paths, scope, and acceptance constraints "
+            "from this request. The work order above summarizes the job; "
+            "if it omits a path or constraint, use the owner's wording below.",
+            "", owner_request,
+        ]
     if python:
         brief += ["", V2_PROMPT_MARKER + " — one python file with exactly one "
                   "`async def run(ctx, inputs)`; the rules are in section 5."]
@@ -303,6 +341,10 @@ def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = Non
             "your turn — never re-run, never poll it, never call "
             "playbook_set_autonomy to get past it (that change is "
             "permanent).",
+            "   A done run proves execution, not business correctness. Read "
+            "the real saved output and compare its identifiers and field "
+            "shape with the source inputs and owner's specification before "
+            "publishing; repair any mismatch.",
             "6. PUBLISH — run the checklist in section 9, then ship. A "
             "refusal naming a parked candidate run means the owner has a "
             "card: wait for their decision, never start a second "
@@ -936,7 +978,8 @@ def build_delegation_tools(ctx: Any, session_factory, authoring_tools: tuple[str
                 log.exception("delegation %s: card post failed", row.id)
 
         tools = await delegate_toolset(session_factory, playbook, authoring_tools)
-        prompt = _delegate_prompt(task, pb)
+        owner_request = await _owner_request_context(ctx, conversation_id)
+        prompt = _delegate_prompt(task, pb, owner_request=owner_request)
 
         task_obj = asyncio.create_task(_drive_delegation(
             ctx, session_factory, row.id, prompt, tools, conversation_id,
