@@ -42,7 +42,7 @@ def _aware(dt: datetime) -> datetime:
     # sqlite returns naive datetimes; stored values are UTC
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-from .models import FAILED_RUN_STATUSES, PlaybookStepRun, PlaybookWatch
+from .models import FAILED_RUN_STATUSES, Playbook, PlaybookStepRun, PlaybookWatch
 from .publish import ops_conversation_id
 
 log = logging.getLogger(__name__)
@@ -336,7 +336,7 @@ class RunCompletionWake:
                     "original request asked for."
                 )
         try:
-            await send(
+            outcome = await send(
                 f"Playbook finished: {name}",
                 "\n".join(lines),
                 channel="moment",
@@ -348,9 +348,60 @@ class RunCompletionWake:
                 token_budget=600_000 if payload.get("is_test") else _WAKE_TOKEN_BUDGET,
                 timeout_s=_WAKE_TIMEOUT_S,
             )
-            log.info("run_wake.moment run=%s status=%s", run_id, status)
+            if isinstance(outcome, dict) and (outcome.get("responded") or outcome.get("queued")):
+                log.info("run_wake.moment run=%s status=%s", run_id, status)
+                return
+            log.warning("run_wake.moment_unfinished run=%s status=%s outcome=%s",
+                        run_id, status, {k: outcome.get(k) for k in ("aborted", "error")}
+                        if isinstance(outcome, dict) else type(outcome).__name__)
+            if not payload.get("is_test") or status not in ("done", "succeeded", "completed", "success"):
+                return
+            if await self._candidate_is_live(payload):
+                return
+            # One bounded continuation. The first moment may have consumed its
+            # entire turn budget before it could verify/publish the candidate;
+            # never mistake that for a completed owner request.
+            retry = await send(
+                f"Publication still pending: {name}",
+                f"The prior reaction to candidate run {run_id} did not finish. "
+                f"The exact playbook '{name}' is still a candidate, not a verified live process. "
+                "Continue the original owner mission now: check the persisted outputs against "
+                "the owner's specification, then use the normal playbook_publish approval gate "
+                "for this exact name and version if they are correct. If they are wrong, repair "
+                "and retest. Do not repeat completed batch work or claim publication from an "
+                "approval card alone. Report any blocker honestly.",
+                channel="moment", respond=True, conversation_id=conv,
+                source="playbooks", tools="all", max_turns=20,
+                token_budget=300_000, timeout_s=600.0,
+            )
+            if isinstance(retry, dict) and (retry.get("responded") or retry.get("queued")):
+                log.info("run_wake.retry_delivered run=%s", run_id)
+                return
+            if await self._candidate_is_live(payload):
+                return
+            log.warning("run_wake.retry_unfinished run=%s outcome=%s", run_id,
+                        {k: retry.get(k) for k in ("aborted", "error")}
+                        if isinstance(retry, dict) else type(retry).__name__)
+            await send(
+                f"Process not live: {name}",
+                f"This reusable process is not live yet. Its test run {run_id} completed, "
+                "but Luna could not finish checking and publishing it. Review the saved "
+                "outputs and approve publication before relying on it to run again.",
+                channel="awareness", respond=False, conversation_id=conv,
+                source="playbooks",
+            )
         except Exception:  # noqa: BLE001
             log.exception("run_wake.moment_failed run=%s", run_id)
+
+    async def _candidate_is_live(self, payload: dict[str, Any]) -> bool:
+        try:
+            pb_id = uuid.UUID(str(payload["playbook_id"]))
+            version = int(payload["playbook_version"])
+            async with self._sf() as session:
+                pb = await session.get(Playbook, pb_id)
+            return bool(pb and pb.live_version is not None and pb.live_version >= version)
+        except (KeyError, TypeError, ValueError):
+            return False
 
     async def _awareness_note(self, send: Any, payload: dict[str, Any]) -> None:
         name = payload.get("playbook_name") or "?"

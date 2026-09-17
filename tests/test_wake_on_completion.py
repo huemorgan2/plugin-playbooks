@@ -11,7 +11,6 @@ import uuid
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from plugin_playbooks.agent_tools import build_tools
 from plugin_playbooks.models import Base, Playbook, PlaybookRun, PlaybookStepRun
@@ -37,10 +36,11 @@ class _Ctx:
 
     def __init__(self) -> None:
         self.sent: list[dict] = []
+        self.results: list[dict] = []
 
     async def send_muted_message(self, title, content, **kw):
         self.sent.append({"title": title, "content": content, **kw})
-        return {"responded": True}
+        return self.results.pop(0) if self.results else {"responded": True}
 
     async def ops_conversation_id(self):
         return OPS_ID
@@ -60,11 +60,12 @@ class _Tools:
 
 
 @pytest.fixture
-async def env():
-    # StaticPool: concurrent sessions (background run + the stamp write)
-    # must share ONE in-memory database, not get a fresh empty one each.
+async def env(tmp_path):
+    # File-backed SQLite gives background execution and the wake stamp
+    # separate connections. Sharing one StaticPool connection lets their
+    # overlapping transactions roll back each other's committed state.
     engine = create_async_engine(
-        "sqlite+aiosqlite://", poolclass=StaticPool,
+        f"sqlite+aiosqlite:///{tmp_path / 'runs.db'}", connect_args={"timeout": 30},
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -197,11 +198,9 @@ def _payload(**over):
 
 
 @pytest.fixture
-async def svc_env():
-    # StaticPool: concurrent sessions (background run + the stamp write)
-    # must share ONE in-memory database, not get a fresh empty one each.
+async def svc_env(tmp_path):
     engine = create_async_engine(
-        "sqlite+aiosqlite://", poolclass=StaticPool,
+        f"sqlite+aiosqlite:///{tmp_path / 'wakes.db'}", connect_args={"timeout": 30},
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -295,6 +294,49 @@ async def test_restarted_candidate_test_wakes_original_conversation(svc_env):
     assert "candidate test run resumed" in msg["content"]
     assert "Verify the persisted effects" in msg["content"]
     assert "publication gate" in msg["content"]
+
+
+async def test_aborted_candidate_wake_gets_one_bounded_followup(svc_env):
+    _, ctx, svc = svc_env
+    ctx.results = [{"responded": False, "aborted": "token_budget"},
+                   {"responded": True}]
+    await svc._on_completed(_payload(
+        is_test=True, trigger="agent-candidate", wake_on_complete=True,
+        conversation_id=str(uuid.uuid4()),
+    ))
+    await _drain(svc)
+    assert len(ctx.sent) == 2
+    assert ctx.sent[1]["channel"] == "moment"
+    assert ctx.sent[1]["max_turns"] == 20
+    assert "exact playbook 'my-pb'" in ctx.sent[1]["content"]
+    assert "approval gate" in ctx.sent[1]["content"]
+
+
+async def test_second_unfinished_candidate_wake_is_disclosed(svc_env):
+    _, ctx, svc = svc_env
+    ctx.results = [{"responded": False, "aborted": "token_budget"},
+                   {"responded": False, "aborted": "max_turns"}]
+    await svc._on_completed(_payload(
+        is_test=True, trigger="agent-candidate", wake_on_complete=True,
+        conversation_id=str(uuid.uuid4()),
+    ))
+    await _drain(svc)
+    assert len(ctx.sent) == 3
+    assert ctx.sent[2]["channel"] == "awareness"
+    assert ctx.sent[2]["respond"] is False
+    assert ctx.sent[2]["title"].startswith("Process not live:")
+    assert "not live yet" in ctx.sent[2]["content"]
+
+
+async def test_queued_candidate_wake_does_not_start_another_turn(svc_env):
+    _, ctx, svc = svc_env
+    ctx.results = [{"responded": False, "queued": True}]
+    await svc._on_completed(_payload(
+        is_test=True, trigger="agent-candidate", wake_on_complete=True,
+        conversation_id=str(uuid.uuid4()),
+    ))
+    await _drain(svc)
+    assert len(ctx.sent) == 1
 
 
 async def test_old_core_without_muted_is_a_noop(svc_env):
