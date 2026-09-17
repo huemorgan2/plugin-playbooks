@@ -271,12 +271,30 @@ async def test_background_run_leaves_awareness_row(svc_env):
 
 async def test_test_and_subtask_runs_are_silent(svc_env):
     sf, ctx, svc = svc_env
-    await svc._on_completed(_payload(is_test=True, wake_on_complete=True))
+    await svc._on_completed(_payload(is_test=True, wake_on_complete=False))
     await svc._on_completed(_payload(
         trigger="subtask:xyz", parent_run_id=str(uuid.uuid4()),
     ))
     await _drain(svc)
     assert ctx.sent == []
+
+
+async def test_restarted_candidate_test_wakes_original_conversation(svc_env):
+    _, ctx, svc = svc_env
+    origin = uuid.uuid4()
+    await svc._on_completed(_payload(
+        is_test=True, trigger="agent-candidate", wake_on_complete=True,
+        conversation_id=str(origin), result={"processed": 30},
+    ))
+    await _drain(svc)
+    assert len(ctx.sent) == 1
+    msg = ctx.sent[0]
+    assert msg["conversation_id"] == origin
+    assert msg["channel"] == "moment"
+    assert msg["max_turns"] >= 30
+    assert "candidate test run resumed" in msg["content"]
+    assert "Verify the persisted effects" in msg["content"]
+    assert "publication gate" in msg["content"]
 
 
 async def test_old_core_without_muted_is_a_noop(svc_env):

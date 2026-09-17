@@ -662,6 +662,22 @@ class PlaybookRunner:
             )).scalars().all()
         candidates = [run for run in runs if run.id not in self._tasks]
         journaled = await self._v2.journal.journaled([run.id for run in candidates])
+        # 041: the initiating candidate-test tool call died with the old
+        # process. Its normal inline result can never reach the agent, so a
+        # resumed test must leave a durable completion wake in that chat.
+        # Ordinary candidate tests still report inline and stay unflagged.
+        interrupted_tests = [
+            run for run in candidates
+            if run.id in journaled and run.is_test
+            and run.trigger == "agent-candidate" and run.conversation_id
+        ]
+        if interrupted_tests:
+            async with self._sf() as session:
+                for run in interrupted_tests:
+                    row = await session.get(PlaybookRun, run.id)
+                    if row is not None and row.status == "running":
+                        row.wake_on_complete = True
+                await session.commit()
         resumed = 0
         for run in candidates:
             if run.id not in journaled:

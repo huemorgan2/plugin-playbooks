@@ -447,6 +447,43 @@ async def test_kill_mid_run_restart_resumes_with_same_journal_prefix(db):
     assert await runner_b.resume_interrupted_runs() == 0
 
 
+async def test_interrupted_candidate_run_stamps_completion_wake_before_resume(db):
+    arm = {"die": True}
+    t1, t2, t3 = _Counter("t1"), _Counter("t2"), _Counter("t3")
+    tools_a = _Tools(
+        t1=_Tool(t1), t2=_Tool(t2), t3=_Tool(t3),
+        code_run=_Tool(ScriptedCodeRun(_three_script(arm)).handler),
+    )
+    runner_a, _ = _runner(db, tools_a)
+    pb = await _save(db, _pb("candidate-restart", THREE_TOOLS))
+    run = await runner_a.start_run_background(
+        pb, inputs={}, trigger="agent-candidate", is_test=True,
+    )
+    await _dead(runner_a, run.id)
+    origin = uuid.uuid4()
+    async with db() as s:
+        row = await s.get(PlaybookRun, run.id)
+        row.conversation_id = origin
+        await s.commit()
+    assert (await _row(db, run.id)).wake_on_complete is False
+
+    arm["die"] = False
+    tools_b = _Tools(
+        t1=_Tool(t1), t2=_Tool(t2), t3=_Tool(t3),
+        code_run=_Tool(ScriptedCodeRun(_three_script(arm)).handler),
+    )
+    runner_b, bus_b = _restart(db, tools_b)
+    assert await runner_b.resume_interrupted_runs() == 1
+    assert (await _row(db, run.id)).wake_on_complete is True
+    done = await runner_b.wait_for_run(run.id, timeout=10)
+    assert done.status == "done"
+    events = bus_b.named("playbook.run.completed")
+    assert len(events) == 1
+    assert events[0]["is_test"] is True
+    assert events[0]["wake_on_complete"] is True
+    assert events[0]["conversation_id"] == str(origin)
+
+
 class _DyingCodeRun:
     """Wraps the real `code_run` handler: raises `_ProcessDied` on invocation
     `die_on` (before spawning) while armed — the same death point as the

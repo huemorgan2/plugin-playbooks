@@ -106,7 +106,9 @@ class RunCompletionWake:
     async def _on_completed(self, payload: Any) -> None:
         if not isinstance(payload, dict):
             return
-        if payload.get("is_test") or payload.get("parent_run_id"):
+        if payload.get("parent_run_id") or (
+            payload.get("is_test") and not payload.get("wake_on_complete")
+        ):
             return
         task = asyncio.create_task(
             self._deliver(payload), name="playbook-run-wake",
@@ -282,11 +284,18 @@ class RunCompletionWake:
             log.warning("run_wake.unroutable run=%s", run_id)
             return
 
-        lines = [
-            f"The '{name}' playbook run you started earlier has finished "
-            f"with status '{status}' after {duration_s}s.",
-            f"Run: {run_id}",
-        ]
+        if payload.get("is_test"):
+            lines = [
+                f"The '{name}' candidate test run resumed after a server "
+                f"restart and finished with status '{status}' after {duration_s}s.",
+                f"Run: {run_id}",
+            ]
+        else:
+            lines = [
+                f"The '{name}' playbook run you started earlier has finished "
+                f"with status '{status}' after {duration_s}s.",
+                f"Run: {run_id}",
+            ]
         if status in FAILED_RUN_STATUSES:
             lines.extend(_failure_lines(payload))
             lines.append("")
@@ -313,10 +322,19 @@ class RunCompletionWake:
                     "playbook_status(run_id) before reporting."
                 )
             lines.append("")
-            lines.append(
-                "Report the outcome to the owner now, continuing what the "
-                "original request asked for."
-            )
+            if payload.get("is_test"):
+                lines.append(
+                    "This is candidate-test evidence, not a published process. "
+                    "Verify the persisted effects against the source inputs "
+                    "and the owner's specification. If they are exact, "
+                    "continue the normal publication gate and request any "
+                    "required owner approval; do not re-run the same test."
+                )
+            else:
+                lines.append(
+                    "Report the outcome to the owner now, continuing what the "
+                    "original request asked for."
+                )
         try:
             await send(
                 f"Playbook finished: {name}",
@@ -326,8 +344,8 @@ class RunCompletionWake:
                 conversation_id=conv,
                 source="playbooks",
                 tools="all",
-                max_turns=_WAKE_MAX_TURNS,
-                token_budget=_WAKE_TOKEN_BUDGET,
+                max_turns=40 if payload.get("is_test") else _WAKE_MAX_TURNS,
+                token_budget=600_000 if payload.get("is_test") else _WAKE_TOKEN_BUDGET,
                 timeout_s=_WAKE_TIMEOUT_S,
             )
             log.info("run_wake.moment run=%s status=%s", run_id, status)
