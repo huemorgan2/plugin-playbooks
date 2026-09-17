@@ -60,6 +60,14 @@ def test_toml_tools_match_code():
     assert manifest["requires"]["tools"] == len(real)
 
 
+def test_owner_turn_guard_metadata_is_declared_by_playbooks():
+    real = _code_tooldefs()
+    assert real["playbook_propose"].survey_before_create == ["playbook_list"]
+    assert all(real[name].store_write for name in (
+        "playbook_propose", "playbook_edit", "playbook_publish"
+    ))
+
+
 def test_toml_tables_match_models():
     manifest = _toml()
     assert set(manifest["db_tables"]) == set(Base.metadata.tables)

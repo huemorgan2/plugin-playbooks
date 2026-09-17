@@ -766,6 +766,8 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_propose",
+            survey_before_create=["playbook_list"],
+            store_write=True,
             artifact_ref="playbook:{name}",
             description=(
                 "Create a new playbook from its FULL source, written all at "
@@ -3210,6 +3212,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_edit",
+            store_write=True,
             artifact_ref="playbook:{name}",
             # 0.6.0 (luna 074/phase4): no longer chat_only. Headless turns
             # (scheduled fires, playbook agent_steps) could only reach
@@ -3910,6 +3913,7 @@ def build_tools(
     tools.append((
         ToolDef(
             name="playbook_publish",
+            store_write=True,
             artifact_ref="playbook:{name}",
             artifact_verb="publishing",
             description=(

@@ -19,7 +19,7 @@ import asyncio
 import json
 import types
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import inspect, select, text
@@ -500,10 +500,20 @@ async def test_wait_event_times_out_with_ctx_event_timeout(db, caught):
 
 
 async def test_wait_event_deadline_passed_during_downtime(db):
-    env = _env(db, _prog([_wait(timeout=0.1), FAST]))
+    env = _env(db, _prog([_wait(timeout=30), FAST]))
     run = await _park(env, "waiter")
     env.runner.park.stop()  # the process is gone: no timer fires
-    await asyncio.sleep(0.3)
+    # Persist a deadline that elapsed while the process was down. A 0.1s
+    # live timer can start running before stop() on a busy test host, making
+    # this a race against the test harness rather than a restart contract.
+    due = datetime.now(timezone.utc) - timedelta(seconds=1)
+    async with db() as session:
+        row = await session.get(PlaybookRun, run.id)
+        parked_on = dict(row.parked_on)
+        parked_on["since"] = (due - timedelta(milliseconds=100)).isoformat()
+        parked_on["due_at"] = due.isoformat()
+        row.parked_on = parked_on
+        await session.commit()
     assert (await _row(db, run.id)).status == "parked"
     new = await _restart(env, _prog([_wait(timeout=0.1), FAST]))
     assert new.bus.count("email.received") == 0
