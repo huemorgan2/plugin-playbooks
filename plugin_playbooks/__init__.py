@@ -737,7 +737,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.57.12",
+        version="0.57.13",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -1371,6 +1371,15 @@ class PlaybooksPlugin(LunaPlugin):
             lines.append(f"- `{name}` ({display_name or name}): {desc}")
 
         lines += [
+            "",
+            "**Unattended direct triggers**: a published playbook still "
+            "parks each scheduled fire when its mode is `agent_must_confirm`. "
+            "If the owner explicitly authorized unattended runs, call "
+            "`playbook_set_autonomy(name, 'agent_may_trigger')` through its "
+            "approval gate, verify the stored mode, and test a real fire. "
+            "Trigger creation alone is not proof it will run while the "
+            "owner is away. Keep `manual_only` or per-run confirmation when "
+            "that is what the owner asked for.",
             "",
             "**Chat delivery**: playbook steps run in the background; an "
             "llm_step/agent_step's output goes to the run record, not the user. "
