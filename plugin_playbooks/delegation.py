@@ -503,6 +503,20 @@ def _delegate_prompt(task: str, pb: Playbook | None, *, format: str | None = Non
         ]
         tail = _PROMPT_TAIL
 
+    quality_bar += [
+        "- Aggregate artifacts: compute counts and totals from the actual "
+        "source records inside the saved process, never from a placeholder "
+        "or hand-copied summary. After the real run, reopen the complete "
+        "saved output and compare its required keys, record count and "
+        "arithmetic with the owner's specification and source files. "
+        "Treat empty or zero totals as unproven until checked."
+    ]
+    checklist += [
+        "6. Any named aggregate or output file was read back and checked "
+        "against source records and the owner's exact schema. A green "
+        "candidate run alone proves execution, not correctness."
+    ]
+
     sections = [
         "# Playbook delegate",
         "",
