@@ -737,7 +737,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.57.14",
+        version="0.57.15",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -1371,6 +1371,12 @@ class PlaybooksPlugin(LunaPlugin):
             lines.append(f"- `{name}` ({display_name or name}): {desc}")
 
         lines += [
+            "",
+            "**Reusable summaries**: when the owner asks for a new aggregate "
+            "across repeated job outputs, edit the saved playbook to compute "
+            "it from actual records (delegate the edit if useful), run it, "
+            "and inspect the persisted summary. Hand-copied totals are not "
+            "a reusable process.",
             "",
             "**Unattended direct triggers**: a published playbook still "
             "parks each scheduled fire when its mode is `agent_must_confirm`. "

@@ -250,6 +250,7 @@ class TestPromptSection:
         plugin._session_factory = db
         sections = await plugin.prompt_sections()
         assert len(sections) == 1
+        assert "edit the saved playbook to compute it from actual records" in sections[0]
 
 
 class _KindStateCtx:
