@@ -81,6 +81,11 @@ Triggers and `playbook_run` use the live version only.
 NEVER report an edit as done after `candidate_saved` — the old version runs
 until publish succeeds.
 
+For a multi-file summary, calculate totals from real source records inside
+the saved playbook; do not hand-copy figures in chat. After a real run,
+reopen the persisted summary and check exact keys, counts and arithmetic
+before claiming it is correct.
+
 ''' + PUBLISH_RULE + '''
 
 ### WHERE IT RUNS

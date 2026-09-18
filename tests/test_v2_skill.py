@@ -34,6 +34,13 @@ def test_size_bound():
     assert len(V2_SKILL_BODY.encode("utf-8")) <= V2_SKILL_MAX_BYTES
 
 
+def test_source_derived_summary_rule_is_in_registered_authoring_skill():
+    skill = next(s for s in PlaybooksPlugin.manifest.skills if s.name == "playbook-authoring-v2")
+    assert "calculate totals from real source records inside" in skill.body
+    assert "reopen the persisted summary" in skill.body
+    assert "check exact keys, counts and arithmetic" in skill.body
+
+
 def _blocks() -> list[str]:
     blocks = _BLOCK.findall(V2_SKILL_BODY)
     assert len(blocks) == 2
