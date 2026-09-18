@@ -411,6 +411,12 @@ async def test_main_turn_payloads_stay_small(env):
 
     gate.set()
     out = json.loads(running)
+    # Wait for the actual background delegate before reading its terminal row.
+    # Tight polling of one in-memory SQLite connection can starve its writer
+    # under the concurrent full-suite and real-model regression workload.
+    live = _TASKS.get(uuid.UUID(out["delegation_id"]))
+    assert live is not None
+    await asyncio.wait_for(live, 20)
     await _wait_settled(env, out["delegation_id"])
     _, status = tools["playbook_agent_status"]
     done = await status(delegation_id=out["delegation_id"])

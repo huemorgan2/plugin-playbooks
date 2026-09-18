@@ -290,6 +290,17 @@ class TestPromptSectionPerState:
         assert "Prefer running an existing playbook" in text
         assert "you MUST use it" not in text
 
+    async def test_fresh_building_chat_sees_reusable_work_guidance(self, db):
+        plugin = await self._plugin(db, "building", "building")
+        sections = await plugin.prompt_sections()
+        assert len(sections) == 1
+        assert "create and test the named playbook before" in sections[0]
+        assert "verify the persisted results" in sections[0]
+
+    async def test_fresh_planning_chat_keeps_guidance_out(self, db):
+        plugin = await self._plugin(db, "building", "planning")
+        assert await plugin.prompt_sections() == []
+
     async def test_ops_renders_ops_section_and_digest(self, db):
         # luna 098: one static ops section, no mode variants.
         pid = await _playbook(db, name="mailer", live_version=1)

@@ -737,7 +737,7 @@ class PlaybooksPlugin(LunaPlugin):
         name="plugin-playbooks",
         icon="workflow",
         image="assets/icon.png",
-        version="0.57.15",
+        version="0.57.16",
         description="Durable multi-step playbooks — Luna builds them, triggers fire them.",
         category="system",
         system_app=False,
@@ -1334,6 +1334,21 @@ class PlaybooksPlugin(LunaPlugin):
         sections: list[str] = []
         if kind == "ops":
             sections.append(self._OPS_SECTION)
+
+        # A fresh building chat has no saved rows yet. The list below used to
+        # return early here, hiding all reusable-work guidance precisely when
+        # the owner first asks Luna to establish a repeatable job.
+        if kind != "ops" and state != "planning" and (kind == "building" or state == "building"):
+            sections.append(
+                "## New repeatable work\n"
+                "When the owner asks for a recurring job and no matching saved "
+                "playbook exists, create and test the named playbook before "
+                "processing the whole workload by hand. A small sample can "
+                "validate the workflow; then run the saved process for the "
+                "remaining items. Follow the owner's exact input and output "
+                "schema, verify the persisted results, and confirm the "
+                "required playbook is live before reporting the job complete."
+            )
 
         if not rows:
             return sections
